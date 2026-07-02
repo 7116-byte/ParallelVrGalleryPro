@@ -1,0 +1,13 @@
+.gradle/
+.kotlin/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+app/src/main/assets/models/*.tflite
+upload-apk.log
+upload-model.log
+release-notes-v*.md
+!release-notes-v1.0.00.md
+_workspace_artifacts/
