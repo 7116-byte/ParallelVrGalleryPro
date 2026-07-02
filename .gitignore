@@ -10,4 +10,5 @@ upload-apk.log
 upload-model.log
 release-notes-v*.md
 !release-notes-v1.0.00.md
+!release-notes-v1.0.01.md
 _workspace_artifacts/

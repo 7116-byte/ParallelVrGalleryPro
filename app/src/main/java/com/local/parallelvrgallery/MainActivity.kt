@@ -543,6 +543,10 @@ data class GenerationTimings(
     val modelMs: Long = 0L,
     val depthPostMs: Long = 0L,
     val sbsMs: Long = 0L,
+    val writeLeftMs: Long = 0L,
+    val writeRightMs: Long = 0L,
+    val writeParamsMs: Long = 0L,
+    val writeLogMs: Long = 0L,
     val writeMs: Long = 0L,
     val totalMs: Long = 0L,
 )
@@ -3864,8 +3868,12 @@ private class VrGenerator(
         val vrPath = File(dir, "vr_sbs.jpg")
         val leftPath = File(dir, "left.webp")
         val rightPath = File(dir, "right.webp")
+        val writeLeftStart = System.currentTimeMillis()
         writeWebpLossless(pair.left, leftPath)
+        val writeLeftMs = System.currentTimeMillis() - writeLeftStart
+        val writeRightStart = System.currentTimeMillis()
         writeWebpLossless(pair.right, rightPath)
+        val writeRightMs = System.currentTimeMillis() - writeRightStart
         onProgress(0.9f)
         val outputWidth = pair.sbsWidth
         val outputHeight = pair.height
@@ -3878,16 +3886,36 @@ private class VrGenerator(
             modelMs = modelMs,
             depthPostMs = depthPostMs,
             sbsMs = sbsMs,
+            writeLeftMs = writeLeftMs,
+            writeRightMs = writeRightMs,
             writeMs = 0L,
             totalMs = totalBeforeFinalLog,
         )
+        val writeParamsStart = System.currentTimeMillis()
         paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, timings), Charsets.UTF_8)
-        val writeMs = System.currentTimeMillis() - writeStart
-        val finalTimings = timings.copy(writeMs = writeMs, totalMs = System.currentTimeMillis() - start)
-        paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, finalTimings), Charsets.UTF_8)
-        mark("write ${writeMs}ms")
-        mark("done total=${finalTimings.totalMs}ms")
+        val writeParamsFirstMs = System.currentTimeMillis() - writeParamsStart
+        val writeMsBeforeLog = System.currentTimeMillis() - writeStart
+        val finalTimingsBeforeLog = timings.copy(
+            writeParamsMs = writeParamsFirstMs,
+            writeMs = writeMsBeforeLog,
+            totalMs = System.currentTimeMillis() - start,
+        )
+        val rewriteParamsStart = System.currentTimeMillis()
+        paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, finalTimingsBeforeLog), Charsets.UTF_8)
+        val writeParamsMs = writeParamsFirstMs + (System.currentTimeMillis() - rewriteParamsStart)
+        val logWriteStart = System.currentTimeMillis()
+        mark("write leftWebp=${writeLeftMs}ms rightWebp=${writeRightMs}ms params=${writeParamsMs}ms")
+        mark("done total=${System.currentTimeMillis() - start}ms")
         logPath.writeText(log.toString(), Charsets.UTF_8)
+        val writeLogMs = System.currentTimeMillis() - logWriteStart
+        val writeMs = System.currentTimeMillis() - writeStart
+        val finalTimings = timings.copy(
+            writeParamsMs = writeParamsMs,
+            writeLogMs = writeLogMs,
+            writeMs = writeMs,
+            totalMs = System.currentTimeMillis() - start,
+        )
+        paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, finalTimings), Charsets.UTF_8)
         depthBitmap.recycle()
         original.recycle()
         pair.recycle()
@@ -7296,6 +7324,10 @@ private fun DebugScreen(
                     DebugLine(lang.t("深度后处理", "Depth post"), imageTimings?.depthPostMs?.let { "${it}ms" } ?: "-")
                     DebugLine(lang.t("SBS 合成", "SBS"), imageTimings?.sbsMs?.let { "${it}ms" } ?: "-")
                     DebugLine(lang.t("写文件", "Write"), imageTimings?.writeMs?.let { "${it}ms" } ?: "-")
+                    DebugLine("Left WebP", imageTimings?.writeLeftMs?.let { "${it}ms" } ?: "-")
+                    DebugLine("Right WebP", imageTimings?.writeRightMs?.let { "${it}ms" } ?: "-")
+                    DebugLine("Params", imageTimings?.writeParamsMs?.let { "${it}ms" } ?: "-")
+                    DebugLine("Log", imageTimings?.writeLogMs?.let { "${it}ms" } ?: "-")
                     DebugLine(lang.t("总耗时", "Total"), imageTimings?.totalMs?.let { "${it}ms" } ?: "-")
                 }
                 Row(Modifier.fillMaxWidth().height(260.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -7377,6 +7409,10 @@ private fun readImageTimings(file: File): GenerationTimings? {
             modelMs = jsonLongValue(text, "modelMs") ?: 0L,
             depthPostMs = jsonLongValue(text, "depthPostMs") ?: 0L,
             sbsMs = jsonLongValue(text, "sbsMs") ?: 0L,
+            writeLeftMs = jsonLongValue(text, "writeLeftMs") ?: 0L,
+            writeRightMs = jsonLongValue(text, "writeRightMs") ?: 0L,
+            writeParamsMs = jsonLongValue(text, "writeParamsMs") ?: 0L,
+            writeLogMs = jsonLongValue(text, "writeLogMs") ?: 0L,
             writeMs = jsonLongValue(text, "writeMs") ?: 0L,
             totalMs = jsonLongValue(text, "totalMs") ?: 0L,
         )
@@ -8740,6 +8776,10 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, outputWi
             "modelMs": ${timings.modelMs},
             "depthPostMs": ${timings.depthPostMs},
             "sbsMs": ${timings.sbsMs},
+            "writeLeftMs": ${timings.writeLeftMs},
+            "writeRightMs": ${timings.writeRightMs},
+            "writeParamsMs": ${timings.writeParamsMs},
+            "writeLogMs": ${timings.writeLogMs},
             "writeMs": ${timings.writeMs},
             "totalMs": ${timings.totalMs}
           },
