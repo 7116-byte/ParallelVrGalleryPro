@@ -165,6 +165,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -3868,12 +3869,7 @@ private class VrGenerator(
         val vrPath = File(dir, "vr_sbs.jpg")
         val leftPath = File(dir, "left.webp")
         val rightPath = File(dir, "right.webp")
-        val writeLeftStart = System.currentTimeMillis()
-        writeWebpLossless(pair.left, leftPath)
-        val writeLeftMs = System.currentTimeMillis() - writeLeftStart
-        val writeRightStart = System.currentTimeMillis()
-        writeWebpLossless(pair.right, rightPath)
-        val writeRightMs = System.currentTimeMillis() - writeRightStart
+        val stereoWrite = writeStereoWebpLosslessParallel(pair.left, leftPath, pair.right, rightPath)
         onProgress(0.9f)
         val outputWidth = pair.sbsWidth
         val outputHeight = pair.height
@@ -3886,8 +3882,8 @@ private class VrGenerator(
             modelMs = modelMs,
             depthPostMs = depthPostMs,
             sbsMs = sbsMs,
-            writeLeftMs = writeLeftMs,
-            writeRightMs = writeRightMs,
+            writeLeftMs = stereoWrite.leftMs,
+            writeRightMs = stereoWrite.rightMs,
             writeMs = 0L,
             totalMs = totalBeforeFinalLog,
         )
@@ -3904,7 +3900,7 @@ private class VrGenerator(
         paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, finalTimingsBeforeLog), Charsets.UTF_8)
         val writeParamsMs = writeParamsFirstMs + (System.currentTimeMillis() - rewriteParamsStart)
         val logWriteStart = System.currentTimeMillis()
-        mark("write leftWebp=${writeLeftMs}ms rightWebp=${writeRightMs}ms params=${writeParamsMs}ms")
+        mark("write leftWebp=${stereoWrite.leftMs}ms rightWebp=${stereoWrite.rightMs}ms params=${writeParamsMs}ms")
         mark("done total=${System.currentTimeMillis() - start}ms")
         logPath.writeText(log.toString(), Charsets.UTF_8)
         val writeLogMs = System.currentTimeMillis() - logWriteStart
@@ -8629,6 +8625,27 @@ private fun writeWebpLossless(bitmap: Bitmap, file: File) {
         check(bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSLESS, 100, output)) {
             "WEBP lossless encode failed: ${file.absolutePath}"
         }
+    }
+}
+
+private data class StereoWebpWriteTimings(
+    val leftMs: Long,
+    val rightMs: Long,
+)
+
+private fun writeStereoWebpLosslessParallel(left: Bitmap, leftFile: File, right: Bitmap, rightFile: File): StereoWebpWriteTimings {
+    return runBlocking {
+        val leftJob = async(Dispatchers.Default) {
+            val start = System.currentTimeMillis()
+            writeWebpLossless(left, leftFile)
+            System.currentTimeMillis() - start
+        }
+        val rightJob = async(Dispatchers.Default) {
+            val start = System.currentTimeMillis()
+            writeWebpLossless(right, rightFile)
+            System.currentTimeMillis() - start
+        }
+        StereoWebpWriteTimings(leftJob.await(), rightJob.await())
     }
 }
 
