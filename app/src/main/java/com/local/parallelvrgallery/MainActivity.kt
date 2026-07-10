@@ -449,7 +449,10 @@ private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
-private const val VIDEO_ENCODER_VERSION = "encoderV12"
+private const val VIDEO_ENCODER_VERSION = "encoderV13"
+private const val VIDEO_FRAME_WEBP_EFFORT = 40
+private const val VIDEO_TARGET_BITS_PER_PIXEL_FRAME = 0.10f
+private val READABLE_VIDEO_ENCODER_VERSIONS = setOf("encoderV12", VIDEO_ENCODER_VERSION)
 private val CURRENT_VERSION_TAG: String get() = "v${BuildConfig.VERSION_NAME}"
 private val CURRENT_VERSION_CODE: Long get() = BuildConfig.VERSION_CODE.toLong()
 private const val GITHUB_REPO = "7116-byte/ParallelVrGalleryPro"
@@ -506,6 +509,9 @@ data class VideoVrJob(
     val fps: Int = 30,
     val currentFrameMs: Long = 0L,
     val avgFrameMs: Long = 0L,
+    val frameLatencyMs: Long = 0L,
+    val queueWaitMs: Long = 0L,
+    val cacheHitReadMs: Long = 0L,
     val modelId: String = "",
     val cacheVersion: String = "",
     val modelThreads: Int = 0,
@@ -521,6 +527,7 @@ data class VideoVrJob(
 
 data class VideoPipelineStats(
     val decodeQueue: Int = 0,
+    val depthQueue: Int = 0,
     val generatedQueue: Int = 0,
     val waitingFrames: Int = 0,
     val cacheHits: Int = 0,
@@ -550,6 +557,14 @@ data class GenerationTimings(
     val writeLogMs: Long = 0L,
     val writeMs: Long = 0L,
     val totalMs: Long = 0L,
+)
+
+data class VideoFrameMetrics(
+    val throughputMs: Long = 0L,
+    val latencyMs: Long = 0L,
+    val queueWaitMs: Long = 0L,
+    val cacheHitReadMs: Long = 0L,
+    val cacheHit: Boolean = false,
 )
 
 data class LastGenerationInfo(
@@ -2304,11 +2319,26 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         var lastRuntimeInfo = "pending"
         _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.GENERATING)) }
         videoQueueTags.upsert(next.item.cacheKey, VideoVrState.GENERATING, next.params)
-        upsertVideoJob(next.item, VideoVrState.GENERATING, 0.01f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = next.params.depthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
+        upsertVideoJob(
+            next.item,
+            VideoVrState.GENERATING,
+            0.01f,
+            currentFrameMs = 0L,
+            avgFrameMs = 0L,
+            frameLatencyMs = 0L,
+            queueWaitMs = 0L,
+            cacheHitReadMs = 0L,
+            modelId = vrParams.depthModel,
+            cacheVersion = videoCacheVersion,
+            modelThreads = vrParams.modelThreads,
+            depthWorkers = next.params.depthWorkers,
+            useGpu = vrParams.useGpu,
+            runtimeInfo = lastRuntimeInfo,
+        )
         videoNotifier.show(next.item, 0, 0, indeterminate = true, status = "准备生成")
         val started = SystemClock.uptimeMillis()
-        var totalFrameTimeMs = 0L
-        var measuredFrameCount = 0
+        var totalThroughputMs = 0L
+        var measuredGeneratedFrames = 0
         videoKeepAlive.acquire()
         val result = try {
             runCatching {
@@ -2330,19 +2360,39 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         lastRuntimeInfo = runtime
                         upsertVideoJob(next.item, VideoVrState.GENERATING, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = next.params.depthWorkers, useGpu = vrParams.useGpu, runtimeInfo = runtime)
                     },
-                ) { progress, frame, total, fps, currentFrameMs, frameTimings, pipelineStats ->
+                ) { progress, frame, total, fps, frameMetrics, frameTimings, pipelineStats ->
                     if (!isCurrentVideoRun(next.item.cacheKey, next.runToken)) {
                         throw VideoStaleException()
                     }
                     if (synchronized(pausedVideos) { pausedVideos.contains(next.item.cacheKey) }) {
                         throw VideoPausedException()
                     }
-                    if (currentFrameMs > 0L) {
-                        totalFrameTimeMs += currentFrameMs
-                        measuredFrameCount++
+                    if (!frameMetrics.cacheHit && frameMetrics.throughputMs > 0L) {
+                        totalThroughputMs += frameMetrics.throughputMs
+                        measuredGeneratedFrames++
                     }
-                    val avgFrameMs = if (measuredFrameCount > 0) totalFrameTimeMs / measuredFrameCount else 0L
-                    upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps, currentFrameMs = currentFrameMs, avgFrameMs = avgFrameMs, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = next.params.depthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, frameTimings = frameTimings, pipelineStats = pipelineStats)
+                    val avgFrameMs = if (measuredGeneratedFrames > 0) totalThroughputMs / measuredGeneratedFrames else 0L
+                    upsertVideoJob(
+                        next.item,
+                        VideoVrState.GENERATING,
+                        progress,
+                        frame,
+                        total,
+                        fps,
+                        currentFrameMs = frameMetrics.throughputMs,
+                        avgFrameMs = avgFrameMs,
+                        frameLatencyMs = frameMetrics.latencyMs,
+                        queueWaitMs = frameMetrics.queueWaitMs,
+                        cacheHitReadMs = frameMetrics.cacheHitReadMs,
+                        modelId = vrParams.depthModel,
+                        cacheVersion = videoCacheVersion,
+                        modelThreads = vrParams.modelThreads,
+                        depthWorkers = next.params.depthWorkers,
+                        useGpu = vrParams.useGpu,
+                        runtimeInfo = lastRuntimeInfo,
+                        frameTimings = frameTimings,
+                        pipelineStats = pipelineStats,
+                    )
                     videoNotifier.show(next.item, frame, total, indeterminate = false, status = "生成中")
                 }
             }
@@ -2558,8 +2608,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         currentFrame: Int = 0,
         totalFrames: Int = 0,
         fps: Int = 30,
-        avgFrameMs: Long = 0L,
-        currentFrameMs: Long = 0L,
+        avgFrameMs: Long? = null,
+        currentFrameMs: Long? = null,
+        frameLatencyMs: Long? = null,
+        queueWaitMs: Long? = null,
+        cacheHitReadMs: Long? = null,
         modelId: String = "",
         cacheVersion: String = "",
         modelThreads: Int = 0,
@@ -2581,8 +2634,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 currentFrame = currentFrame.takeIf { it > 0 } ?: previous?.currentFrame ?: 0,
                 totalFrames = totalFrames.takeIf { it > 0 } ?: previous?.totalFrames ?: 0,
                 fps = fps.takeIf { it > 0 } ?: previous?.fps ?: 30,
-                currentFrameMs = currentFrameMs.takeIf { it > 0L } ?: previous?.currentFrameMs ?: 0L,
-                avgFrameMs = avgFrameMs.takeIf { it > 0L } ?: previous?.avgFrameMs ?: 0L,
+                currentFrameMs = currentFrameMs ?: previous?.currentFrameMs ?: 0L,
+                avgFrameMs = avgFrameMs ?: previous?.avgFrameMs ?: 0L,
+                frameLatencyMs = frameLatencyMs ?: previous?.frameLatencyMs ?: 0L,
+                queueWaitMs = queueWaitMs ?: previous?.queueWaitMs ?: 0L,
+                cacheHitReadMs = cacheHitReadMs ?: previous?.cacheHitReadMs ?: 0L,
                 modelId = modelId.ifBlank { previous?.modelId.orEmpty() },
                 cacheVersion = cacheVersion.ifBlank { previous?.cacheVersion.orEmpty() },
                 modelThreads = modelThreads.takeIf { it > 0 } ?: previous?.modelThreads ?: 0,
@@ -3517,7 +3573,7 @@ private class VideoVrCacheManager(private val context: Context) {
             val parts = it.split("=", limit = 2)
             parts.first() to parts.getOrElse(1) { "" }
         }
-        if (values["encoderVersion"] != VIDEO_ENCODER_VERSION) return null
+        if (values["encoderVersion"] !in READABLE_VIDEO_ENCODER_VERSIONS) return null
         return VideoCacheEntry(
             videoKey = videoKey,
             outputPath = output.absolutePath,
@@ -4000,14 +4056,14 @@ private class VrGenerator(
         val depthSmall = smoothDepth(stableDepth, params.blurRadius, params.invertDepth)
         val depthPostMs = SystemClock.uptimeMillis() - depthPostStart
         val sbsStart = SystemClock.uptimeMillis()
-        val sbs = try {
-            makeParallelSbs(depth.source, depthSmall, params.depthScale, params.fillRadius)
+        val eyes = try {
+            makeParallelStereoPair(depth.source, depthSmall, params.depthScale, params.fillRadius)
         } finally {
             depth.source.recycle()
         }
         val sbsMs = SystemClock.uptimeMillis() - sbsStart
         return VideoSbsResult(
-            bitmap = sbs,
+            eyes = eyes,
             timings = VideoFrameTimings(
                 depthMs = depth.timings.depthMs,
                 temporalMs = temporalMs,
@@ -4482,8 +4538,8 @@ class DepthModelSession(
     }
 }
 
-data class VideoSbsResult(
-    val bitmap: Bitmap,
+private data class VideoSbsResult(
+    val eyes: StereoBitmapPair,
     val timings: VideoFrameTimings,
 )
 
@@ -4500,6 +4556,7 @@ private data class VideoFramePlan(
     val useFrameIndex: Boolean,
     val metadataFrameCount: Int?,
     val captureFps: Int?,
+    val sourceBitrate: Int?,
 )
 
 class DepthTemporalSmoother(
@@ -4550,12 +4607,18 @@ private class VideoVrGenerator(
         params: VideoGenerationParams,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit = {},
-        onProgress: (Float, Int, Int, Int, Long, VideoFrameTimings, VideoPipelineStats) -> Unit,
+        onProgress: (Float, Int, Int, Int, VideoFrameMetrics, VideoFrameTimings, VideoPipelineStats) -> Unit,
     ): VideoCacheEntry {
         val vrParams = params.toVrParams()
         val version = params.cacheVersion()
         val dir = cache.entryDir(item, version)
         val framesDir = File(dir, "frames").also { it.mkdirs() }
+        val previousVersion = version.replace("_$VIDEO_ENCODER_VERSION", "_encoderV12")
+        val previousFramesDir = if (previousVersion != version) {
+            File(File(File(cache.root, item.cacheKey), previousVersion), "frames").takeIf { it.isDirectory }
+        } else {
+            null
+        }
         val output = File(dir, "vr_sbs.mp4")
         val logPath = File(dir, "job.log")
         val metaPath = File(dir, "video_params.txt")
@@ -4573,30 +4636,47 @@ private class VideoVrGenerator(
         val durationMs = framePlan.durationMs
         val fps = framePlan.fps
         val totalFrames = framePlan.totalFrames
-        mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames frameMode=${if (framePlan.useFrameIndex) "index" else "time"} metadataFrames=${framePlan.metadataFrameCount ?: "-"} captureFps=${framePlan.captureFps ?: "-"} version=$version model=${vrParams.depthModel} threads=${vrParams.modelThreads} depthWorkers=${params.depthWorkers.coerceIn(1, 2)} useGpu=${vrParams.useGpu}")
+        mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames frameMode=${if (framePlan.useFrameIndex) "index" else "time"} metadataFrames=${framePlan.metadataFrameCount ?: "-"} captureFps=${framePlan.captureFps ?: "-"} sourceBitrate=${framePlan.sourceBitrate ?: 0} version=$version model=${vrParams.depthModel} threads=${vrParams.modelThreads} depthWorkers=${params.depthWorkers.coerceIn(1, 2)} useGpu=${vrParams.useGpu}")
+        previousFramesDir?.let { mark("frame cache fallback=${it.absolutePath}") }
 
         var width = 0
         var height = 0
         val temporalSmoother = DepthTemporalSmoother()
         frameGenerator.openDepthSession(vrParams, onModelProgress, onRuntimeInfo).use { depthSession ->
-            val first = decodeVideoFrame(retriever, 0, framePlan) ?: error("Unable to decode first video frame")
-            val firstSource = first.copy(Bitmap.Config.ARGB_8888, false)
-            val firstGenerated = frameGenerator.generateVideoSbsBitmap(firstSource, vrParams, depthSession, temporalSmoother).bitmap
-            val cachedFirst = readCachedSbsFrame(framesDir, 0)?.also { onRuntimeInfo("frame cache hit frame=0 version=$version") }
-            val firstSbs = cachedFirst ?: firstGenerated.also { bitmap ->
-                writeStereoFrameCache(framesDir, 0, bitmap)
+            val cachedFirst = readCachedStereoFrame(framesDir, 0, previousFramesDir)?.also {
+                onRuntimeInfo("frame cache hit frame=0 version=$version")
             }
-            if (cachedFirst != null) firstGenerated.recycle()
-            width = even(firstSbs.width)
-            height = even(firstSbs.height)
-            first.recycle()
-            mark("first frame sbs=${firstSbs.width}x${firstSbs.height} encode=${width}x${height}")
+            val firstEyes = cachedFirst ?: run {
+                val first = decodeVideoFrame(retriever, 0, framePlan) ?: error("Unable to decode first video frame")
+                try {
+                    val firstSource = if (first.config == Bitmap.Config.ARGB_8888) {
+                        first
+                    } else {
+                        first.copy(Bitmap.Config.ARGB_8888, false)
+                    }
+                    val generated = frameGenerator.generateVideoSbsBitmap(firstSource, vrParams, depthSession, temporalSmoother)
+                    try {
+                        writeStereoFrameCache(framesDir, 0, generated.eyes)
+                    } catch (error: Throwable) {
+                        generated.eyes.recycle()
+                        throw error
+                    }
+                    generated.eyes
+                } finally {
+                    if (!first.isRecycled) first.recycle()
+                }
+            }
+            width = even(firstEyes.sbsWidth)
+            height = even(firstEyes.height)
+            mark("first frame eyes=${firstEyes.left.width}x${firstEyes.left.height} encode=${width}x${height} cached=${cachedFirst != null}")
 
             encodeVideo(
                 item = item,
                 retriever = retriever,
-                firstSbs = firstSbs,
+                firstEyes = firstEyes,
+                firstCacheHit = cachedFirst != null,
                 framesDir = framesDir,
+                fallbackFramesDir = previousFramesDir,
                 output = output,
                 width = width,
                 height = height,
@@ -4625,11 +4705,13 @@ private class VideoVrGenerator(
                 "frameMode=${if (framePlan.useFrameIndex) "index" else "time"}",
                 "metadataFrameCount=${framePlan.metadataFrameCount ?: 0}",
                 "captureFps=${framePlan.captureFps ?: 0}",
+                "sourceBitrate=${framePlan.sourceBitrate ?: 0}",
                 "source=${item.displayName}",
                 "depthModel=${vrParams.depthModel}",
                 "cacheVersion=$version",
                 "encoderVersion=$VIDEO_ENCODER_VERSION",
-                "frameCache=split_webp_lossless",
+                "frameCache=split_webp_lossless_e$VIDEO_FRAME_WEBP_EFFORT",
+                "frameCacheFallback=${previousFramesDir?.absolutePath.orEmpty()}",
                 "modelThreads=${vrParams.modelThreads}",
                 "depthWorkers=${params.depthWorkers.coerceIn(1, 2)}",
                 "useGpu=${vrParams.useGpu}",
@@ -4652,6 +4734,10 @@ private class VideoVrGenerator(
             ?.toFloatOrNull()
             ?.roundToInt()
             ?.coerceIn(1, 60)
+        val sourceBitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)
+            ?.toLongOrNull()
+            ?.coerceIn(1L, Int.MAX_VALUE.toLong())
+            ?.toInt()
         val metadataFrameCount = if (Build.VERSION.SDK_INT >= 28) {
             retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)
                 ?.toIntOrNull()
@@ -4670,6 +4756,7 @@ private class VideoVrGenerator(
             useFrameIndex = metadataFrameCount != null && Build.VERSION.SDK_INT >= 28,
             metadataFrameCount = metadataFrameCount,
             captureFps = captureFps,
+            sourceBitrate = sourceBitrate,
         )
     }
 
@@ -4691,8 +4778,10 @@ private class VideoVrGenerator(
     private fun encodeVideo(
         item: GalleryItem,
         retriever: MediaMetadataRetriever,
-        firstSbs: Bitmap,
+        firstEyes: StereoBitmapPair,
+        firstCacheHit: Boolean,
         framesDir: File,
+        fallbackFramesDir: File?,
         output: File,
         width: Int,
         height: Int,
@@ -4706,16 +4795,38 @@ private class VideoVrGenerator(
         temporalSmoother: DepthTemporalSmoother,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit,
-        onProgress: (Float, Int, Int, Int, Long, VideoFrameTimings, VideoPipelineStats) -> Unit,
+        onProgress: (Float, Int, Int, Int, VideoFrameMetrics, VideoFrameTimings, VideoPipelineStats) -> Unit,
         mark: (String) -> Unit,
     ) {
+        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        val codecCapabilities = codec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        val videoCapabilities = requireNotNull(codecCapabilities.videoCapabilities) { "AVC encoder has no video capabilities" }
+        val encoderCapabilities = requireNotNull(codecCapabilities.encoderCapabilities) { "AVC encoder has no encoder capabilities" }
+        val pixelRateTarget = (width.toDouble() * height.toDouble() * fps.toDouble() * VIDEO_TARGET_BITS_PER_PIXEL_FRAME.toDouble())
+            .roundToInt()
+            .coerceAtLeast(2_000_000)
+        val sourceRateTarget = framePlan.sourceBitrate?.let { (it.toLong() * 2L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt() } ?: 0
+        val targetBitrate = videoCapabilities.bitrateRange.clamp(max(pixelRateTarget, sourceRateTarget))
+        val useVbr = encoderCapabilities.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, (width * height * fps * 0.08f).roundToInt().coerceAtLeast(2_000_000))
+            setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            if (useVbr) {
+                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+            }
         }
-        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        val supportsHighProfile = codecCapabilities.profileLevels.any {
+            it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh
+        }
+        if (supportsHighProfile) {
+            format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+            if (!codecCapabilities.isFormatSupported(format)) {
+                format.removeKey(MediaFormat.KEY_PROFILE)
+            }
+        }
+        mark("encoder codec=${codec.codecInfo.name} bitrate=$targetBitrate sourceBitrate=${framePlan.sourceBitrate ?: 0} mode=${if (useVbr) "VBR" else "default"} highProfile=${format.containsKey(MediaFormat.KEY_PROFILE)} webpEffort=$VIDEO_FRAME_WEBP_EFFORT")
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         val surface = codec.createInputSurface()
         codec.start()
@@ -4757,24 +4868,41 @@ private class VideoVrGenerator(
         try {
             val activeRenderer = InputSurfaceRenderer(surface, width, height)
             renderer = activeRenderer
-            data class FrameResult(val bitmap: Bitmap, val generatedMs: Long, val timings: VideoFrameTimings)
-            data class PipelineInput(val frame: Int, val source: Bitmap?, val cachedSbs: Bitmap?, val decodeMs: Long)
-            data class PipelineDepthOutput(val frame: Int, val source: Bitmap?, val cachedSbs: Bitmap?, val depth: VideoDepthResult?, val decodeMs: Long, val depthStartedAt: Long)
+            data class FrameResult(
+                val eyes: StereoBitmapPair,
+                val generatedLatencyMs: Long,
+                val timings: VideoFrameTimings,
+                val cacheHit: Boolean,
+            )
+            data class PipelineInput(val frame: Int, val source: Bitmap?, val cachedEyes: StereoBitmapPair?, val decodeMs: Long)
+            data class PipelineDepthOutput(val frame: Int, val source: Bitmap?, val cachedEyes: StereoBitmapPair?, val depth: VideoDepthResult?, val decodeMs: Long, val depthStartedAt: Long)
             data class PipelineOutput(val frame: Int, val result: FrameResult)
 
-            val decodedChannel = Channel<PipelineInput>(capacity = 2)
-            val depthChannel = Channel<PipelineDepthOutput>(capacity = 2)
-            val generatedChannel = Channel<PipelineOutput>(capacity = 2)
+            val decodedChannel = Channel<PipelineInput>(capacity = 2) { input ->
+                input.source?.recycle()
+                input.cachedEyes?.recycle()
+            }
+            val depthChannel = Channel<PipelineDepthOutput>(capacity = 2) { output ->
+                output.cachedEyes?.recycle()
+                output.depth?.source?.recycle()
+                if (output.source !== output.depth?.source) output.source?.recycle()
+            }
+            val generatedChannel = Channel<PipelineOutput>(capacity = 2) { output ->
+                output.result.eyes.recycle()
+            }
             val decodeQueueSize = AtomicInteger(0)
+            val depthQueueSize = AtomicInteger(0)
             val generatedQueueSize = AtomicInteger(0)
-            val cacheHits = AtomicInteger(0)
+            val cacheHits = AtomicInteger(if (firstCacheHit) 1 else 0)
             val depthWorkerCount = videoParams.depthWorkers.coerceIn(1, 2)
             var timingWindow = VideoFrameTimings()
             var timingWindowCount = 0
+            var lastGeneratedEncodedAt = 0L
 
             fun stats(waitingFrames: Int): VideoPipelineStats {
                 return VideoPipelineStats(
                     decodeQueue = decodeQueueSize.get().coerceAtLeast(0),
+                    depthQueue = depthQueueSize.get().coerceAtLeast(0),
                     generatedQueue = generatedQueueSize.get().coerceAtLeast(0),
                     waitingFrames = waitingFrames,
                     cacheHits = cacheHits.get(),
@@ -4807,15 +4935,32 @@ private class VideoVrGenerator(
             }
 
             fun encodeFrame(frame: Int, frameResult: FrameResult, waitingFrames: Int) {
-                val sbs = frameResult.bitmap
                 val presentationTimeUs = frame * 1_000_000L / fps
                 val encodeStart = SystemClock.uptimeMillis()
-                activeRenderer.draw(sbs, presentationTimeUs)
-                if (frame != 0) sbs.recycle()
+                try {
+                    activeRenderer.drawStereo(frameResult.eyes.left, frameResult.eyes.right, presentationTimeUs)
+                } finally {
+                    if (frame != 0) frameResult.eyes.recycle()
+                }
                 drain(end = false)
                 val encodeMs = SystemClock.uptimeMillis() - encodeStart
                 val timings = frameResult.timings.copy(encodeMs = encodeMs)
-                val effectiveMs = frameResult.generatedMs.takeIf { it > 0L } ?: timings.totalMs
+                val now = SystemClock.uptimeMillis()
+                val throughputMs = if (!frameResult.cacheHit && lastGeneratedEncodedAt > 0L) {
+                    now - lastGeneratedEncodedAt
+                } else {
+                    0L
+                }
+                if (!frameResult.cacheHit) lastGeneratedEncodedAt = now
+                val activeGenerationMs = timings.depthMs + timings.temporalMs + timings.depthPostMs + timings.sbsMs + timings.cacheWriteMs
+                val queueWaitMs = (frameResult.generatedLatencyMs - activeGenerationMs).coerceAtLeast(0L)
+                val metrics = VideoFrameMetrics(
+                    throughputMs = throughputMs,
+                    latencyMs = frameResult.generatedLatencyMs,
+                    queueWaitMs = queueWaitMs,
+                    cacheHitReadMs = if (frameResult.cacheHit) timings.decodeMs else 0L,
+                    cacheHit = frameResult.cacheHit,
+                )
                 timingWindow = addTiming(timingWindow, timings)
                 timingWindowCount++
                 if (timingWindowCount >= 30) {
@@ -4824,7 +4969,7 @@ private class VideoVrGenerator(
                     timingWindow = VideoFrameTimings()
                     timingWindowCount = 0
                 }
-                onProgress((frame + 1).toFloat() / totalFrames.toFloat(), frame + 1, totalFrames, fps, effectiveMs, timings, stats(waitingFrames))
+                onProgress((frame + 1).toFloat() / totalFrames.toFloat(), frame + 1, totalFrames, fps, metrics, timings, stats(waitingFrames))
             }
 
             runBlocking {
@@ -4832,21 +4977,24 @@ private class VideoVrGenerator(
                     try {
                         for (frame in 1 until totalFrames) {
                             val decodeStart = SystemClock.uptimeMillis()
-                            val cached = readCachedSbsFrame(framesDir, frame)
+                            val cached = readCachedStereoFrame(framesDir, frame, fallbackFramesDir)
                             if (cached != null) {
                                 val decodeMs = SystemClock.uptimeMillis() - decodeStart
                                 onRuntimeInfo("frame cache hit frame=$frame version=$version")
                                 decodeQueueSize.incrementAndGet()
-                                decodedChannel.send(PipelineInput(frame, source = null, cachedSbs = cached, decodeMs = decodeMs))
+                                decodedChannel.send(PipelineInput(frame, source = null, cachedEyes = cached, decodeMs = decodeMs))
                                 continue
                             }
                             val bitmap = decodeVideoFrame(retriever, frame, framePlan)
                                 ?: error("Unable to decode video frame $frame")
-                            val source = bitmap.copy(Bitmap.Config.ARGB_8888, false)
-                            bitmap.recycle()
+                            val source = if (bitmap.config == Bitmap.Config.ARGB_8888) {
+                                bitmap
+                            } else {
+                                bitmap.copy(Bitmap.Config.ARGB_8888, false).also { bitmap.recycle() }
+                            }
                             val decodeMs = SystemClock.uptimeMillis() - decodeStart
                             decodeQueueSize.incrementAndGet()
-                            decodedChannel.send(PipelineInput(frame, source = source, cachedSbs = null, decodeMs = decodeMs))
+                            decodedChannel.send(PipelineInput(frame, source = source, cachedEyes = null, decodeMs = decodeMs))
                         }
                     } finally {
                         decodedChannel.close()
@@ -4863,13 +5011,14 @@ private class VideoVrGenerator(
                         try {
                             for (inputFrame in decodedChannel) {
                                 decodeQueueSize.decrementAndGet()
-                                if (inputFrame.cachedSbs != null) {
+                                if (inputFrame.cachedEyes != null) {
                                     cacheHits.incrementAndGet()
+                                    depthQueueSize.incrementAndGet()
                                     depthChannel.send(
                                         PipelineDepthOutput(
                                             frame = inputFrame.frame,
                                             source = null,
-                                            cachedSbs = inputFrame.cachedSbs,
+                                            cachedEyes = inputFrame.cachedEyes,
                                             depth = null,
                                             decodeMs = inputFrame.decodeMs,
                                             depthStartedAt = 0L,
@@ -4879,11 +5028,12 @@ private class VideoVrGenerator(
                                     val source = inputFrame.source ?: error("Missing source frame ${inputFrame.frame}")
                                     val started = SystemClock.uptimeMillis()
                                     val depth = frameGenerator.generateVideoDepth(source, params, workerSession)
+                                    depthQueueSize.incrementAndGet()
                                     depthChannel.send(
                                         PipelineDepthOutput(
                                             frame = inputFrame.frame,
                                             source = source,
-                                            cachedSbs = null,
+                                            cachedEyes = null,
                                             depth = depth,
                                             decodeMs = inputFrame.decodeMs,
                                             depthStartedAt = started,
@@ -4908,19 +5058,21 @@ private class VideoVrGenerator(
                         var expectedDepthFrame = 1
                         while (expectedDepthFrame < totalFrames) {
                             val depthOutput = depthChannel.receiveCatching().getOrNull() ?: break
+                            depthQueueSize.decrementAndGet()
                             pendingDepthFrames[depthOutput.frame] = depthOutput
                             var lastWaitingFrames = pendingDepthFrames.size
                             while (true) {
                                 val inputFrame = pendingDepthFrames.remove(expectedDepthFrame) ?: break
                                 lastWaitingFrames = pendingDepthFrames.size
                                 val started = SystemClock.uptimeMillis()
-                                val output = if (inputFrame.cachedSbs != null) {
+                                val output = if (inputFrame.cachedEyes != null) {
                                     PipelineOutput(
                                         inputFrame.frame,
                                         FrameResult(
-                                            bitmap = inputFrame.cachedSbs,
-                                            generatedMs = 0L,
+                                            eyes = inputFrame.cachedEyes,
+                                            generatedLatencyMs = 0L,
                                             timings = VideoFrameTimings(decodeMs = inputFrame.decodeMs),
+                                            cacheHit = true,
                                         ),
                                     )
                                 } else {
@@ -4928,13 +5080,18 @@ private class VideoVrGenerator(
                                     val generatedResult = frameGenerator.finishVideoSbs(depth, params, temporalSmoother)
                                     if (inputFrame.source != depth.source) inputFrame.source?.recycle()
                                     val cacheStart = SystemClock.uptimeMillis()
-                                    writeStereoFrameCache(framesDir, inputFrame.frame, generatedResult.bitmap)
+                                    try {
+                                        writeStereoFrameCache(framesDir, inputFrame.frame, generatedResult.eyes)
+                                    } catch (error: Throwable) {
+                                        generatedResult.eyes.recycle()
+                                        throw error
+                                    }
                                     val cacheWriteMs = SystemClock.uptimeMillis() - cacheStart
                                     PipelineOutput(
                                         inputFrame.frame,
                                         FrameResult(
-                                            bitmap = generatedResult.bitmap,
-                                            generatedMs = if (inputFrame.depthStartedAt > 0L) {
+                                            eyes = generatedResult.eyes,
+                                            generatedLatencyMs = if (inputFrame.depthStartedAt > 0L) {
                                                 SystemClock.uptimeMillis() - inputFrame.depthStartedAt
                                             } else {
                                                 SystemClock.uptimeMillis() - started
@@ -4943,6 +5100,7 @@ private class VideoVrGenerator(
                                                 decodeMs = inputFrame.decodeMs,
                                                 cacheWriteMs = cacheWriteMs,
                                             ),
+                                            cacheHit = false,
                                         ),
                                     )
                                 }
@@ -4956,7 +5114,7 @@ private class VideoVrGenerator(
                                     expectedDepthFrame,
                                     totalFrames,
                                     fps,
-                                    0L,
+                                    VideoFrameMetrics(),
                                     VideoFrameTimings(),
                                     stats(lastWaitingFrames),
                                 )
@@ -4970,7 +5128,7 @@ private class VideoVrGenerator(
                     }
                 }
 
-                encodeFrame(0, FrameResult(firstSbs, 0L, VideoFrameTimings()), waitingFrames = 0)
+                encodeFrame(0, FrameResult(firstEyes, 0L, VideoFrameTimings(), firstCacheHit), waitingFrames = 0)
                 val pendingFrames = mutableMapOf<Int, FrameResult>()
                 var expectedFrame = 1
                 while (expectedFrame < totalFrames) {
@@ -5004,7 +5162,7 @@ private class VideoVrGenerator(
                 mark("audio copied")
             }
         } finally {
-            firstSbs.recycle()
+            firstEyes.recycle()
             renderer?.release()
             runCatching { codec.stop() }
             codec.release()
@@ -5038,7 +5196,15 @@ private class VideoVrGenerator(
         while (true) {
             val size = extractor.readSampleData(buffer, 0)
             if (size < 0) break
-            info.set(0, size, extractor.sampleTime.coerceAtLeast(0L), extractor.sampleFlags)
+            val sampleFlags = extractor.sampleFlags
+            var codecFlags = 0
+            if ((sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                codecFlags = codecFlags or MediaCodec.BUFFER_FLAG_KEY_FRAME
+            }
+            if ((sampleFlags and MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME) != 0) {
+                codecFlags = codecFlags or MediaCodec.BUFFER_FLAG_PARTIAL_FRAME
+            }
+            info.set(0, size, extractor.sampleTime.coerceAtLeast(0L), codecFlags)
             muxer.writeSampleData(track, buffer, info)
             extractor.advance()
         }
@@ -5069,6 +5235,9 @@ private class InputSurfaceRenderer(
     private val eglSurface: EGLSurface
     private val program: Int
     private val textureId: Int
+    private val positionHandle: Int
+    private val texCoordHandle: Int
+    private val textureHandle: Int
     private val positionBuffer: FloatBuffer
     private val texCoordBuffer: FloatBuffer
 
@@ -5105,6 +5274,9 @@ private class InputSurfaceRenderer(
 
         program = createProgram(VERTEX_SHADER, FRAGMENT_SHADER)
         textureId = createTexture()
+        positionHandle = GLES20.glGetAttribLocation(program, "aPosition")
+        texCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
+        textureHandle = GLES20.glGetUniformLocation(program, "uTexture")
         positionBuffer = floatBufferOf(
             -1f, -1f,
             1f, -1f,
@@ -5119,7 +5291,7 @@ private class InputSurfaceRenderer(
         )
     }
 
-    fun draw(bitmap: Bitmap, presentationTimeUs: Long) {
+    fun drawStereo(left: Bitmap, right: Bitmap, presentationTimeUs: Long) {
         makeCurrent()
         GLES20.glViewport(0, 0, width, height)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
@@ -5128,11 +5300,6 @@ private class InputSurfaceRenderer(
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
-        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
-
-        val positionHandle = GLES20.glGetAttribLocation(program, "aPosition")
-        val texCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
-        val textureHandle = GLES20.glGetUniformLocation(program, "uTexture")
         GLES20.glUniform1i(textureHandle, 0)
 
         positionBuffer.position(0)
@@ -5141,6 +5308,14 @@ private class InputSurfaceRenderer(
         texCoordBuffer.position(0)
         GLES20.glEnableVertexAttribArray(texCoordHandle)
         GLES20.glVertexAttribPointer(texCoordHandle, 2, GLES20.GL_FLOAT, false, 0, texCoordBuffer)
+
+        val leftWidth = width / 2
+        GLES20.glViewport(0, 0, leftWidth, height)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, left, 0)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        GLES20.glViewport(leftWidth, 0, width - leftWidth, height)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, right, 0)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         GLES20.glDisableVertexAttribArray(positionHandle)
         GLES20.glDisableVertexAttribArray(texCoordHandle)
@@ -6353,7 +6528,7 @@ private fun ManageScreen(
                                     AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
                                     if (item.cacheKey in selectedVideoKeys) SelectionBadge()
                                     StatusBadge(
-                                        text = "${videoState.shortLabel(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}% 当前${job?.currentFrameMs ?: 0}ms 均${job?.avgFrameMs ?: 0}ms",
+                                        text = "${videoState.shortLabel(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}% 吞吐${job?.currentFrameMs ?: 0}ms 均${job?.avgFrameMs ?: 0}ms",
                                         fontSize = (10 - columnFontReduction(state.generatedColumns)).coerceAtLeast(7).sp,
                                         modifier = Modifier.align(Alignment.BottomStart),
                                         horizontalPadding = 2.dp,
@@ -7080,7 +7255,7 @@ private fun ViewerScreen(
                         sbsMode = generated != null,
                         controlsVisible = controlsVisible,
                         stateLine = "${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}",
-                        metricsLine = "frame ${job?.currentFrameMs ?: 0}ms · avg ${job?.avgFrameMs ?: 0}ms",
+                        metricsLine = "out ${job?.currentFrameMs ?: 0}ms · avg ${job?.avgFrameMs ?: 0}ms",
                         onSingleTap = { controlsVisible = !controlsVisible },
                     )
                 }
@@ -7266,10 +7441,14 @@ private fun DebugScreen(
                     DebugLine("Frame", "${videoJob?.currentFrame ?: 0}/${videoJob?.totalFrames ?: 0}")
                     DebugLine("Progress", "${((videoJob?.progress ?: 0f) * 100f).roundToInt()}%")
                     DebugLine("FPS", "${videoJob?.fps ?: videoEntry?.fps ?: 30}")
-                    DebugLine(lang.t("当前有效帧", "Current active frame"), "${videoJob?.currentFrameMs ?: 0}ms")
-                    DebugLine(lang.t("平均有效帧", "Avg active frame"), "${videoJob?.avgFrameMs ?: 0}ms")
+                    DebugLine(lang.t("吞吐间隔", "Throughput interval"), "${videoJob?.currentFrameMs ?: 0}ms")
+                    DebugLine(lang.t("平均吞吐", "Avg throughput"), "${videoJob?.avgFrameMs ?: 0}ms")
+                    DebugLine(lang.t("端到端延迟", "Frame latency"), "${videoJob?.frameLatencyMs ?: 0}ms")
+                    DebugLine(lang.t("队列等待", "Queue wait"), "${videoJob?.queueWaitMs ?: 0}ms")
+                    DebugLine(lang.t("缓存命中读取", "Cache-hit read"), "${videoJob?.cacheHitReadMs ?: 0}ms")
                     val pipeline = videoJob?.pipelineStats ?: VideoPipelineStats()
                     DebugLine(lang.t("解码队列", "Decode queue"), "${pipeline.decodeQueue}")
+                    DebugLine(lang.t("深度结果队列", "Depth queue"), "${pipeline.depthQueue}")
                     DebugLine(lang.t("生成队列", "Generated queue"), "${pipeline.generatedQueue}")
                     DebugLine(lang.t("等待编码", "Encode waiting"), "${pipeline.waitingFrames}")
                     DebugLine(lang.t("缓存命中", "Cache hits"), "${pipeline.cacheHits}")
@@ -8619,10 +8798,10 @@ private fun replaceOriginalImage(context: Context, photo: PhotoItem, source: Fil
     resolver.update(photo.uri, values, null, null)
 }
 
-private fun writeWebpLossless(bitmap: Bitmap, file: File) {
+private fun writeWebpLossless(bitmap: Bitmap, file: File, effort: Int = 100) {
     file.parentFile?.mkdirs()
     FileOutputStream(file).use { output ->
-        check(bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSLESS, 100, output)) {
+        check(bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSLESS, effort.coerceIn(0, 100), output)) {
             "WEBP lossless encode failed: ${file.absolutePath}"
         }
     }
@@ -8633,23 +8812,34 @@ private data class StereoWebpWriteTimings(
     val rightMs: Long,
 )
 
-private fun writeStereoWebpLosslessParallel(left: Bitmap, leftFile: File, right: Bitmap, rightFile: File): StereoWebpWriteTimings {
+private fun writeStereoWebpLosslessParallel(
+    left: Bitmap,
+    leftFile: File,
+    right: Bitmap,
+    rightFile: File,
+    effort: Int = 100,
+): StereoWebpWriteTimings {
     return runBlocking {
         val leftJob = async(Dispatchers.Default) {
             val start = System.currentTimeMillis()
-            writeWebpLossless(left, leftFile)
+            writeWebpLossless(left, leftFile, effort)
             System.currentTimeMillis() - start
         }
         val rightJob = async(Dispatchers.Default) {
             val start = System.currentTimeMillis()
-            writeWebpLossless(right, rightFile)
+            writeWebpLossless(right, rightFile, effort)
             System.currentTimeMillis() - start
         }
         StereoWebpWriteTimings(leftJob.await(), rightJob.await())
     }
 }
 
-private fun readCachedSbsFrame(framesDir: File, frame: Int): Bitmap? {
+private fun readCachedStereoFrame(framesDir: File, frame: Int, fallbackFramesDir: File? = null): StereoBitmapPair? {
+    return readCachedStereoFrameInDir(framesDir, frame)
+        ?: fallbackFramesDir?.let { readCachedStereoFrameInDir(it, frame) }
+}
+
+private fun readCachedStereoFrameInDir(framesDir: File, frame: Int): StereoBitmapPair? {
     val left = File(framesDir, "left_${frame.toString().padStart(6, '0')}.webp")
     val right = File(framesDir, "right_${frame.toString().padStart(6, '0')}.webp")
     if (left.exists() && right.exists()) {
@@ -8659,29 +8849,31 @@ private fun readCachedSbsFrame(framesDir: File, frame: Int): Bitmap? {
             leftBitmap.recycle()
             return null
         }
-        return try {
-            composeSbsBitmap(leftBitmap, rightBitmap)
-        } finally {
-            leftBitmap.recycle()
-            rightBitmap.recycle()
-        }
+        return StereoBitmapPair(leftBitmap, rightBitmap)
     }
     val legacy = File(framesDir, "frame_${frame.toString().padStart(6, '0')}.jpg")
-    return if (legacy.exists()) BitmapFactory.decodeFile(legacy.absolutePath) else null
+    if (!legacy.exists()) return null
+    val sbs = BitmapFactory.decodeFile(legacy.absolutePath) ?: return null
+    return try {
+        val half = (sbs.width / 2).coerceAtLeast(1)
+        StereoBitmapPair(
+            left = Bitmap.createBitmap(sbs, 0, 0, half, sbs.height),
+            right = Bitmap.createBitmap(sbs, half, 0, sbs.width - half, sbs.height),
+        )
+    } finally {
+        sbs.recycle()
+    }
 }
 
-private fun writeStereoFrameCache(framesDir: File, frame: Int, sbs: Bitmap) {
+private fun writeStereoFrameCache(framesDir: File, frame: Int, eyes: StereoBitmapPair) {
     framesDir.mkdirs()
-    val half = (sbs.width / 2).coerceAtLeast(1)
-    val left = Bitmap.createBitmap(sbs, 0, 0, half, sbs.height)
-    val right = Bitmap.createBitmap(sbs, half, 0, sbs.width - half, sbs.height)
-    try {
-        writeWebpLossless(left, File(framesDir, "left_${frame.toString().padStart(6, '0')}.webp"))
-        writeWebpLossless(right, File(framesDir, "right_${frame.toString().padStart(6, '0')}.webp"))
-    } finally {
-        left.recycle()
-        right.recycle()
-    }
+    writeStereoWebpLosslessParallel(
+        eyes.left,
+        File(framesDir, "left_${frame.toString().padStart(6, '0')}.webp"),
+        eyes.right,
+        File(framesDir, "right_${frame.toString().padStart(6, '0')}.webp"),
+        effort = VIDEO_FRAME_WEBP_EFFORT,
+    )
 }
 
 private fun composeSbsBitmap(left: Bitmap, right: Bitmap): Bitmap {
