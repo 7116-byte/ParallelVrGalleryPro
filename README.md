@@ -99,24 +99,6 @@ APK 输出：
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
-### GitHub Release 上传包
-
-普通 Debug APK 同时包含真机和模拟器的四种 CPU 架构，文件较大。发布到 GitHub
-供 Android 真机安装时，可构建仅含 `arm64-v8a` 的上传包：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\build-github-apk.ps1
-```
-
-输出文件：
-
-```text
-_workspace_artifacts/github-release/app-debug.apk
-```
-
-该参数不会改变普通 `assembleDebug` 的通用 APK。上传包适用于 64 位 ARM Android
-真机，不适用于 x86/x86_64 模拟器或仅支持 32 位 ARM 的旧设备。
-
 ## 模型资产
 
 APK 不内置 `depth_anything_v2.tflite`。首次生成 VR 前，App 会从 GitHub Release 下载模型并校验 SHA-256。
