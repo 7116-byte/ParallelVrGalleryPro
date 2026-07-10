@@ -14,6 +14,15 @@ android {
         targetSdk = 35
         versionCode = 10003
         versionName = "1.0.03"
+
+        // GitHub releases are installed on physical Android devices.  Building with
+        // -PgithubRelease=true omits emulator/legacy ABIs without changing the
+        // regular universal debug APK used during development.
+        if (providers.gradleProperty("githubRelease").orNull == "true") {
+            ndk {
+                abiFilters += "arm64-v8a"
+            }
+        }
     }
 
     buildFeatures {
