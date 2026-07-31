@@ -68,6 +68,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -6305,6 +6306,44 @@ private fun Modifier.discreteColumnPinch(
     }
 }
 
+@Composable
+private fun Modifier.generatedGridDragSelection(
+    gridState: androidx.compose.foundation.lazy.grid.LazyGridState,
+    onSelectIndex: (Int) -> Unit,
+): Modifier {
+    val currentOnSelectIndex by rememberUpdatedState(onSelectIndex)
+    return pointerInput(gridState) {
+        var lastSelectedIndex: Int? = null
+
+        fun selectAt(position: Offset) {
+            val itemIndex = gridState.layoutInfo.visibleItemsInfo.firstOrNull { item ->
+                val left = item.offset.x.toFloat()
+                val top = item.offset.y.toFloat()
+                val right = left + item.size.width
+                val bottom = top + item.size.height
+                position.x >= left && position.x < right && position.y >= top && position.y < bottom
+            }?.index ?: return
+            if (itemIndex != lastSelectedIndex) {
+                lastSelectedIndex = itemIndex
+                currentOnSelectIndex(itemIndex)
+            }
+        }
+
+        detectDragGesturesAfterLongPress(
+            onDragStart = { position ->
+                lastSelectedIndex = null
+                selectAt(position)
+            },
+            onDragEnd = { lastSelectedIndex = null },
+            onDragCancel = { lastSelectedIndex = null },
+            onDrag = { change, _ ->
+                selectAt(change.position)
+                change.consume()
+            },
+        )
+    }
+}
+
 private fun columnFontReduction(columns: Int): Int = ((columns - 5).coerceAtLeast(0) * 2).coerceAtMost(6)
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -6418,6 +6457,7 @@ private fun ManageScreen(
     val tab = selectedTab
     var selectedImageKeys by remember { mutableStateOf(setOf<String>()) }
     var selectedVideoKeys by remember { mutableStateOf(setOf<String>()) }
+    val availablePhotoKeys = remember(state.photos) { state.photos.mapTo(hashSetOf()) { it.cacheKey } }
     LaunchedEffect(tab, state.selectedGeneratedVersion) {
         selectedImageKeys = emptySet()
         selectedVideoKeys = emptySet()
@@ -6509,7 +6549,14 @@ private fun ManageScreen(
                         modifier = Modifier
                             .fillMaxSize()
                             .background(androidx.compose.ui.graphics.Color.White)
-                            .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns),
+                            .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
+                            .generatedGridDragSelection(videoGridState) { gridIndex ->
+                                videos.getOrNull(gridIndex)?.let { item ->
+                                    if (item.cacheKey in availablePhotoKeys) {
+                                        selectedVideoKeys = selectedVideoKeys + item.cacheKey
+                                    }
+                                }
+                            },
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(
                             start = 8.dp,
                             top = if (embedded) contentTopPadding else 8.dp,
@@ -6532,7 +6579,7 @@ private fun ManageScreen(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .aspectRatio(1f)
-                                        .combinedClickable(
+                                        .clickable(
                                             enabled = index >= 0,
                                             onClick = {
                                                 if (selectedVideoKeys.isNotEmpty()) {
@@ -6541,7 +6588,6 @@ private fun ManageScreen(
                                                     onOpenGeneratedVideo(index)
                                                 }
                                             },
-                                            onLongClick = { selectedVideoKeys = selectedVideoKeys + item.cacheKey },
                                         ),
                                 ) {
                                     AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
@@ -6609,7 +6655,6 @@ private fun ManageScreen(
                                     cover = cover,
                                     lang = lang,
                                     onOpen = { onOpenVersion(summary.version) },
-                                    onDelete = { onDeleteVersion(summary.version) },
                                 )
                             }
                         }
@@ -6679,7 +6724,14 @@ private fun ManageScreen(
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .background(androidx.compose.ui.graphics.Color.White)
-                                    .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns),
+                                    .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
+                                    .generatedGridDragSelection(imageGridState) { gridIndex ->
+                                        itemsInVersion.getOrNull(gridIndex)?.let { item ->
+                                            if (item.photoItem.cacheKey in availablePhotoKeys) {
+                                                selectedImageKeys = selectedImageKeys + "${item.entry.photoKey}|${item.entry.version}"
+                                            }
+                                        }
+                                    },
                                 contentPadding = androidx.compose.foundation.layout.PaddingValues(
                                     start = 8.dp,
                                     top = if (embedded) contentTopPadding else 8.dp,
@@ -6697,7 +6749,7 @@ private fun ManageScreen(
                                             .fillMaxWidth()
                                             .aspectRatio(1f)
                                             .background(androidx.compose.ui.graphics.Color(0xff16191c))
-                                            .combinedClickable(
+                                            .clickable(
                                                 enabled = index >= 0,
                                                 onClick = {
                                                     if (selectedImageKeys.isNotEmpty()) {
@@ -6706,7 +6758,6 @@ private fun ManageScreen(
                                                         onOpenGenerated(index, item.entry)
                                                     }
                                                 },
-                                                onLongClick = { selectedImageKeys = selectedImageKeys + selectionKey },
                                             ),
                                     ) {
                                         GeneratedSbsThumbnail(item.entry, 360, ContentScale.Crop, Modifier.fillMaxSize(), lang)
@@ -6724,19 +6775,17 @@ private fun ManageScreen(
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun GeneratedVersionTile(
     summary: CacheVersionSummary,
     cover: ManagedCacheItem?,
     lang: AppLanguage,
     onOpen: () -> Unit,
-    onDelete: () -> Unit,
 ) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .combinedClickable(onClick = onOpen, onLongClick = onDelete),
+            .clickable(onClick = onOpen),
     ) {
         Box(
             modifier = Modifier
@@ -6772,7 +6821,7 @@ private fun GeneratedVersionTile(
             overflow = TextOverflow.Ellipsis,
         )
         Text(
-            text = lang.t("${(summary.bytes / 1024f / 1024f).roundToInt()} MB，长按删除", "${(summary.bytes / 1024f / 1024f).roundToInt()} MB, long press delete"),
+            text = "${(summary.bytes / 1024f / 1024f).roundToInt()} MB",
             style = MaterialTheme.typography.bodySmall,
             color = androidx.compose.ui.graphics.Color(0xff666666),
             maxLines = 1,
