@@ -68,10 +68,14 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
+import androidx.compose.foundation.gestures.awaitTouchSlopOrCancellation
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -6309,38 +6313,61 @@ private fun Modifier.discreteColumnPinch(
 @Composable
 private fun Modifier.generatedGridDragSelection(
     gridState: androidx.compose.foundation.lazy.grid.LazyGridState,
+    selectionMode: Boolean,
+    contentStartPadding: androidx.compose.ui.unit.Dp,
     onSelectIndex: (Int) -> Unit,
 ): Modifier {
+    val currentSelectionMode by rememberUpdatedState(selectionMode)
     val currentOnSelectIndex by rememberUpdatedState(onSelectIndex)
-    return pointerInput(gridState) {
-        var lastSelectedIndex: Int? = null
+    val contentStartPaddingPx = with(LocalDensity.current) { contentStartPadding.toPx() }
+    return pointerInput(gridState, contentStartPaddingPx) {
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false)
+            val selectionModeAtDown = currentSelectionMode
+            var lastSelectedIndex: Int? = null
 
-        fun selectAt(position: Offset) {
-            val itemIndex = gridState.layoutInfo.visibleItemsInfo.firstOrNull { item ->
-                val left = item.offset.x.toFloat()
-                val top = item.offset.y.toFloat()
-                val right = left + item.size.width
-                val bottom = top + item.size.height
-                position.x >= left && position.x < right && position.y >= top && position.y < bottom
-            }?.index ?: return
-            if (itemIndex != lastSelectedIndex) {
-                lastSelectedIndex = itemIndex
-                currentOnSelectIndex(itemIndex)
+            fun selectAt(pointerPosition: Offset) {
+                val layoutInfo = gridState.layoutInfo
+                // LazyGrid item offsets exclude the visual content padding used during placement.
+                val contentPosition = Offset(
+                    x = pointerPosition.x - contentStartPaddingPx,
+                    y = pointerPosition.y - layoutInfo.beforeContentPadding,
+                )
+                val itemIndex = layoutInfo.visibleItemsInfo.firstOrNull { item ->
+                    val left = item.offset.x.toFloat()
+                    val top = item.offset.y.toFloat()
+                    val right = left + item.size.width
+                    val bottom = top + item.size.height
+                    contentPosition.x >= left &&
+                        contentPosition.x < right &&
+                        contentPosition.y >= top &&
+                        contentPosition.y < bottom
+                }?.index ?: return
+                if (itemIndex != lastSelectedIndex) {
+                    lastSelectedIndex = itemIndex
+                    currentOnSelectIndex(itemIndex)
+                }
             }
-        }
 
-        detectDragGesturesAfterLongPress(
-            onDragStart = { position ->
-                lastSelectedIndex = null
-                selectAt(position)
-            },
-            onDragEnd = { lastSelectedIndex = null },
-            onDragCancel = { lastSelectedIndex = null },
-            onDrag = { change, _ ->
+            val dragStart = if (selectionModeAtDown) {
+                awaitTouchSlopOrCancellation(down.id) { change, _ ->
+                    change.consume()
+                }?.also { change ->
+                    selectAt(down.position)
+                    selectAt(change.position)
+                }
+            } else {
+                awaitLongPressOrCancellation(down.id)?.also { change ->
+                    selectAt(change.position)
+                    change.consume()
+                }
+            } ?: return@awaitEachGesture
+
+            drag(dragStart.id) { change ->
                 selectAt(change.position)
                 change.consume()
-            },
-        )
+            }
+        }
     }
 }
 
@@ -6550,7 +6577,11 @@ private fun ManageScreen(
                             .fillMaxSize()
                             .background(androidx.compose.ui.graphics.Color.White)
                             .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
-                            .generatedGridDragSelection(videoGridState) { gridIndex ->
+                            .generatedGridDragSelection(
+                                gridState = videoGridState,
+                                selectionMode = selectedVideoKeys.isNotEmpty(),
+                                contentStartPadding = 8.dp,
+                            ) { gridIndex ->
                                 videos.getOrNull(gridIndex)?.let { item ->
                                     if (item.cacheKey in availablePhotoKeys) {
                                         selectedVideoKeys = selectedVideoKeys + item.cacheKey
@@ -6725,7 +6756,11 @@ private fun ManageScreen(
                                     .fillMaxSize()
                                     .background(androidx.compose.ui.graphics.Color.White)
                                     .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
-                                    .generatedGridDragSelection(imageGridState) { gridIndex ->
+                                    .generatedGridDragSelection(
+                                        gridState = imageGridState,
+                                        selectionMode = selectedImageKeys.isNotEmpty(),
+                                        contentStartPadding = 8.dp,
+                                    ) { gridIndex ->
                                         itemsInVersion.getOrNull(gridIndex)?.let { item ->
                                             if (item.photoItem.cacheKey in availablePhotoKeys) {
                                                 selectedImageKeys = selectedImageKeys + "${item.entry.photoKey}|${item.entry.version}"
