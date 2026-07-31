@@ -290,6 +290,8 @@ data class VrCacheEntry(
 }
 
 private val IMAGE_CACHE_FILES = listOf(
+    "left.jpg",
+    "right.jpg",
     "left.webp",
     "right.webp",
     "vr_sbs.jpg",
@@ -449,10 +451,12 @@ private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
-private const val VIDEO_ENCODER_VERSION = "encoderV13"
-private const val VIDEO_FRAME_WEBP_EFFORT = 40
+private const val IMAGE_CACHE_ENCODER_VERSION = "eyesJpegQ100V1"
+private const val IMAGE_EYE_JPEG_QUALITY = 100
+private const val VIDEO_ENCODER_VERSION = "encoderV14"
+private const val VIDEO_FRAME_JPEG_QUALITY = 100
 private const val VIDEO_TARGET_BITS_PER_PIXEL_FRAME = 0.10f
-private val READABLE_VIDEO_ENCODER_VERSIONS = setOf("encoderV12", VIDEO_ENCODER_VERSION)
+private val READABLE_VIDEO_ENCODER_VERSIONS = setOf("encoderV12", "encoderV13", VIDEO_ENCODER_VERSION)
 private val CURRENT_VERSION_TAG: String get() = "v${BuildConfig.VERSION_NAME}"
 private val CURRENT_VERSION_CODE: Long get() = BuildConfig.VERSION_CODE.toLong()
 private const val GITHUB_REPO = "7116-byte/ParallelVrGalleryPro"
@@ -3455,24 +3459,28 @@ private class VrCacheManager(private val context: Context) {
 
     private fun readEntry(photoKey: String, version: String, dir: File): VrCacheEntry? {
         val vr = File(dir, "vr_sbs.jpg")
-        val left = File(dir, "left.webp")
-        val right = File(dir, "right.webp")
+        val splitEyes = listOf(
+            File(dir, "left.jpg") to File(dir, "right.jpg"),
+            File(dir, "left.webp") to File(dir, "right.webp"),
+        ).firstOrNull { (left, right) -> left.exists() && right.exists() }
+        val left = splitEyes?.first
+        val right = splitEyes?.second
         val depth = File(dir, "depth.png")
         val params = File(dir, "params.json")
         val log = File(dir, "job.log")
-        if ((!vr.exists() && (!left.exists() || !right.exists())) || !depth.exists() || !params.exists() || !log.exists()) return null
+        if ((!vr.exists() && splitEyes == null) || !depth.exists() || !params.exists() || !log.exists()) return null
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        if (left.exists() && right.exists()) {
+        if (left != null && right != null) {
             BitmapFactory.decodeFile(left.absolutePath, bounds)
             if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
         } else {
             BitmapFactory.decodeFile(vr.absolutePath, bounds)
             if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
         }
-        val leftWidth = if (left.exists() && right.exists()) bounds.outWidth else max(1, bounds.outWidth / 2)
+        val leftWidth = if (left != null && right != null) bounds.outWidth else max(1, bounds.outWidth / 2)
         val outputWidth = leftWidth * 2
         val outputHeight = bounds.outHeight
-        val modified = listOf(vr, left, right, params, log)
+        val modified = listOfNotNull(vr, left, right, params, log)
             .filter { it.exists() }
             .maxOfOrNull { it.lastModified() }
             ?: dir.lastModified()
@@ -3480,8 +3488,8 @@ private class VrCacheManager(private val context: Context) {
             photoKey = photoKey,
             version = version,
             outputPath = vr.absolutePath,
-            leftPath = left.takeIf { it.exists() }?.absolutePath.orEmpty(),
-            rightPath = right.takeIf { it.exists() }?.absolutePath.orEmpty(),
+            leftPath = left?.absolutePath.orEmpty(),
+            rightPath = right?.absolutePath.orEmpty(),
             depthPath = depth.absolutePath,
             paramsPath = params.absolutePath,
             logPath = log.absolutePath,
@@ -3923,9 +3931,15 @@ private class VrGenerator(
         mark("stereo ${sbsMs}ms output=${pair.sbsWidth}x${pair.height}")
         val writeStart = System.currentTimeMillis()
         val vrPath = File(dir, "vr_sbs.jpg")
-        val leftPath = File(dir, "left.webp")
-        val rightPath = File(dir, "right.webp")
-        val stereoWrite = writeStereoWebpLosslessParallel(pair.left, leftPath, pair.right, rightPath)
+        val leftPath = File(dir, "left.jpg")
+        val rightPath = File(dir, "right.jpg")
+        val stereoWrite = writeStereoJpegParallel(
+            pair.left,
+            leftPath,
+            pair.right,
+            rightPath,
+            IMAGE_EYE_JPEG_QUALITY,
+        )
         onProgress(0.9f)
         val outputWidth = pair.sbsWidth
         val outputHeight = pair.height
@@ -3956,7 +3970,7 @@ private class VrGenerator(
         paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, finalTimingsBeforeLog), Charsets.UTF_8)
         val writeParamsMs = writeParamsFirstMs + (System.currentTimeMillis() - rewriteParamsStart)
         val logWriteStart = System.currentTimeMillis()
-        mark("write leftWebp=${stereoWrite.leftMs}ms rightWebp=${stereoWrite.rightMs}ms params=${writeParamsMs}ms")
+        mark("write leftJpegQ$IMAGE_EYE_JPEG_QUALITY=${stereoWrite.leftMs}ms rightJpegQ$IMAGE_EYE_JPEG_QUALITY=${stereoWrite.rightMs}ms params=${writeParamsMs}ms")
         mark("done total=${System.currentTimeMillis() - start}ms")
         logPath.writeText(log.toString(), Charsets.UTF_8)
         val writeLogMs = System.currentTimeMillis() - logWriteStart
@@ -4613,12 +4627,13 @@ private class VideoVrGenerator(
         val version = params.cacheVersion()
         val dir = cache.entryDir(item, version)
         val framesDir = File(dir, "frames").also { it.mkdirs() }
-        val previousVersion = version.replace("_$VIDEO_ENCODER_VERSION", "_encoderV12")
-        val previousFramesDir = if (previousVersion != version) {
-            File(File(File(cache.root, item.cacheKey), previousVersion), "frames").takeIf { it.isDirectory }
-        } else {
-            null
-        }
+        val previousFramesDirs = listOf("encoderV13", "encoderV12")
+            .asSequence()
+            .map { encoderVersion -> version.replace("_$VIDEO_ENCODER_VERSION", "_$encoderVersion") }
+            .filter { previousVersion -> previousVersion != version }
+            .map { previousVersion -> File(File(File(cache.root, item.cacheKey), previousVersion), "frames") }
+            .filter { candidate -> candidate.isDirectory }
+            .toList()
         val output = File(dir, "vr_sbs.mp4")
         val logPath = File(dir, "job.log")
         val metaPath = File(dir, "video_params.txt")
@@ -4637,13 +4652,15 @@ private class VideoVrGenerator(
         val fps = framePlan.fps
         val totalFrames = framePlan.totalFrames
         mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames frameMode=${if (framePlan.useFrameIndex) "index" else "time"} metadataFrames=${framePlan.metadataFrameCount ?: "-"} captureFps=${framePlan.captureFps ?: "-"} sourceBitrate=${framePlan.sourceBitrate ?: 0} version=$version model=${vrParams.depthModel} threads=${vrParams.modelThreads} depthWorkers=${params.depthWorkers.coerceIn(1, 2)} useGpu=${vrParams.useGpu}")
-        previousFramesDir?.let { mark("frame cache fallback=${it.absolutePath}") }
+        if (previousFramesDirs.isNotEmpty()) {
+            mark("frame cache fallbacks=${previousFramesDirs.joinToString("|") { it.absolutePath }}")
+        }
 
         var width = 0
         var height = 0
         val temporalSmoother = DepthTemporalSmoother()
         frameGenerator.openDepthSession(vrParams, onModelProgress, onRuntimeInfo).use { depthSession ->
-            val cachedFirst = readCachedStereoFrame(framesDir, 0, previousFramesDir)?.also {
+            val cachedFirst = readCachedStereoFrame(framesDir, 0, previousFramesDirs)?.also {
                 onRuntimeInfo("frame cache hit frame=0 version=$version")
             }
             val firstEyes = cachedFirst ?: run {
@@ -4676,7 +4693,7 @@ private class VideoVrGenerator(
                 firstEyes = firstEyes,
                 firstCacheHit = cachedFirst != null,
                 framesDir = framesDir,
-                fallbackFramesDir = previousFramesDir,
+                fallbackFramesDirs = previousFramesDirs,
                 output = output,
                 width = width,
                 height = height,
@@ -4710,8 +4727,8 @@ private class VideoVrGenerator(
                 "depthModel=${vrParams.depthModel}",
                 "cacheVersion=$version",
                 "encoderVersion=$VIDEO_ENCODER_VERSION",
-                "frameCache=split_webp_lossless_e$VIDEO_FRAME_WEBP_EFFORT",
-                "frameCacheFallback=${previousFramesDir?.absolutePath.orEmpty()}",
+                "frameCache=split_jpeg_q$VIDEO_FRAME_JPEG_QUALITY",
+                "frameCacheFallbacks=${previousFramesDirs.joinToString("|") { it.absolutePath }}",
                 "modelThreads=${vrParams.modelThreads}",
                 "depthWorkers=${params.depthWorkers.coerceIn(1, 2)}",
                 "useGpu=${vrParams.useGpu}",
@@ -4781,7 +4798,7 @@ private class VideoVrGenerator(
         firstEyes: StereoBitmapPair,
         firstCacheHit: Boolean,
         framesDir: File,
-        fallbackFramesDir: File?,
+        fallbackFramesDirs: List<File>,
         output: File,
         width: Int,
         height: Int,
@@ -4826,7 +4843,7 @@ private class VideoVrGenerator(
                 format.removeKey(MediaFormat.KEY_PROFILE)
             }
         }
-        mark("encoder codec=${codec.codecInfo.name} bitrate=$targetBitrate sourceBitrate=${framePlan.sourceBitrate ?: 0} mode=${if (useVbr) "VBR" else "default"} highProfile=${format.containsKey(MediaFormat.KEY_PROFILE)} webpEffort=$VIDEO_FRAME_WEBP_EFFORT")
+        mark("encoder codec=${codec.codecInfo.name} bitrate=$targetBitrate sourceBitrate=${framePlan.sourceBitrate ?: 0} mode=${if (useVbr) "VBR" else "default"} highProfile=${format.containsKey(MediaFormat.KEY_PROFILE)} frameCache=jpegQ$VIDEO_FRAME_JPEG_QUALITY")
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         val surface = codec.createInputSurface()
         codec.start()
@@ -4977,7 +4994,7 @@ private class VideoVrGenerator(
                     try {
                         for (frame in 1 until totalFrames) {
                             val decodeStart = SystemClock.uptimeMillis()
-                            val cached = readCachedStereoFrame(framesDir, frame, fallbackFramesDir)
+                            val cached = readCachedStereoFrame(framesDir, frame, fallbackFramesDirs)
                             if (cached != null) {
                                 val decodeMs = SystemClock.uptimeMillis() - decodeStart
                                 onRuntimeInfo("frame cache hit frame=$frame version=$version")
@@ -5421,8 +5438,10 @@ private class DebugExporter(
             out.addFile("source_preview.jpg", preview)
             out.addFile("depth.png", File(entry.depthPath))
             if (entry.hasSplitEyes) {
-                out.addFile("left.webp", File(entry.leftPath))
-                out.addFile("right.webp", File(entry.rightPath))
+                val left = File(entry.leftPath)
+                val right = File(entry.rightPath)
+                out.addFile(left.name, left)
+                out.addFile(right.name, right)
             }
             if (entry.hasLegacySbs) {
                 out.addFile("vr_sbs.jpg", File(entry.outputPath))
@@ -8798,51 +8817,55 @@ private fun replaceOriginalImage(context: Context, photo: PhotoItem, source: Fil
     resolver.update(photo.uri, values, null, null)
 }
 
-private fun writeWebpLossless(bitmap: Bitmap, file: File, effort: Int = 100) {
+private fun writeJpegCache(bitmap: Bitmap, file: File, quality: Int) {
     file.parentFile?.mkdirs()
     FileOutputStream(file).use { output ->
-        check(bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSLESS, effort.coerceIn(0, 100), output)) {
-            "WEBP lossless encode failed: ${file.absolutePath}"
+        check(bitmap.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(1, 100), output)) {
+            "JPEG cache encode failed: ${file.absolutePath}"
         }
     }
 }
 
-private data class StereoWebpWriteTimings(
+private data class StereoWriteTimings(
     val leftMs: Long,
     val rightMs: Long,
 )
 
-private fun writeStereoWebpLosslessParallel(
+private fun writeStereoJpegParallel(
     left: Bitmap,
     leftFile: File,
     right: Bitmap,
     rightFile: File,
-    effort: Int = 100,
-): StereoWebpWriteTimings {
+    quality: Int,
+): StereoWriteTimings {
     return runBlocking {
         val leftJob = async(Dispatchers.Default) {
             val start = System.currentTimeMillis()
-            writeWebpLossless(left, leftFile, effort)
+            writeJpegCache(left, leftFile, quality)
             System.currentTimeMillis() - start
         }
         val rightJob = async(Dispatchers.Default) {
             val start = System.currentTimeMillis()
-            writeWebpLossless(right, rightFile, effort)
+            writeJpegCache(right, rightFile, quality)
             System.currentTimeMillis() - start
         }
-        StereoWebpWriteTimings(leftJob.await(), rightJob.await())
+        StereoWriteTimings(leftJob.await(), rightJob.await())
     }
 }
 
-private fun readCachedStereoFrame(framesDir: File, frame: Int, fallbackFramesDir: File? = null): StereoBitmapPair? {
+private fun readCachedStereoFrame(framesDir: File, frame: Int, fallbackFramesDirs: List<File> = emptyList()): StereoBitmapPair? {
     return readCachedStereoFrameInDir(framesDir, frame)
-        ?: fallbackFramesDir?.let { readCachedStereoFrameInDir(it, frame) }
+        ?: fallbackFramesDirs.asSequence().mapNotNull { readCachedStereoFrameInDir(it, frame) }.firstOrNull()
 }
 
 private fun readCachedStereoFrameInDir(framesDir: File, frame: Int): StereoBitmapPair? {
-    val left = File(framesDir, "left_${frame.toString().padStart(6, '0')}.webp")
-    val right = File(framesDir, "right_${frame.toString().padStart(6, '0')}.webp")
-    if (left.exists() && right.exists()) {
+    val frameNumber = frame.toString().padStart(6, '0')
+    val splitEyes = listOf(
+        File(framesDir, "left_$frameNumber.jpg") to File(framesDir, "right_$frameNumber.jpg"),
+        File(framesDir, "left_$frameNumber.webp") to File(framesDir, "right_$frameNumber.webp"),
+    ).firstOrNull { (left, right) -> left.exists() && right.exists() }
+    if (splitEyes != null) {
+        val (left, right) = splitEyes
         val leftBitmap = BitmapFactory.decodeFile(left.absolutePath) ?: return null
         val rightBitmap = BitmapFactory.decodeFile(right.absolutePath)
         if (rightBitmap == null) {
@@ -8851,7 +8874,7 @@ private fun readCachedStereoFrameInDir(framesDir: File, frame: Int): StereoBitma
         }
         return StereoBitmapPair(leftBitmap, rightBitmap)
     }
-    val legacy = File(framesDir, "frame_${frame.toString().padStart(6, '0')}.jpg")
+    val legacy = File(framesDir, "frame_$frameNumber.jpg")
     if (!legacy.exists()) return null
     val sbs = BitmapFactory.decodeFile(legacy.absolutePath) ?: return null
     return try {
@@ -8867,12 +8890,13 @@ private fun readCachedStereoFrameInDir(framesDir: File, frame: Int): StereoBitma
 
 private fun writeStereoFrameCache(framesDir: File, frame: Int, eyes: StereoBitmapPair) {
     framesDir.mkdirs()
-    writeStereoWebpLosslessParallel(
+    val frameNumber = frame.toString().padStart(6, '0')
+    writeStereoJpegParallel(
         eyes.left,
-        File(framesDir, "left_${frame.toString().padStart(6, '0')}.webp"),
+        File(framesDir, "left_$frameNumber.jpg"),
         eyes.right,
-        File(framesDir, "right_${frame.toString().padStart(6, '0')}.webp"),
-        effort = VIDEO_FRAME_WEBP_EFFORT,
+        File(framesDir, "right_$frameNumber.jpg"),
+        VIDEO_FRAME_JPEG_QUALITY,
     )
 }
 
@@ -8968,7 +8992,7 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, outputWi
           "outputWidth": $outputWidth,
           "outputHeight": $outputHeight,
           "depthModel": "$depthModel",
-          "outputMode": "SPLIT_EYES_WEBP_LOSSLESS",
+          "outputMode": "SPLIT_EYES_JPEG_Q$IMAGE_EYE_JPEG_QUALITY",
           "depthScale": $depthScale,
           "blurRadius": $blurRadius,
           "fillRadius": $fillRadius,
@@ -8998,7 +9022,7 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, outputWi
     """.trimIndent()
 }
 
-private fun VrGenerationParams.cacheVersion(): String {
+private fun VrGenerationParams.visualGenerationVersion(): String {
     val scale = depthScale.roundToInt()
     val invert = if (invertDepth) "inv1" else "inv0"
     val gpu = if (useGpu) "gpu1" else "gpu0"
@@ -9007,8 +9031,12 @@ private fun VrGenerationParams.cacheVersion(): String {
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
 }
 
+private fun VrGenerationParams.cacheVersion(): String {
+    return "${visualGenerationVersion()}_$IMAGE_CACHE_ENCODER_VERSION"
+}
+
 private fun VideoGenerationParams.cacheVersion(): String {
-    return "${toVrParams().cacheVersion()}_dw${depthWorkers.coerceIn(1, 2)}_$VIDEO_ENCODER_VERSION"
+    return "${toVrParams().visualGenerationVersion()}_dw${depthWorkers.coerceIn(1, 2)}_$VIDEO_ENCODER_VERSION"
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
 }
 
