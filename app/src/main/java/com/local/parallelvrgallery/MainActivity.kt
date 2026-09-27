@@ -328,6 +328,7 @@ data class VrGenerationParams(
     val forceGpuNoFallback: Boolean = false,
     val inpaintMode: String = "FOREGROUND_FILL",
     val quality: Int = 94,
+    val edgeMode: DepthEdgeMode = DepthEdgeMode.LEGACY_V6,
 )
 
 data class VideoGenerationParams(
@@ -372,6 +373,7 @@ data class AppSettings(
     val videoModelThreads: Int = 4,
     val videoUseGpu: Boolean = false,
     val videoDepthWorkers: Int = 2,
+    val edgeMode: DepthEdgeMode = DepthEdgeMode.LEGACY_V6,
 ) {
     fun toParams(): VrGenerationParams = VrGenerationParams(
         depthModel = imageModelId,
@@ -384,6 +386,7 @@ data class AppSettings(
         useGpu = useGpu,
         gpuTestMode = gpuTestMode,
         forceGpuNoFallback = useGpu,
+        edgeMode = edgeMode,
     )
 
     fun toVideoParams(): VideoGenerationParams = VideoGenerationParams(
@@ -455,7 +458,6 @@ private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
-private const val IMAGE_GENERATOR_VERSION = "depthV7"
 private const val IMAGE_CACHE_ENCODER_VERSION = "eyesJpegQ100V1"
 private const val IMAGE_EYE_JPEG_QUALITY = 100
 private const val VIDEO_ENCODER_VERSION = "encoderV15"
@@ -731,6 +733,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val generator = VrGenerator(app, cache, modelManager)
     private val videoGenerator = VideoVrGenerator(app, videoCache, generator)
     private val settingsStore = SettingsStore(app)
+    private val imageRuns = GenerationGuard(settingsStore.loadDeletedImageKeys(), settingsStore::saveDeletedImageKeys)
     private val queueTags = QueueTagStore(app)
     private val videoQueueTags = VideoQueueTagStore(app)
     private val pending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
@@ -750,6 +753,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val videoWorkers = mutableListOf<Job>()
     private var currentWorker: Job? = null
     private val activeImageKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val runningImageJobs = java.util.concurrent.ConcurrentHashMap<String, QueuedJob>()
+    private val claimedImageJobs = mutableSetOf<QueuedJob>()
+    private val currentImageFirst = CurrentImageFirst()
 
     private val _uiState = MutableStateFlow(
         UiState(
@@ -817,30 +823,34 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     cacheVersions = cache.summaries(),
                 )
             }
-            _uiState.update {
-                val readyVideoStates = snapshot.videoEntries.keys.associateWith { VideoVrState.READY }
-                val activeVideoStates = it.videoStates.filterValues { state -> state != VideoVrState.NORMAL } - readyVideoStates.keys
-                val snapshotKeys = snapshot.photos.map { item -> item.cacheKey }.toSet()
-                val activeVideoItems = it.videoJobs
-                    .filter { job -> job.state != VideoVrState.READY || job.item.cacheKey !in snapshot.videoEntries }
-                    .map { job -> if (job.item.cacheKey in snapshotKeys) job.item else job.item.copy(generatedVirtual = true) }
-                val mergedPhotos = (snapshot.photos + activeVideoItems)
-                    .distinctBy { item -> item.cacheKey }
-                it.copy(
-                    photos = mergedPhotos,
-                    albums = snapshot.albums,
-                    entries = snapshot.entries,
-                    states = snapshot.entries.keys.associateWith { VrState.READY },
-                    videoStates = activeVideoStates + readyVideoStates,
-                    videoEntries = snapshot.videoEntries,
-                    allOffset = mergedPhotos.count { !it.generatedVirtual },
-                    allExhausted = mergedPhotos.count { !it.generatedVirtual } < INITIAL_MEDIA_LIMIT,
-                    loading = false,
-                    message = "已加载最近 ${mergedPhotos.count { !it.generatedVirtual }} 项媒体，生成库 ${snapshot.managedItems.size + snapshot.videoEntries.size} 项 / Loaded recent media and generated cache",
-                    cacheVersions = snapshot.cacheVersions,
-                    managedCacheItems = snapshot.managedItems,
-                    modelStatus = modelStatusText(it.settings),
-                )
+            synchronized(imageRuns) {
+                val latestManaged = cache.allEntries(snapshot.photos)
+                val latestEntries = latestManaged.groupBy { it.entry.photoKey }.mapValues { (_, items) -> items.maxBy { it.entry.createdAt }.entry }
+                _uiState.update {
+                    val readyVideoStates = snapshot.videoEntries.keys.associateWith { VideoVrState.READY }
+                    val activeVideoStates = it.videoStates.filterValues { state -> state != VideoVrState.NORMAL } - readyVideoStates.keys
+                    val snapshotKeys = snapshot.photos.map { item -> item.cacheKey }.toSet()
+                    val activeVideoItems = it.videoJobs
+                        .filter { job -> job.state != VideoVrState.READY || job.item.cacheKey !in snapshot.videoEntries }
+                        .map { job -> if (job.item.cacheKey in snapshotKeys) job.item else job.item.copy(generatedVirtual = true) }
+                    val mergedPhotos = (snapshot.photos + activeVideoItems)
+                        .distinctBy { item -> item.cacheKey }
+                    it.copy(
+                        photos = mergedPhotos,
+                        albums = snapshot.albums,
+                        entries = latestEntries,
+                        states = latestEntries.keys.associateWith { VrState.READY } + it.states.filterValues { value -> value in setOf(VrState.QUEUED, VrState.GENERATING, VrState.PAUSED, VrState.FAILED) },
+                        videoStates = activeVideoStates + readyVideoStates,
+                        videoEntries = snapshot.videoEntries,
+                        allOffset = mergedPhotos.count { !it.generatedVirtual },
+                        allExhausted = mergedPhotos.count { !it.generatedVirtual } < INITIAL_MEDIA_LIMIT,
+                        loading = false,
+                        message = "已加载最近 ${mergedPhotos.count { !it.generatedVirtual }} 项媒体，生成库 ${latestManaged.size + snapshot.videoEntries.size} 项 / Loaded recent media and generated cache",
+                        cacheVersions = cache.summaries(),
+                        managedCacheItems = latestManaged,
+                        modelStatus = modelStatusText(it.settings),
+                    )
+                }
             }
             if (!restoredQueueTags) {
                 restoredQueueTags = true
@@ -887,9 +897,16 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         openPhoto(index, firstVisibleIndex, firstVisibleOffset, scopeKeys)
     }
 
-    private fun openPhoto(index: Int, firstVisibleIndex: Int, firstVisibleOffset: Int, scopeKeys: List<String>) {
+    private fun openPhoto(index: Int, firstVisibleIndex: Int, firstVisibleOffset: Int, scopeKeys: List<String>) = synchronized(imageRuns) {
         val item = _uiState.value.photos.getOrNull(index)
+        currentImageFirst.select(item?.cacheKey)
+        pauseWaitingImageJobs()
         val queueContext = activeQueueContext(_uiState.value)
+        val orderedKeys = scopeKeys.ifEmpty {
+            _uiState.value.photos.filter {
+                !it.generatedVirtual && (queueContext.source != QueueSource.ALBUM || it.bucketId == queueContext.albumId)
+            }.map { it.cacheKey }
+        }
         _uiState.update {
             it.copy(
                 selectedIndex = index,
@@ -900,21 +917,25 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 vrMode = true,
                 viewerOrigin = ViewerOrigin.NORMAL,
                 manageViewerKeys = emptySet(),
-                viewerScopeKeys = scopeKeys.toSet(),
-                viewerScopeOrderedKeys = scopeKeys,
+                viewerScopeKeys = orderedKeys.toSet(),
+                viewerScopeOrderedKeys = orderedKeys,
                 viewerQueueSource = queueContext.source.name,
                 viewerQueueAlbumId = queueContext.albumId,
+                activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow,
+                prefetchSlotState = PrefetchSlotState(),
                 message = null,
             )
         }
         if (item?.kind == MediaKind.IMAGE) enqueueWindow(index, includeCurrent = true)
     }
 
-    fun openGeneratedPhoto(index: Int, entry: VrCacheEntry? = null) {
+    fun openGeneratedPhoto(index: Int, entry: VrCacheEntry? = null) = synchronized(imageRuns) {
+        currentImageFirst.select(null)
         val photo = _uiState.value.photos.getOrNull(index)
         _uiState.update {
-            val scopedItems = if (entry != null) {
-                it.managedCacheItems.filter { item -> item.entry.version == entry.version }
+            val version = entry?.version ?: it.selectedGeneratedVersion
+            val scopedItems = if (version != null) {
+                it.managedCacheItems.filter { item -> item.entry.version == version }
             } else {
                 it.managedCacheItems
             }
@@ -930,9 +951,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 generatedTab = "images",
                 selectedGeneratedVersion = entry?.version ?: it.selectedGeneratedVersion,
                 viewerOrigin = origin,
+                vrMode = false,
                 manageViewerKeys = keys + listOfNotNull(photo?.cacheKey),
                 viewerScopeKeys = keys + listOfNotNull(photo?.cacheKey),
-                viewerScopeOrderedKeys = scopedItems.map { item -> item.photoItem.cacheKey } + listOfNotNull(photo?.cacheKey),
+                viewerScopeOrderedKeys = (scopedItems.map { item -> item.photoItem.cacheKey } + listOfNotNull(photo?.cacheKey)).distinct(),
                 viewerQueueSource = QueueSource.GENERATED.name,
                 viewerQueueAlbumId = null,
                 entries = if (photo != null && entry != null) it.entries + scopedEntries + (photo.cacheKey to entry) else it.entries,
@@ -941,7 +963,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun openGeneratedVideo(index: Int) {
+    fun openGeneratedVideo(index: Int) = synchronized(imageRuns) {
+        currentImageFirst.select(null)
         _uiState.update {
             val keys = it.photos.filter { item ->
                 item.kind == MediaKind.VIDEO &&
@@ -957,7 +980,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 manageOpen = false,
                 homeTab = if (origin == ViewerOrigin.GENERATED_TAB) "generated" else it.homeTab,
                 generatedTab = "videos",
+                selectedGeneratedVersion = null,
                 viewerOrigin = origin,
+                vrMode = false,
                 manageViewerKeys = keys,
                 viewerScopeKeys = keys,
                 viewerScopeOrderedKeys = keys.toList(),
@@ -968,11 +993,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun closeViewer() {
+    fun closeViewer() = synchronized(imageRuns) {
         val wasNormalViewer = _uiState.value.viewerOrigin == ViewerOrigin.NORMAL
-        if (wasNormalViewer) {
-            clearQueuedImagePrefetch()
-        }
+        currentImageFirst.select(null)
         _uiState.update {
             val currentIndex = it.selectedIndex ?: it.galleryAnchorIndex
             val returnToManage = it.viewerOrigin == ViewerOrigin.MANAGE_MODAL
@@ -999,11 +1022,12 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun setHomeTab(tab: String) {
+    fun setHomeTab(tab: String) = synchronized(imageRuns) {
         _uiState.update {
             it.copy(
                 homeTab = tab,
                 manageOpen = false,
+                vrMode = if (it.selectedIndex == null) false else it.vrMode,
                 selectedGeneratedVersion = if (tab == "generated") it.selectedGeneratedVersion else null,
             )
         }
@@ -1462,7 +1486,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         startWorker()
     }
 
-    fun onPagerIndexChanged(index: Int) {
+    fun onPagerIndexChanged(index: Int) = synchronized(imageRuns) {
+        val before = _uiState.value
+        if (before.selectedIndex == null || before.selectedIndex == index || index !in viewerScopeIndices(before)) return
+        currentImageFirst.select(before.photos.getOrNull(index)?.cacheKey)
+        if (before.viewerOrigin == ViewerOrigin.NORMAL && before.vrMode) pauseWaitingImageJobs()
         _uiState.update { it.copy(selectedIndex = index, galleryAnchorIndex = index, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow, prefetchSlotState = PrefetchSlotState()) }
         val state = _uiState.value
         if (state.viewerOrigin != ViewerOrigin.NORMAL) return
@@ -1483,9 +1511,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
             return
         }
+        if (_uiState.value.viewerOrigin != ViewerOrigin.NORMAL || isGeneratedQueueSurface(_uiState.value)) return
         if (_uiState.value.vrMode) {
             stopVr()
         } else {
+            synchronized(imageRuns) { currentImageFirst.select(item.cacheKey) }
             _uiState.update { it.copy(vrMode = true, selectedIndex = index, message = null, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow, prefetchSlotState = PrefetchSlotState()) }
             enqueueWindow(index, includeCurrent = true)
         }
@@ -1583,25 +1613,16 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun deleteCacheVersion(version: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val affectedKeys = _uiState.value.managedCacheItems
-                .filter { it.entry.version == version }
-                .map { it.entry.photoKey }
-                .toSet()
-            cache.deleteVersion(version)
-            val photos = _uiState.value.photos
-            val entries = photos.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey }
-            if (entries.isEmpty()) clearAllImageQueues() else clearImageQueueForKeys(affectedKeys)
-            _uiState.update {
-                it.copy(
-                    entries = entries,
-                    states = photos.associate { photo -> photo.cacheKey to if (entries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
-                    cacheVersions = cache.summaries(),
-                    managedCacheItems = cache.allEntries(photos),
-                    message = "已删除版本 / Deleted version: $version",
-                )
-            }
-        }
+        deleteCacheVersions(listOf(version))
+    }
+
+    fun deleteCacheVersions(versions: List<String>) {
+        val selected = versions.toSet()
+        if (selected.isEmpty()) return
+        deleteImageWork(
+            entries = _uiState.value.managedCacheItems.filter { it.entry.version in selected },
+            versions = selected,
+        )
     }
 
     fun saveGeneratedCopy(context: Context, index: Int) {
@@ -1689,20 +1710,53 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun deleteGeneratedImageEntries(entries: List<ManagedCacheItem>) {
+        if (entries.isNotEmpty()) deleteImageWork(entries)
+    }
+
+    private fun deleteImageWork(entries: List<ManagedCacheItem>, versions: Set<String> = emptySet()) {
+        // Invalidate synchronously: a worker finishing during the IO dispatch cannot resurrect a deletion.
+        val selectedIdentities = entries.mapTo(hashSetOf()) { it.entry.photoKey to it.entry.version }
+        val (keys, deletingAll) = synchronized(imageRuns) {
+            val jobs = synchronized(pending) { pending.toList() } +
+                synchronized(currentPending) { currentPending.toList() } +
+                synchronized(paused) { paused.values.toList() } + claimedImageJobs + runningImageJobs.values.toList()
+            val deletingAll = _uiState.value.managedCacheItems.all { item ->
+                item.entry.version in versions || (item.entry.photoKey to item.entry.version) in selectedIdentities
+            }
+            val affected = entries.mapTo(mutableSetOf()) { it.entry.photoKey }
+            if (deletingAll) {
+                affected += _uiState.value.jobs.map { it.photoItem.cacheKey }
+                affected += queueTags.load().map { it.photoKey }
+            }
+            jobs.filter { deletingAll || it.params?.cacheVersion() in versions }.mapTo(affected) { it.photo.cacheKey }
+            imageRuns.invalidate(affected)
+            clearImageQueueForKeys(affected)
+            _uiState.update { it.copy(blockingMessage = it.settings.language.t("删除中", "Deleting")) }
+            affected to deletingAll
+        }
         viewModelScope.launch(Dispatchers.IO) {
-            val deletedKeys = entries.map { it.entry.photoKey }.toSet()
-            entries.forEach { cache.deleteEntry(it.entry) }
-            val photos = _uiState.value.photos
-            val currentEntries = photos.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey }
-            if (currentEntries.isEmpty()) clearAllImageQueues() else clearImageQueueForKeys(deletedKeys)
-            _uiState.update {
-                it.copy(
-                    entries = currentEntries,
-                    states = photos.associate { photo -> photo.cacheKey to if (currentEntries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
-                    cacheVersions = cache.summaries(),
-                    managedCacheItems = cache.allEntries(photos),
-                    message = "已删除 ${entries.size} 张图片 VR 缓存",
-                )
+            try {
+                synchronized(imageRuns) {
+                    versions.forEach { cache.deleteVersion(it) }
+                    entries.filter { it.entry.version !in versions }.forEach { cache.deleteEntry(it.entry) }
+                    val photos = _uiState.value.photos
+                    if (deletingAll) cache.allEntries(photos).filter { it.entry.photoKey in keys }.forEach { cache.deleteEntry(it.entry) }
+                    val remaining = cache.allEntries(photos)
+                    val currentEntries = remaining.groupBy { it.entry.photoKey }.mapValues { (_, items) -> items.maxBy { it.entry.createdAt }.entry }
+                    _uiState.update {
+                        it.copy(
+                            entries = currentEntries,
+                            states = (it.states - keys) + currentEntries.keys.associateWith { VrState.READY },
+                            cacheVersions = cache.summaries(),
+                            managedCacheItems = remaining,
+                            selectedGeneratedVersion = it.selectedGeneratedVersion?.takeUnless { version -> version in versions },
+                            blockingMessage = null,
+                            message = it.settings.language.t("已删除 ${entries.size} 张图片缓存，相关任务已取消", "Deleted ${entries.size} image caches and cancelled their jobs"),
+                        )
+                    }
+                }
+            } catch (error: Exception) {
+                _uiState.update { it.copy(blockingMessage = null, message = "删除失败 / Delete failed: ${error.message}") }
             }
         }
     }
@@ -1746,26 +1800,42 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun regenerateImages(indexes: List<Int>) {
-        val unique = indexes.distinct()
-        if (unique.isEmpty()) return
+        val photos = indexes.distinct().mapNotNull { _uiState.value.photos.getOrNull(it) }.filter { it.kind == MediaKind.IMAGE }
+        if (photos.isEmpty()) return
+        val tokens = synchronized(imageRuns) {
+            val keys = photos.mapTo(mutableSetOf()) { it.cacheKey }
+            imageRuns.invalidate(keys)
+            clearImageQueueForKeys(keys)
+            photos.associate { photo ->
+                imageRuns.explicitlyRequest(photo.cacheKey)
+                photo.cacheKey to imageRuns.token(photo.cacheKey)
+            }
+        }
         viewModelScope.launch(Dispatchers.IO) {
-            val photos = unique.mapNotNull { _uiState.value.photos.getOrNull(it) }.filter { it.kind == MediaKind.IMAGE }
-            photos.forEach { cache.deletePhoto(it) }
-            _uiState.update {
-                val keys = photos.map { photo -> photo.cacheKey }.toSet()
-                it.copy(
-                    vrMode = true,
-                    entries = it.entries - keys,
-                    states = it.states + keys.associateWith { VrState.NORMAL },
-                    cacheVersions = cache.summaries(),
-                    managedCacheItems = cache.allEntries(it.photos),
-                    message = "已清理缓存并加入 ${photos.size} 张图片重新生成队列",
-                )
+            try {
+                synchronized(imageRuns) {
+                    val valid = photos.filter { imageRuns.isCurrent(it.cacheKey, tokens.getValue(it.cacheKey)) }
+                    if (valid.isEmpty()) return@synchronized
+                    valid.forEach { cache.deletePhoto(it) }
+                    _uiState.update {
+                        val keys = valid.map { photo -> photo.cacheKey }.toSet()
+                        it.copy(
+                            entries = it.entries - keys,
+                            states = it.states + keys.associateWith { VrState.NORMAL },
+                            cacheVersions = cache.summaries(),
+                            managedCacheItems = cache.allEntries(it.photos),
+                            message = "已清理缓存并加入 ${valid.size} 张图片重新生成队列",
+                        )
+                    }
+                    valid.forEachIndexed { order, photo ->
+                        val index = _uiState.value.photos.indexOfFirst { it.cacheKey == photo.cacheKey }
+                        if (index >= 0) enqueuePhoto(index, priority = order + 1, force = true, current = false, context = QueueContext(QueueSource.GENERATED, null))
+                    }
+                    startWorker()
+                }
+            } catch (error: Exception) {
+                _uiState.update { it.copy(message = "重新生成失败 / Regenerate failed: ${error.message}") }
             }
-            unique.forEachIndexed { order, index ->
-                enqueuePhoto(index, priority = order + 1, force = true, current = false, context = QueueContext(QueueSource.GENERATED, null))
-            }
-            startWorker()
         }
     }
 
@@ -1831,10 +1901,19 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         enqueueWindow(index, includeCurrent = false)
     }
 
-    private fun enqueueWindow(index: Int, includeCurrent: Boolean) {
+    private fun canPrefetch(state: UiState): Boolean = ViewerScope.canPrefetch(
+        vrMode = state.vrMode,
+        normalOrigin = state.viewerOrigin == ViewerOrigin.NORMAL,
+        viewerOpen = state.selectedIndex != null,
+        imageSelected = state.selectedIndex?.let { state.photos.getOrNull(it)?.kind == MediaKind.IMAGE } == true,
+        generatedSurface = isGeneratedQueueSurface(state),
+        hasSourceScope = state.viewerScopeOrderedKeys.isNotEmpty() && state.viewerQueueSource in setOf(QueueSource.ALL.name, QueueSource.ALBUM.name),
+    )
+
+    private fun enqueueWindow(index: Int, includeCurrent: Boolean) = synchronized(imageRuns) {
         val state = _uiState.value
         val photos = state.photos
-        if (!ViewerScope.canPrefetch(state.vrMode, state.viewerOrigin == ViewerOrigin.NORMAL)) return
+        if (!canPrefetch(state) || index != state.selectedIndex) return
         if (photos.isEmpty()) return
         val scopeIndices = ViewerScope.indices(photos.map { it.cacheKey }, state.viewerScopeOrderedKeys, state.viewerScopeKeys)
         val scopePosition = scopeIndices.indexOf(index)
@@ -1848,11 +1927,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (includeCurrent) {
             promoteCurrentImageForVr(index, queueContext)
         }
+        if (!currentImageFirst.permits(photos[index].cacheKey, cache.findEntry(photos[index], currentVersion) != null)) return
         val occupiedStates = setOf(VrState.QUEUED, VrState.GENERATING)
         fun eligibleAt(position: Int): Int? {
             val photoIndex = scopeIndices.getOrNull(position) ?: return null
             val photo = photos[photoIndex]
             if (photo.kind != MediaKind.IMAGE) return null
+            if (!imageRuns.permitsAutomatic(photo.cacheKey)) return null
             if (photo.cacheKey in targetKeys) return null
             val itemState = state.states[photo.cacheKey] ?: VrState.NORMAL
             if (itemState in occupiedStates) return null
@@ -1923,7 +2004,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
 
         synchronized(pending) {
-            val keep = targets.map { photos[it.first].cacheKey }.toSet()
+            val limit = if (state.settings.autoPrefetch) 8 else window
+            val keep = targets.map { photos[it.first].cacheKey }.toSet() +
+                (max(0, scopePosition - limit)..min(scopeIndices.lastIndex, scopePosition + limit))
+                    .map { photos[scopeIndices[it]].cacheKey }
             val toPause = pending.filter { sameQueueSource(it, queueContext) && it.photo.cacheKey !in keep }
             pending.removeAll(toPause.toSet())
             toPause.forEach { job ->
@@ -1939,10 +2023,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         startWorker()
     }
 
-    private fun promoteCurrentImageForVr(index: Int, context: QueueContext? = null) {
+    private fun promoteCurrentImageForVr(index: Int, context: QueueContext? = null) = synchronized(imageRuns) {
         val photo = _uiState.value.photos.getOrNull(index) ?: return
         if (photo.kind != MediaKind.IMAGE) return
-        if (photo.cacheKey in activeImageKeys) return
+        imageRuns.explicitlyRequest(photo.cacheKey)
+        if (runningImageJobs[photo.cacheKey]?.let { imageRuns.isCurrent(photo.cacheKey, it.runToken) } == true) return
         val currentVersion = _uiState.value.settings.toParams().cacheVersion()
         cache.findEntry(photo, currentVersion)?.let { entry ->
             markReady(photo.cacheKey, entry)
@@ -1950,7 +2035,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             return
         }
         val queueContext = context ?: activeQueueContext(_uiState.value)
-        val job = QueuedJob(photo, priority = 0, sequence = sequence++, source = queueContext.source, albumId = queueContext.albumId)
+        val job = QueuedJob(photo, priority = 0, sequence = sequence++, source = queueContext.source, albumId = queueContext.albumId,
+            runToken = imageRuns.token(photo.cacheKey), params = _uiState.value.settings.toParams())
         synchronized(pending) { pending.removeAll { it.photo.cacheKey == photo.cacheKey } }
         synchronized(paused) {
             paused.remove(photo.cacheKey)
@@ -1968,9 +2054,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         startCurrentWorker()
     }
 
-    private fun enqueuePhoto(index: Int, priority: Int, force: Boolean, current: Boolean = false, context: QueueContext? = null) {
-        val photo = _uiState.value.photos.getOrNull(index) ?: return
+    private fun enqueuePhoto(index: Int, priority: Int, force: Boolean, current: Boolean = false, context: QueueContext? = null) = synchronized(imageRuns) {
+        val state = _uiState.value
+        val photo = state.photos.getOrNull(index) ?: return
         if (photo.kind != MediaKind.IMAGE) return
+        if (!force && !current && (!canPrefetch(state) || photo.cacheKey !in state.viewerScopeKeys)) return
+        if (force || current) imageRuns.explicitlyRequest(photo.cacheKey)
+        else if (!imageRuns.permitsAutomatic(photo.cacheKey)) return
         val currentVersion = _uiState.value.settings.toParams().cacheVersion()
         if (!force && cache.findEntry(photo, currentVersion) != null) {
             markState(photo.cacheKey, VrState.READY)
@@ -1986,16 +2076,16 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             promoteCurrentImageForVr(index, queueContext)
             return
         }
-        val job = if (resumableAutoPaused) {
+        val job = (if (resumableAutoPaused) {
             synchronized(paused) {
                 val old = paused.remove(photo.cacheKey)
                 autoPausedKeys.remove(photo.cacheKey)
                 sourcePausedKeys.remove(photo.cacheKey)
-                old?.copy(priority = priority, sequence = sequence++) ?: QueuedJob(photo, priority, sequence++, queueContext.source, queueContext.albumId)
+                old?.copy(priority = priority, sequence = sequence++, source = queueContext.source, albumId = queueContext.albumId) ?: QueuedJob(photo, priority, sequence++, queueContext.source, queueContext.albumId)
             }
         } else {
             QueuedJob(photo, priority, sequence++, queueContext.source, queueContext.albumId)
-        }
+        }).copy(runToken = imageRuns.token(photo.cacheKey), params = _uiState.value.settings.toParams())
         synchronized(pending) { pending.removeAll { it.photo.cacheKey == photo.cacheKey } }
         if (!resumableAutoPaused) {
             synchronized(paused) {
@@ -2008,15 +2098,22 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         queueTags.upsert(job, VrState.QUEUED)
         markState(photo.cacheKey, VrState.QUEUED)
         upsertJob(photo, priority, VrState.QUEUED, 0f, source = job.source, albumId = job.albumId)
-        addLog("${if (current) "current" else "queued"} ${photo.displayName} p=$priority source=${queueContext.source}${queueContext.albumId?.let { ":$it" } ?: ""}")
+        val admission = if (force) "manual" else if (resumableAutoPaused) "resume-window" else "new-prefetch"
+        addLog("image $admission ${photo.displayName} p=$priority source=${queueContext.source}${queueContext.albumId?.let { ":$it" } ?: ""} scope=${state.viewerScopeOrderedKeys.size}")
     }
 
-    private fun startWorker() {
+    private fun startWorker(): Unit = synchronized(imageRuns) {
         workers.removeAll { !it.isActive }
         val desired = _uiState.value.settings.generationWorkers.coerceIn(1, 3)
         repeat((desired - workers.size).coerceAtLeast(0)) {
             workers += viewModelScope.launch(Dispatchers.IO) {
-                workerLoop()
+                try { workerLoop() } finally {
+                    val self = kotlin.coroutines.coroutineContext[Job]
+                    synchronized(imageRuns) {
+                        workers.remove(self)
+                        if (self?.isActive == true && synchronized(pending) { pending.any { jobAllowedInCurrentContext(it, _uiState.value) } }) startWorker()
+                    }
+                }
             }
         }
     }
@@ -2037,13 +2134,28 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         return job.source == context.source && (job.source != QueueSource.ALBUM || job.albumId == context.albumId)
     }
 
+    private fun pauseWaitingImageJobs() = synchronized(imageRuns) {
+        val waiting = synchronized(pending) { pending.toList().also { pending.clear() } } +
+            synchronized(currentPending) { currentPending.toList().also { currentPending.clear() } }
+        synchronized(paused) {
+            waiting.filter { imageRuns.isCurrent(it.photo.cacheKey, it.runToken) }.forEach { job ->
+                paused[job.photo.cacheKey] = job
+                autoPausedKeys += job.photo.cacheKey
+                queueTags.upsert(job, VrState.PAUSED)
+                markState(job.photo.cacheKey, VrState.PAUSED)
+                upsertJob(job.photo, job.priority, VrState.PAUSED, 0f, source = job.source, albumId = job.albumId)
+            }
+        }
+    }
+
     private fun isGeneratedQueueSurface(state: UiState): Boolean {
         return state.homeTab == "generated" || state.manageOpen || (state.selectedIndex != null && state.viewerOrigin != ViewerOrigin.NORMAL)
     }
 
     private fun jobAllowedInCurrentContext(job: QueuedJob, state: UiState): Boolean {
+        if (!imageRuns.isCurrent(job.photo.cacheKey, job.runToken)) return false
         if (isGeneratedQueueSurface(state)) {
-            return sameQueueSource(job, QueueContext(QueueSource.GENERATED, null))
+            return sameQueueSource(job, QueueContext(QueueSource.GENERATED, null)) || synchronized(paused) { job.photo.cacheKey in sourcePausedKeys }
         }
         if (state.vrMode && state.viewerOrigin == ViewerOrigin.NORMAL && state.viewerScopeOrderedKeys.isNotEmpty() && job.photo.cacheKey !in state.viewerScopeOrderedKeys) {
             return false
@@ -2051,18 +2163,21 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         return sameQueueSource(job, activeQueueContext(state))
     }
 
-    private fun pollAllowedPendingJob(): QueuedJob? {
+    private fun pollAllowedPendingJob(): QueuedJob? = synchronized(imageRuns) {
         val state = _uiState.value
         return synchronized(pending) {
             val job = pending
                 .sortedWith(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
                 .firstOrNull { jobAllowedInCurrentContext(it, state) }
-            if (job != null) pending.remove(job)
+            if (job != null) {
+                pending.remove(job)
+                claimedImageJobs += job
+            }
             job
         }
     }
 
-    private fun pollAllowedCurrentJob(): QueuedJob? {
+    private fun pollAllowedCurrentJob(): QueuedJob? = synchronized(imageRuns) {
         val state = _uiState.value
         val deferred = mutableListOf<QueuedJob>()
         val allowed = synchronized(currentPending) {
@@ -2085,10 +2200,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
         }
+        if (allowed != null) claimedImageJobs += allowed
         return allowed
     }
 
-    private fun rebalanceQueueForActiveSource() {
+    private fun rebalanceQueueForActiveSource() = synchronized(imageRuns) {
         val state = _uiState.value
         val disallowed = synchronized(pending) {
             val items = pending.filterNot { jobAllowedInCurrentContext(it, state) }
@@ -2114,8 +2230,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
         }
         val restored = synchronized(paused) {
-            val requiredPausedKeys = if (isGeneratedQueueSurface(state)) sourcePausedKeys else autoPausedKeys
-            val items = paused.values.filter { it.photo.cacheKey in requiredPausedKeys && jobAllowedInCurrentContext(it, state) }
+            // Window-paused jobs are admitted only by enqueueWindow, never by a global source rebalance.
+            val items = paused.values.filter {
+                ViewerScope.canResumeExisting(it.photo.cacheKey in sourcePausedKeys, state.selectedIndex != null, isGeneratedQueueSurface(state)) &&
+                    jobAllowedInCurrentContext(it, state)
+            }
             val keepAutoPaused = isGeneratedQueueSurface(state)
             items.forEach {
                 paused.remove(it.photo.cacheKey)
@@ -2132,6 +2251,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 queueTags.upsert(job, VrState.QUEUED)
                 markState(job.photo.cacheKey, VrState.QUEUED)
                 upsertJob(job.photo, job.priority, VrState.QUEUED, 0f, source = job.source, albumId = job.albumId)
+                addLog("image resume-source ${job.photo.displayName} source=${job.source}${job.albumId?.let { ":$it" } ?: ""} surface=${state.homeTab}; existing job only")
             }
         }
     }
@@ -2144,6 +2264,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val pausedJobs = mutableListOf<QueuedJob>()
         queueTags.load().forEach { tag ->
             val photo = photoByKey[tag.photoKey] ?: return@forEach
+            if (!imageRuns.permitsAutomatic(tag.photoKey)) {
+                queueTags.remove(tag.photoKey)
+                return@forEach
+            }
             if (cache.findEntry(photo, state.settings.toParams().cacheVersion()) != null) {
                 queueTags.remove(tag.photoKey)
                 restoredStates[tag.photoKey] = VrState.READY
@@ -2159,7 +2283,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
             restoredStates[tag.photoKey] = restoredState
             if (restoredState == VrState.FAILED || restoredState == VrState.READY) return@forEach
-            val job = QueuedJob(photo, tag.priority, sequence++, tag.source, tag.albumId)
+            val job = QueuedJob(photo, tag.priority, sequence++, tag.source, tag.albumId,
+                runToken = imageRuns.token(photo.cacheKey), params = state.settings.toParams())
             if (jobAllowedInCurrentContext(job, state) && restoredState != VrState.PAUSED) {
                 pendingJobs += job
             } else {
@@ -2238,26 +2363,30 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun startCurrentWorker() {
+    private fun startCurrentWorker(): Unit = synchronized(imageRuns) {
         if (currentWorker?.isActive == true) return
         currentWorker = viewModelScope.launch(Dispatchers.IO) {
-            var idleChecks = 0
-            while (true) {
-                if (!_uiState.value.vrMode) {
-                    synchronized(currentPending) { currentPending.clear() }
-                    break
-                }
-                val next = pollAllowedCurrentJob()
-                if (next == null) {
-                    if (idleChecks++ < 3) {
-                        delay(50)
-                        continue
+            try {
+                var idleChecks = 0
+                while (true) {
+                    val next = pollAllowedCurrentJob()
+                    if (next == null) {
+                        if (idleChecks++ < 3) {
+                            delay(50)
+                            continue
+                        }
+                        break
                     }
-                    break
+                    idleChecks = 0
+                    processJob(next)
+                    delay(25)
                 }
-                idleChecks = 0
-                processJob(next)
-                delay(25)
+            } finally {
+                val self = kotlin.coroutines.coroutineContext[Job]
+                synchronized(imageRuns) {
+                    if (currentWorker === self) currentWorker = null
+                    if (self?.isActive == true && synchronized(currentPending) { currentPending.any { jobAllowedInCurrentContext(it, _uiState.value) } }) startCurrentWorker()
+                }
             }
         }
     }
@@ -2466,87 +2595,156 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private suspend fun workerLoop() {
-            while (true) {
-                if (!_uiState.value.vrMode) {
-                    synchronized(pending) { pending.clear() }
-                    break
+        while (true) {
+            rebalanceQueueForActiveSource()
+            val next = pollAllowedPendingJob()
+            if (next == null) {
+                if (expandAutoPrefetchIfNeeded()) {
+                    delay(50)
+                    continue
                 }
-                rebalanceQueueForActiveSource()
-                val next = pollAllowedPendingJob()
-                if (next == null) {
-                    if (expandAutoPrefetchIfNeeded()) {
-                        delay(50)
-                        continue
-                    }
-                    break
-                }
-                processJob(next)
-                delay(50)
+                break
             }
+            processJob(next)
+            delay(50)
+        }
     }
 
-    private fun processJob(next: QueuedJob) {
-        if (!activeImageKeys.add(next.photo.cacheKey)) return
+    private fun releaseCurrentPrefetch(key: String) = synchronized(imageRuns) {
+        val state = _uiState.value
+        val selected = state.selectedIndex ?: return
+        if (canPrefetch(state) && state.photos.getOrNull(selected)?.cacheKey == key &&
+            !currentImageFirst.permits(key, cached = false)) {
+            currentImageFirst.started(key)
+            enqueueWindow(selected, includeCurrent = false)
+        }
+    }
+
+    private suspend fun processJob(next: QueuedJob) {
+        val coroutineJob = kotlin.coroutines.coroutineContext[Job]
+        var ownsKey = false
         try {
-            queueTags.upsert(next, VrState.GENERATING)
-            markState(next.photo.cacheKey, VrState.GENERATING)
-            upsertJob(next.photo, next.priority, VrState.GENERATING, 0.1f, source = next.source, albumId = next.albumId)
+            while (!activeImageKeys.add(next.photo.cacheKey)) {
+                if (!imageRuns.isCurrent(next.photo.cacheKey, next.runToken)) return
+                delay(25)
+            }
+            ownsKey = true
+            val params = next.params ?: _uiState.value.settings.toParams()
+            var alreadyReady = false
+            var sourceChanged = false
+            if (!imageRuns.ifCurrent(next.photo.cacheKey, next.runToken) {
+                if (!jobAllowedInCurrentContext(next, _uiState.value)) {
+                    synchronized(paused) {
+                        paused[next.photo.cacheKey] = next
+                        autoPausedKeys += next.photo.cacheKey
+                        sourcePausedKeys += next.photo.cacheKey
+                    }
+                    queueTags.upsert(next, VrState.PAUSED)
+                    markState(next.photo.cacheKey, VrState.PAUSED)
+                    upsertJob(next.photo, next.priority, VrState.PAUSED, 0f, source = next.source, albumId = next.albumId)
+                    sourceChanged = true
+                    return@ifCurrent
+                }
+                runningImageJobs[next.photo.cacheKey] = next
+                val cached = cache.findEntry(next.photo, params.cacheVersion())
+                if (cached != null) {
+                    queueTags.remove(next.photo.cacheKey)
+                    synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey); sourcePausedKeys.remove(next.photo.cacheKey) }
+                    markReady(next.photo.cacheKey, cached)
+                    upsertJob(next.photo, next.priority, VrState.READY, 1f, source = next.source, albumId = next.albumId)
+                    alreadyReady = true
+                    releaseCurrentPrefetch(next.photo.cacheKey)
+                } else {
+                    queueTags.upsert(next, VrState.GENERATING)
+                    markState(next.photo.cacheKey, VrState.GENERATING)
+                    upsertJob(next.photo, next.priority, VrState.GENERATING, 0.1f, source = next.source, albumId = next.albumId)
+                }
+            } || alreadyReady || sourceChanged) return
             val started = System.currentTimeMillis()
             val result = runCatching {
                 generator.generate(
                     next.photo,
-                    _uiState.value.settings.toParams(),
+                    params,
                     priority = next.priority,
+                    shouldContinue = { coroutineJob?.isActive != false && imageRuns.isCurrent(next.photo.cacheKey, next.runToken) },
+                    commit = { entry ->
+                        var published: VrCacheEntry? = null
+                        imageRuns.ifCurrent(next.photo.cacheKey, next.runToken) { published = cache.publish(next.photo, entry) }
+                        published ?: throw ImageJobObsoleteException()
+                    },
                     onModelProgress = { progress ->
-                        _uiState.update {
-                            it.copy(
-                                modelProgress = progress,
-                                modelStatus = if (progress < 1f) {
-                                    "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%"
-                                } else {
-                                    "模型已就绪 / Model ready"
-                                },
-                            )
+                        imageRuns.ifCurrent(next.photo.cacheKey, next.runToken) {
+                            _uiState.update {
+                                it.copy(
+                                    modelProgress = progress,
+                                    modelStatus = if (progress < 1f) {
+                                        "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%"
+                                    } else {
+                                        "模型已就绪 / Model ready"
+                                    },
+                                )
+                            }
                         }
                     },
                 ) { progress ->
-                    upsertJob(next.photo, next.priority, VrState.GENERATING, progress, source = next.source, albumId = next.albumId)
+                    imageRuns.ifCurrent(next.photo.cacheKey, next.runToken) {
+                        upsertJob(next.photo, next.priority, VrState.GENERATING, progress, source = next.source, albumId = next.albumId)
+                        if (progress >= 0.30f) releaseCurrentPrefetch(next.photo.cacheKey)
+                    }
                 }
             }
             result.onSuccess { entry ->
-                queueTags.remove(next.photo.cacheKey)
-                synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey) }
-                markReady(next.photo.cacheKey, entry)
-                upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis(), source = next.source, albumId = next.albumId)
-                addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
-                val currentState = _uiState.value
-                val selected = currentState.selectedIndex ?: currentState.galleryAnchorIndex
-                val doneIndex = currentState.photos.indexOfFirst { it.cacheKey == next.photo.cacheKey }
-                val generationInfo = LastGenerationInfo(relativeIndexInViewerScope(currentState, doneIndex, selected), System.currentTimeMillis() - started)
-                _uiState.update {
-                    it.copy(
-                        modelProgress = null,
-                        modelStatus = modelStatusText(it.settings),
-                        lastGeneration = generationInfo,
-                        recentGenerations = (listOf(generationInfo) + it.recentGenerations).take(3),
-                    )
+                imageRuns.ifCurrent(next.photo.cacheKey, next.runToken) {
+                    queueTags.remove(next.photo.cacheKey)
+                    synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey); sourcePausedKeys.remove(next.photo.cacheKey) }
+                    markReady(next.photo.cacheKey, entry)
+                    releaseCurrentPrefetch(next.photo.cacheKey)
+                    upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis(), source = next.source, albumId = next.albumId)
+                    addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
+                    val currentState = _uiState.value
+                    val selected = currentState.selectedIndex ?: currentState.galleryAnchorIndex
+                    val doneIndex = currentState.photos.indexOfFirst { it.cacheKey == next.photo.cacheKey }
+                    val generationInfo = LastGenerationInfo(relativeIndexInViewerScope(currentState, doneIndex, selected), System.currentTimeMillis() - started)
+                    _uiState.update {
+                        it.copy(
+                            modelProgress = null,
+                            modelStatus = modelStatusText(it.settings),
+                            lastGeneration = generationInfo,
+                            recentGenerations = (listOf(generationInfo) + it.recentGenerations).take(3),
+                        )
+                    }
                 }
             }.onFailure { error ->
-                synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey) }
-                queueTags.upsert(next, VrState.FAILED)
-                markState(next.photo.cacheKey, VrState.FAILED)
-                upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message, source = next.source, albumId = next.albumId)
-                addLog("failed ${next.photo.displayName}: ${error.message}")
+                if (error is java.util.concurrent.CancellationException) {
+                    if (coroutineJob?.isActive == false) throw error
+                    addLog("image cancelled ${next.photo.displayName}; stale output discarded")
+                    return@onFailure
+                }
+                imageRuns.ifCurrent(next.photo.cacheKey, next.runToken) {
+                    synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey); sourcePausedKeys.remove(next.photo.cacheKey) }
+                    queueTags.upsert(next, VrState.FAILED)
+                    markState(next.photo.cacheKey, VrState.FAILED)
+                    upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message, source = next.source, albumId = next.albumId)
+                    addLog("failed ${next.photo.displayName}: ${error.message}")
+                }
             }
-        } finally { activeImageKeys.remove(next.photo.cacheKey) }
+        } finally {
+            synchronized(imageRuns) {
+                claimedImageJobs.remove(next)
+                if (ownsKey) {
+                    runningImageJobs.remove(next.photo.cacheKey, next)
+                    activeImageKeys.remove(next.photo.cacheKey)
+                }
+            }
+        }
     }
 
-    private fun expandAutoPrefetchIfNeeded(): Boolean {
+    private fun expandAutoPrefetchIfNeeded(): Boolean = synchronized(imageRuns) {
         var attempts = 0
         while (attempts++ < 3) {
             val state = _uiState.value
-            if (!state.vrMode || !state.settings.autoPrefetch || state.viewerOrigin != ViewerOrigin.NORMAL) return false
-            val selected = state.selectedIndex ?: state.galleryAnchorIndex
+            if (!canPrefetch(state) || !state.settings.autoPrefetch) return false
+            val selected = state.selectedIndex ?: return false
             val before = state.prefetchSlotState
             if (before.tier >= 8 && before.prevDone >= 4 && before.nextDone >= 4) return false
             enqueueWindow(selected, includeCurrent = false)
@@ -2577,7 +2775,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(states = it.states + (key to state)) }
     }
 
-    private fun refreshGeneratedLibrary(message: String? = null) {
+    private fun refreshGeneratedLibrary(message: String? = null): Unit = synchronized(imageRuns) {
         val photos = _uiState.value.photos
         val imageEntries = photos
             .filter { it.kind == MediaKind.IMAGE }
@@ -2709,7 +2907,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 }
 
-private data class QueuedJob(val photo: PhotoItem, val priority: Int, val sequence: Long, val source: QueueSource, val albumId: String?)
+private data class QueuedJob(val photo: PhotoItem, val priority: Int, val sequence: Long, val source: QueueSource, val albumId: String?, val runToken: Long = 0L, val params: VrGenerationParams? = null)
+
+private class ImageJobObsoleteException : java.util.concurrent.CancellationException("Image generation cancelled by deletion or replacement")
 
 private data class VideoQueuedJob(val item: GalleryItem, val params: VideoGenerationParams, val sequence: Long, val runToken: Long)
 
@@ -2788,13 +2988,7 @@ private fun statusBadgeTextColor(text: String): androidx.compose.ui.graphics.Col
 }
 
 private fun viewerScopeIndices(state: UiState): List<Int> {
-    if (state.photos.isEmpty()) return emptyList()
-    val indexByKey = state.photos.mapIndexed { index, item -> item.cacheKey to index }.toMap()
-    return when {
-        state.viewerScopeOrderedKeys.isNotEmpty() -> state.viewerScopeOrderedKeys.mapNotNull { indexByKey[it] }.distinct()
-        state.viewerScopeKeys.isNotEmpty() -> state.photos.mapIndexedNotNull { index, item -> if (item.cacheKey in state.viewerScopeKeys) index else null }
-        else -> state.photos.indices.toList()
-    }
+    return ViewerScope.indices(state.photos.map { it.cacheKey }, state.viewerScopeOrderedKeys, state.viewerScopeKeys)
 }
 
 private fun relativeIndexInViewerScope(state: UiState, index: Int, selectedIndex: Int): Int {
@@ -2957,6 +3151,12 @@ private fun imagePrefetchSummary(state: UiState, index: Int, lang: AppLanguage):
 private class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
+    fun loadDeletedImageKeys(): Set<String> = prefs.getStringSet("deletedImagePrefetchKeys", emptySet()).orEmpty().toSet()
+
+    fun saveDeletedImageKeys(keys: Set<String>) {
+        prefs.edit().putStringSet("deletedImagePrefetchKeys", keys.toSet()).apply()
+    }
+
     fun load(): AppSettings {
         val migratedInvertDefault = prefs.getBoolean("migratedInvertDefaultOffV5", false)
         val invertDepth = if (migratedInvertDefault) {
@@ -2989,6 +3189,7 @@ private class SettingsStore(context: Context) {
             videoModelThreads = prefs.getInt("videoModelThreads", 4),
             videoUseGpu = prefs.getBoolean("videoUseGpu", false),
             videoDepthWorkers = prefs.getInt("videoDepthWorkers", 2).coerceIn(1, 2),
+            edgeMode = DepthEdgeMode.restore(prefs.getString("edgeMode", null)),
         )
     }
 
@@ -3014,6 +3215,7 @@ private class SettingsStore(context: Context) {
             .putInt("videoModelThreads", settings.videoModelThreads)
             .putBoolean("videoUseGpu", settings.videoUseGpu)
             .putInt("videoDepthWorkers", settings.videoDepthWorkers)
+            .putString("edgeMode", settings.edgeMode.name)
             .apply()
     }
 }
@@ -3338,6 +3540,7 @@ private class VideoQueueTagStore(context: Context) : Closeable {
             vr.forceGpuNoFallback.toString(),
             cacheVersion(),
             depthWorkers.toString(),
+            vr.edgeMode.name,
         ).joinToString(",") { it.replace(",", "_").replace('\t', '_').replace('\n', '_').replace('\r', '_') }
     }
 
@@ -3360,6 +3563,7 @@ private class VideoQueueTagStore(context: Context) : Closeable {
                     forceGpuNoFallback = parts[10].toBooleanStrictOrNull() ?: false,
                     inpaintMode = parts[7],
                     quality = parts[8].toInt(),
+                    edgeMode = DepthEdgeMode.restore(parts.getOrNull(15), parts.getOrNull(13)),
                 ),
                 modelThreads = parts[9].toInt(),
                 useGpu = parts[10].toBooleanStrictOrNull() ?: false,
@@ -3396,6 +3600,22 @@ private class VrCacheManager(private val context: Context) {
 
     fun entryDir(photo: PhotoItem, version: String): File {
         return if (version == DEFAULT_VERSION) File(root, photo.cacheKey) else File(File(root, photo.cacheKey), version)
+    }
+
+    fun stagingDir(): File = File(root.parentFile, "image_work/${java.util.UUID.randomUUID()}").also {
+        check(it.mkdirs()) { "Cannot create image staging directory" }
+    }
+
+    @Synchronized fun publish(photo: PhotoItem, staged: VrCacheEntry): VrCacheEntry {
+        val work = File(staged.paramsPath).parentFile!!
+        val target = entryDir(photo, staged.version)
+        ImageCachePublication.commit(work, target)
+        fun publishedPath(path: String) = if (path.isBlank()) "" else File(target, File(path).name).absolutePath
+        return staged.copy(
+            outputPath = publishedPath(staged.outputPath), leftPath = publishedPath(staged.leftPath),
+            rightPath = publishedPath(staged.rightPath), depthPath = publishedPath(staged.depthPath),
+            paramsPath = publishedPath(staged.paramsPath), logPath = publishedPath(staged.logPath),
+        ).also { register(it) }
     }
 
     fun findEntry(photo: PhotoItem, version: String? = null): VrCacheEntry? {
@@ -3447,10 +3667,12 @@ private class VrCacheManager(private val context: Context) {
         root.listFiles()?.filter { it.isDirectory }?.forEach { photoDir ->
             if (version == DEFAULT_VERSION) {
                 IMAGE_CACHE_FILES.forEach {
-                    File(photoDir, it).delete()
+                    val file = File(photoDir, it)
+                    check(!file.exists() || file.delete()) { "Cannot delete image cache: $file" }
                 }
             } else {
-                File(photoDir, version).deleteRecursively()
+                val dir = File(photoDir, version)
+                check(dir.deleteRecursively()) { "Cannot delete image cache version: $dir" }
             }
         }
         index.removeWhere { it.version == version }
@@ -3461,17 +3683,20 @@ private class VrCacheManager(private val context: Context) {
         val photoDir = File(root, entry.photoKey)
         if (entry.version == DEFAULT_VERSION) {
             IMAGE_CACHE_FILES.forEach {
-                File(photoDir, it).delete()
+                val file = File(photoDir, it)
+                check(!file.exists() || file.delete()) { "Cannot delete image cache: $file" }
             }
         } else {
-            File(photoDir, entry.version).deleteRecursively()
+            val dir = File(photoDir, entry.version)
+            check(dir.deleteRecursively()) { "Cannot delete image cache: $dir" }
         }
         index.removeWhere { it.photoKey == entry.photoKey && it.version == entry.version }
         virtualItems.remove(entry.photoKey)
     }
 
     @Synchronized fun deletePhoto(photo: PhotoItem) {
-        File(root, photo.cacheKey).deleteRecursively()
+        val dir = File(root, photo.cacheKey)
+        check(dir.deleteRecursively()) { "Cannot delete image cache: $dir" }
         index.removeWhere { it.photoKey == photo.cacheKey }
         virtualItems.remove(photo.cacheKey)
     }
@@ -3894,10 +4119,14 @@ private class VrGenerator(
         params: VrGenerationParams,
         onModelProgress: (Float) -> Unit,
         priority: Int = 1,
+        shouldContinue: () -> Boolean = { true },
+        commit: (VrCacheEntry) -> VrCacheEntry = { cache.publish(photo, it) },
         onProgress: (Float) -> Unit,
     ): VrCacheEntry {
         val version = params.cacheVersion()
-        val dir = cache.entryDir(photo, version).also { it.mkdirs() }
+        fun checkCurrent() { if (!shouldContinue()) throw ImageJobObsoleteException() }
+        checkCurrent()
+        val dir = cache.stagingDir()
         val log = StringBuilder()
         val start = System.currentTimeMillis()
         fun mark(message: String) {
@@ -3906,11 +4135,11 @@ private class VrGenerator(
         }
 
         mark("start name=${photo.displayName} size=${photo.size} modified=${photo.modifiedTime}")
-        val sessionLease = sharedImageDepthSession(params, onModelProgress) { runtime ->
-            mark(runtime)
-        }
+        var sessionLease: IdleResourcePool.Borrowed<DepthModelSession>? = null
         val ownedBitmaps = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Bitmap, Boolean>())
         try {
+            sessionLease = sharedImageDepthSession(params, onModelProgress) { mark(it) }
+            checkCurrent()
             val depthSession = sessionLease.value
             mark("model session ready key=${imageSessionKey(params)}")
             onProgress(0.12f)
@@ -3927,13 +4156,19 @@ private class VrGenerator(
                 mark("downsampled source because original long edge exceeded $decodeMaxLongEdge")
             }
             onProgress(0.25f)
+            checkCurrent()
 
             val depthStart = System.currentTimeMillis()
-            val rawDepth = depthSession.run(original, priority)
+            val rawDepth = depthSession.run(original, priority) {
+                checkCurrent()
+                // The owner thread has accepted the current inference before neighbors are admitted.
+                onProgress(0.30f)
+            }
+            checkCurrent()
             val modelMs = System.currentTimeMillis() - depthStart
             mark("model inference ${modelMs}ms")
             val depthPostStart = System.currentTimeMillis()
-            val depthSmall = smoothDepth(rawDepth, params.blurRadius, params.invertDepth)
+            val depthSmall = smoothDepth(rawDepth, params)
             onProgress(0.55f)
 
             val depthBitmap = depthToBitmap(depthSmall).also { ownedBitmaps.add(it) }
@@ -3942,6 +4177,7 @@ private class VrGenerator(
             val depthPostMs = System.currentTimeMillis() - depthPostStart
             mark("depth post ${depthPostMs}ms output=${depthBitmap.width}x${depthBitmap.height}")
             onProgress(0.7f)
+            checkCurrent()
 
             val sbsStart = System.currentTimeMillis()
             val pair = runCatching {
@@ -3966,6 +4202,7 @@ private class VrGenerator(
             val sbsMs = System.currentTimeMillis() - sbsStart
             mark("stereo ${sbsMs}ms output=${pair.sbsWidth}x${pair.height}")
             val writeStart = System.currentTimeMillis()
+            checkCurrent()
             val vrPath = File(dir, "vr_sbs.jpg")
             val leftPath = File(dir, "left.jpg")
             val rightPath = File(dir, "right.jpg")
@@ -4022,7 +4259,8 @@ private class VrGenerator(
             original.recycle()
             pair.recycle()
 
-            return VrCacheEntry(
+            checkCurrent()
+            return commit(VrCacheEntry(
                 photoKey = photo.cacheKey,
                 version = version,
                 outputPath = vrPath.absolutePath,
@@ -4034,10 +4272,11 @@ private class VrGenerator(
                 width = outputWidth,
                 height = outputHeight,
                 createdAt = System.currentTimeMillis(),
-            )
+            ))
         } finally {
             ownedBitmaps.forEach { if (!it.isRecycled) it.recycle() }
-            sessionLease.close()
+            sessionLease?.close()
+            dir.deleteRecursively()
         }
     }
 
@@ -4062,7 +4301,7 @@ private class VrGenerator(
                 session.run(working)
             }
         }
-        val depthSmall = smoothDepth(rawDepth, params.blurRadius, params.invertDepth)
+        val depthSmall = smoothDepth(rawDepth, params)
         return makeParallelSbs(working, depthSmall, params.depthScale, params.fillRadius)
     }
 
@@ -4110,7 +4349,7 @@ private class VrGenerator(
         val stableDepth = temporalSmoother.smooth(depth.rawDepth)
         val temporalMs = SystemClock.uptimeMillis() - temporalStart
         val depthPostStart = SystemClock.uptimeMillis()
-        val depthSmall = smoothDepth(stableDepth, params.blurRadius, params.invertDepth)
+        val depthSmall = smoothDepth(stableDepth, params)
         val depthPostMs = SystemClock.uptimeMillis() - depthPostStart
         val sbsStart = SystemClock.uptimeMillis()
         val eyes = try {
@@ -4195,8 +4434,8 @@ private class VrGenerator(
         return bitmap
     }
 
-    private fun smoothDepth(depth: FloatArray, radius: Int, invert: Boolean): FloatArray {
-        return DepthFilters.boxMean(depth, 518, 518, radius, invert)
+    private fun smoothDepth(depth: FloatArray, params: VrGenerationParams): FloatArray {
+        return DepthFilters.process(depth, 518, 518, params.blurRadius, params.invertDepth, params.edgeMode)
     }
 
     private fun makeParallelStereoPair(source: Bitmap, depth: FloatArray, depthScale: Float, fillRadius: Int): StereoBitmapPair {
@@ -4213,7 +4452,6 @@ private class VrGenerator(
             val srcRow = IntArray(w)
             val leftRow = IntArray(w)
             val dxForX = IntArray(w) { x -> (x * 517 / max(1, w - 1)).coerceIn(0, 517) }
-
             for (y in 0 until h) {
                 source.getPixels(srcRow, 0, w, 0, y, w, 1)
                 srcRow.copyInto(leftRow)
@@ -4296,7 +4534,10 @@ class DepthModelSession(
         throw error
     }
 
-    fun run(bitmap: Bitmap, priority: Int = 1): FloatArray = resource.use(priority) { it.run(bitmap) }
+    fun run(bitmap: Bitmap, priority: Int = 1, onStarted: () -> Unit = {}): FloatArray = resource.use(priority) {
+        onStarted()
+        it.run(bitmap)
+    }
 
     override fun close() {
         try { resource.close() } finally { if (ownsWorker) worker.close() }
@@ -5439,7 +5680,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSetGeneratedColumns = { viewModel.setPageColumns("generated", it) },
                 onGeneratedScroll = viewModel::setGeneratedScroll,
                 onGeneratedVersionScroll = viewModel::setGeneratedVersionScroll,
-                onDeleteVersion = viewModel::deleteCacheVersion,
+                onDeleteVersion = viewModel::deleteCacheVersions,
                 onOpenGenerated = viewModel::openGeneratedPhoto,
                 onOpenGeneratedVideo = viewModel::openGeneratedVideo,
                 onSaveVideo = { viewModel.saveGeneratedVideo(context, it) },
@@ -5511,7 +5752,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                         viewModel.replaceOriginalsWithGenerated(context, indexes)
                     }
                 },
-                onDeleteVersion = viewModel::deleteCacheVersion,
+                onDeleteVersion = viewModel::deleteCacheVersions,
                 onOpenGenerated = viewModel::openGeneratedPhoto,
                 onOpenGeneratedVideo = viewModel::openGeneratedVideo,
                 onSaveVideo = { viewModel.saveGeneratedVideo(context, it) },
@@ -5545,8 +5786,8 @@ private fun PermissionScreen(lang: AppLanguage, onGrant: () -> Unit) {
 private data class GeneratedSelectionActionsState(
     val count: Int,
     val onClear: () -> Unit,
-    val onSave: () -> Unit,
-    val onRegenerate: () -> Unit,
+    val onSave: (() -> Unit)?,
+    val onRegenerate: (() -> Unit)?,
     val onDelete: () -> Unit,
 )
 
@@ -5572,7 +5813,7 @@ private fun GalleryScreen(
     onLoadMoreAlbum: () -> Unit,
     onSaveGenerated: (List<Int>) -> Unit,
     onReplaceOriginal: (List<Int>) -> Unit,
-    onDeleteVersion: (String) -> Unit,
+    onDeleteVersion: (List<String>) -> Unit,
     onOpenGenerated: (Int, VrCacheEntry) -> Unit,
     onOpenGeneratedVideo: (Int) -> Unit,
     onSaveVideo: (Int) -> Unit,
@@ -6351,7 +6592,7 @@ private fun ManageScreen(
     onSetGeneratedColumns: (Int) -> Unit,
     onGeneratedScroll: (String, Int, Int) -> Unit,
     onGeneratedVersionScroll: (String, Int, Int) -> Unit,
-    onDeleteVersion: (String) -> Unit,
+    onDeleteVersion: (List<String>) -> Unit,
     onOpenGenerated: (Int, VrCacheEntry) -> Unit,
     onOpenGeneratedVideo: (Int) -> Unit,
     onSaveVideo: (Int) -> Unit,
@@ -6368,10 +6609,35 @@ private fun ManageScreen(
     val tab = selectedTab
     var selectedImageKeys by remember { mutableStateOf(setOf<String>()) }
     var selectedVideoKeys by remember { mutableStateOf(setOf<String>()) }
+    var selectedVersions by remember { mutableStateOf(setOf<String>()) }
+    var versionsToDelete by remember { mutableStateOf<Set<String>?>(null) }
+    BackHandler(selectedVersions.isNotEmpty() || selectedImageKeys.isNotEmpty() || selectedVideoKeys.isNotEmpty()) {
+        selectedVersions = emptySet()
+        selectedImageKeys = emptySet()
+        selectedVideoKeys = emptySet()
+    }
     val availablePhotoKeys = remember(state.photos) { state.photos.mapTo(hashSetOf()) { it.cacheKey } }
     LaunchedEffect(tab, state.selectedGeneratedVersion) {
         selectedImageKeys = emptySet()
         selectedVideoKeys = emptySet()
+        selectedVersions = emptySet()
+    }
+    LaunchedEffect(state.cacheVersions) {
+        selectedVersions = selectedVersions.intersect(state.cacheVersions.map { it.version }.toSet())
+    }
+    versionsToDelete?.let { versions ->
+        val count = state.managedCacheItems.count { it.entry.version in versions }
+        AlertDialog(
+            onDismissRequest = { versionsToDelete = null },
+            title = { Text(lang.t("删除 ${versions.size} 个生成相册？", "Delete ${versions.size} generated albums?")) },
+            text = { Text(lang.t("将删除 $count 张生成缓存并取消相关生成任务。系统原图不会删除。", "Delete $count generated images and cancel related jobs. Original photos are kept.")) },
+            confirmButton = { Button(onClick = {
+                onDeleteVersion(versions.toList())
+                selectedVersions = emptySet()
+                versionsToDelete = null
+            }) { Text(lang.t("删除", "Delete")) } },
+            dismissButton = { OutlinedButton(onClick = { versionsToDelete = null }) { Text(lang.t("取消", "Cancel")) } },
+        )
     }
     DisposableEffect(Unit) {
         onDispose { onGeneratedSelectionChange(null) }
@@ -6534,8 +6800,23 @@ private fun ManageScreen(
             } else {
                 val selectedVersion = state.selectedGeneratedVersion
                 if (selectedVersion == null) {
-                    LaunchedEffect(embedded, selectedVersion) {
-                        if (embedded) onGeneratedSelectionChange(null)
+                    LaunchedEffect(embedded, selectedVersions) {
+                        if (embedded) onGeneratedSelectionChange(
+                            selectedVersions.takeIf { it.isNotEmpty() }?.let { versions ->
+                                GeneratedSelectionActionsState(
+                                    count = versions.size,
+                                    onClear = { selectedVersions = emptySet() },
+                                    onSave = null,
+                                    onRegenerate = null,
+                                    onDelete = { versionsToDelete = versions },
+                                )
+                            },
+                        )
+                    }
+                    if (!embedded && selectedVersions.isNotEmpty()) {
+                        ManageSelectionActions(selectedVersions.size, lang,
+                            onClear = { selectedVersions = emptySet() }, onSave = null, onRegenerate = null,
+                            onDelete = { versionsToDelete = selectedVersions })
                     }
                     val versionGridState = rememberLazyGridState(
                         initialFirstVisibleItemIndex = state.generatedImageScrollIndex.coerceAtLeast(0),
@@ -6552,7 +6833,14 @@ private fun ManageScreen(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .background(androidx.compose.ui.graphics.Color.White)
-                                .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns),
+                                .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
+                                .generatedGridDragSelection(
+                                    gridState = versionGridState,
+                                    selectionMode = selectedVersions.isNotEmpty(),
+                                    contentStartPadding = 10.dp,
+                                ) { gridIndex ->
+                                    state.cacheVersions.getOrNull(gridIndex)?.let { selectedVersions += it.version }
+                                },
                             contentPadding = androidx.compose.foundation.layout.PaddingValues(
                                 start = 10.dp,
                                 top = if (embedded) contentTopPadding else 10.dp,
@@ -6569,7 +6857,11 @@ private fun ManageScreen(
                                     summary = summary,
                                     cover = cover,
                                     lang = lang,
-                                    onOpen = { onOpenVersion(summary.version) },
+                                    selected = summary.version in selectedVersions,
+                                    onOpen = {
+                                        if (selectedVersions.isEmpty()) onOpenVersion(summary.version)
+                                        else selectedVersions = if (summary.version in selectedVersions) selectedVersions - summary.version else selectedVersions + summary.version
+                                    },
                                 )
                             }
                         }
@@ -6600,7 +6892,7 @@ private fun ManageScreen(
                                     modifier = Modifier.weight(1f),
                                 )
                                 Spacer(Modifier.width(8.dp))
-                                OutlinedButton(onClick = { onDeleteVersion(selectedVersion); onCloseVersion() }) { Text(lang.t("删除", "Delete")) }
+                                OutlinedButton(onClick = { versionsToDelete = setOf(selectedVersion) }) { Text(lang.t("删除", "Delete")) }
                             }
                             Spacer(Modifier.height(10.dp))
                         }
@@ -6699,6 +6991,7 @@ private fun GeneratedVersionTile(
     summary: CacheVersionSummary,
     cover: ManagedCacheItem?,
     lang: AppLanguage,
+    selected: Boolean = false,
     onOpen: () -> Unit,
 ) {
     Column(
@@ -6730,6 +7023,7 @@ private fun GeneratedVersionTile(
                     .background(androidx.compose.ui.graphics.Color(0x99000000))
                     .padding(horizontal = 6.dp, vertical = 3.dp),
             )
+            if (selected) SelectionBadge()
         }
         Spacer(Modifier.height(6.dp))
         Text(
@@ -6777,8 +7071,8 @@ private fun ManageSelectionActions(
     count: Int,
     lang: AppLanguage,
     onClear: () -> Unit,
-    onSave: () -> Unit,
-    onRegenerate: () -> Unit,
+    onSave: (() -> Unit)?,
+    onRegenerate: (() -> Unit)?,
     onDelete: () -> Unit,
 ) {
     Row(
@@ -6788,8 +7082,8 @@ private fun ManageSelectionActions(
     ) {
         Text(lang.t("已选 $count", "$count selected"), modifier = Modifier.weight(1f), fontWeight = FontWeight.Bold)
         OutlinedButton(onClick = onClear) { Text(lang.t("取消", "Cancel")) }
-        OutlinedButton(onClick = onSave) { Text(lang.t("保存", "Save")) }
-        OutlinedButton(onClick = onRegenerate) { Text(lang.t("重新生成", "Regenerate")) }
+        onSave?.let { OutlinedButton(onClick = it) { Text(lang.t("保存", "Save")) } }
+        onRegenerate?.let { OutlinedButton(onClick = it) { Text(lang.t("重新生成", "Regenerate")) } }
         Button(onClick = onDelete) { Text(lang.t("删除", "Delete")) }
     }
 }
@@ -6883,18 +7177,40 @@ private fun SettingsScreen(
         }
         Spacer(Modifier.height(16.dp))
 
+        Text(lang.t("边缘处理", "Edge processing"), fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(6.dp))
+        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+            DepthEdgeMode.entries.forEachIndexed { index, mode ->
+                SegmentedButton(
+                    selected = settings.edgeMode == mode,
+                    onClick = { onChange(settings.copy(edgeMode = mode)) },
+                    shape = SegmentedButtonDefaults.itemShape(index, DepthEdgeMode.entries.size),
+                ) {
+                    Text(when (mode) {
+                        DepthEdgeMode.LEGACY_V6 -> lang.t("旧版兼容", "Legacy")
+                        DepthEdgeMode.CENTERED_V7 -> lang.t("新版平滑", "Centered")
+                    })
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        SettingHelp(lang.t("旧版兼容：v1.0.06 的 depthV6，默认使用，保留原来的平滑和位移幅度。新版平滑：v1.0.07 的 depthV7，使用居中均值滤波；相同强度下位移通常更大，人物边缘可能不同。图片与视频共用此选项，两种缓存分开保存；切换不自动重做已有结果。", "Legacy restores v1.0.06 depthV6 smoothing and disparity gain and is the default. Centered uses v1.0.07 depthV7 box filtering; the same strength usually produces more disparity and different contours. Applies to images and videos. Caches are separate; switching does not regenerate existing results."))
         SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f)) {
             onChange(settings.copy(depthScale = it))
         }
+        SettingHelp(lang.t("控制左右眼的水平位移，不是清晰度。沿用旧版单位：位移约为深度值 × 255 × 强度 ÷ 单眼宽度。同一数值在不同分辨率下并不等于固定百分比；越大立体感越强，也越容易出现轮廓拉伸。", "Controls horizontal disparity, not sharpness. Legacy units: depth x 255 x scale / eye width. It is not a fixed percentage across resolutions. Larger values increase depth and edge stretching."))
         SettingInt(lang.t("深度平滑", "Blur radius"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) {
             onChange(settings.copy(blurRadius = it))
         }
+        SettingHelp(lang.t("在 518 × 518 深度图上处理，不模糊原图。0/1 不平滑；较大值抑制深度噪点，但可能混合人物与背景边界。旧版兼容还会改变深度幅度，新版平滑保持均匀区域的幅度，因此切换算法后不应假设同一强度效果相同。", "Filters the 518 x 518 depth map, not the source photo. 0/1 bypass smoothing. Larger values reduce noise but can blend foreground/background boundaries. Legacy also changes depth gain; Centered preserves constant regions. The same strength is not visually equivalent across modes."))
         SettingInt(lang.t("边缘填充", "Fill radius"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) {
             onChange(settings.copy(fillRadius = it))
         }
+        SettingHelp(lang.t("旧版水平像素填充宽度，单位是输出像素，不是 AI 补画半径。0 按 1 像素写入；较大值覆盖更多位移空隙，但可能拉宽肩膀、头发、椅背等边缘。左右眼方向和填充算法保持旧版。", "Legacy horizontal fill width in output pixels, not an AI inpainting radius. 0 writes one pixel. Wider fills cover more gaps but may stretch hair, shoulders or object edges. Eye order and fill algorithm are unchanged."))
         SettingInt(lang.t("输出最大长边", "Max output long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) {
             onChange(settings.copy(maxLongEdge = it))
         }
+        SettingHelp(lang.t("限制单眼长边，不是双眼合并后的总宽；小图不会被强制放大。越大占用的内存和写入时间越多，内存不足时仍会降采样并写入日志。JPEG 100 缓存仍属于有损压缩。", "Limits each eye's long edge, not the combined SBS width. Small sources are not upscaled. Larger output needs more memory and write time; memory-driven downsampling is logged. JPEG 100 cache is still lossy."))
         Spacer(Modifier.height(12.dp))
 
         SettingsSectionTitle(lang.t("图片生成设置", "Image generation"))
@@ -6925,12 +7241,15 @@ private fun SettingsScreen(
             }
         }
         Spacer(Modifier.height(14.dp))
+        SettingHelp(lang.t("先启动当前图片，再让邻图进入流水线。自动档按来源列表从前后 2 扩到 4、8，遇到无图、视频或已完成项可向另一侧补位，最多前后各 8；固定档不反向补位。生成页只运行已入队或因切来源暂停的任务，不新建邻图预加载。", "The current image starts first, then neighboring images enter the pipeline. Auto expands within the source list from +/-2 to +/-4 and +/-8, borrowing opposite-side slots when needed. Fixed tiers do not borrow. Generated pages run existing jobs only and never create neighbor prefetch."))
         SettingInt(lang.t("后台 worker 数", "Background workers"), settings.generationWorkers, listOf(1, 2, 3)) {
             onChange(settings.copy(generationWorkers = it))
         }
+        SettingHelp(lang.t("后台图片流水线数量；当前图有独立入口。GPU 推理统一串行调度，增加 worker 主要重叠解码、合成和写入，并不代表多个 GPU 同时推理；更多 worker 也会占用更多内存。", "Background image pipelines; the current image has a separate entry point. GPU inference is serialized. Extra workers overlap decoding, composition and writing rather than parallel GPU inference, and consume more RAM."))
         SettingInt(lang.t("模型 CPU 线程", "Model CPU threads"), settings.modelThreads, listOf(1, 2, 4, 8)) {
             onChange(settings.copy(modelThreads = it))
         }
+        SettingHelp(lang.t("每个模型会话的 CPU 线程上限，不是后台任务数，也不是 GPU 占用率。线程越多未必越快，多个 worker 会叠加 CPU 负载。", "CPU threads per model session, not a job count or GPU utilization limit. More threads are not always faster; multiple workers add CPU load."))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
                 checked = settings.useGpu,
@@ -6943,6 +7262,7 @@ private fun SettingsScreen(
         GpuModePicker(settings.gpuTestMode, lang) {
             onChange(settings.copy(gpuTestMode = it))
         }
+        SettingHelp(lang.t("自动：在 GPU 后端之间尝试，不是限制 GPU 占用。精确：优先精度，由运行时选后端。强制 OpenGL / OpenCL：只用指定后端，设备不支持会报错。系统推荐：采用 TFLite 给设备推荐的配置。此模式同时供图片和视频的 GPU 设置使用。", "Auto tries GPU configurations; it does not cap utilization. Accurate prioritizes precision with runtime backend selection. Forced OpenGL/OpenCL requires device support. System best uses TFLite's recommended options. The mode is shared by image and video GPU settings."))
         Spacer(Modifier.height(6.dp))
         Text(
             lang.t(
@@ -6974,7 +7294,7 @@ private fun SettingsScreen(
             )
             Text(lang.t("视频生成尝试 GPU 加速", "Try GPU for video generation"))
         }
-        Text(lang.t("视频深度 worker 是独立模型会话数量；2 个 worker 可能更快，也会更占显存/内存。视频设置只影响视频 VR 生成。", "Video depth workers are independent model sessions. 2 workers may be faster but use more GPU memory/RAM. Video settings only affect video VR generation."), style = MaterialTheme.typography.bodySmall)
+        SettingHelp(lang.t("仅影响视频生成。CPU 模式可使用 1–2 个独立深度会话；GPU 模式固定使用 1 个会话，避免重复占用 GPU。取帧、深度推理、缓存写入、编码是有界流水线；此处不是播放速度或帧率设置。视频 CPU 线程同样按每个会话计算。", "Video generation only. CPU supports 1-2 depth sessions; GPU uses one session to avoid duplicate GPU load. Decode, inference, cache and encode form a bounded pipeline. This is not playback speed or FPS. CPU threads are configured per session."))
 
         Spacer(Modifier.height(12.dp))
         Text(lang.t("深度图分辨率", "Depth resolution"), fontWeight = FontWeight.Bold)
@@ -6989,7 +7309,14 @@ private fun SettingsScreen(
             )
             Text(lang.t("反转深度", "Invert depth"))
         }
+        SettingHelp(lang.t("把处理后的深度值 d 改为 1-d，改变近远关系。不是交换左右画面，也不是修复人物边缘的开关。参数改变只影响之后的新任务；已有缓存保持原样，需要明确重新生成才会改变。", "Replaces processed depth d with 1-d and changes near/far perception. It does not swap eyes or repair contours. Changes apply to newly queued jobs; existing caches are unchanged until explicitly regenerated."))
     }
+}
+
+@Composable
+private fun SettingHelp(text: String) {
+    Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Spacer(Modifier.height(12.dp))
 }
 
 @Composable
@@ -7131,28 +7458,8 @@ private fun ViewerScreen(
             emptyMap()
         }
     }
-    val viewerItems = remember(state.photos, state.managedCacheItems, state.viewerScopeKeys, state.viewerScopeOrderedKeys, state.viewerOrigin, state.selectedGeneratedVersion, startIndex) {
-        val indexed = state.photos.mapIndexed { index, item -> index to item }
-        val indexedByKey = indexed.associateBy { (_, item) -> item.cacheKey }
-        if (state.viewerOrigin != ViewerOrigin.NORMAL && state.selectedGeneratedVersion != null) {
-            state.managedCacheItems
-                .filter { it.entry.version == state.selectedGeneratedVersion }
-                .mapNotNull { generated ->
-                    indexedByKey[generated.photoItem.cacheKey]
-                }
-                .distinctBy { (_, item) -> item.cacheKey }
-                .ifEmpty { indexed.filter { it.first == startIndex } }
-        } else if (state.viewerScopeOrderedKeys.isNotEmpty()) {
-            state.viewerScopeOrderedKeys
-                .mapNotNull { indexedByKey[it] }
-                .distinctBy { (_, item) -> item.cacheKey }
-                .ifEmpty { indexed.filter { it.first == startIndex } }
-        } else if (state.viewerScopeKeys.isNotEmpty()) {
-            indexed.filter { (_, item) -> item.cacheKey in state.viewerScopeKeys }
-                .ifEmpty { indexed.filter { it.first == startIndex } }
-        } else {
-            indexed
-        }
+    val viewerItems = remember(state.photos, state.viewerScopeKeys, state.viewerScopeOrderedKeys) {
+        viewerScopeIndices(state).map { it to state.photos[it] }
     }
     val initialPage = viewerItems.indexOfFirst { it.first == startIndex }.takeIf { it >= 0 } ?: 0
     val pagerState = rememberPagerState(initialPage = initialPage) { viewerItems.size }
@@ -8977,6 +9284,7 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, outputWi
           "outputMode": "SPLIT_EYES_JPEG_Q$IMAGE_EYE_JPEG_QUALITY",
           "depthScale": $depthScale,
           "blurRadius": $blurRadius,
+          "edgeMode": "${edgeMode.name}",
           "fillRadius": $fillRadius,
           "invertDepth": $invertDepth,
           "maxLongEdge": $maxLongEdge,
@@ -9004,20 +9312,20 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, outputWi
     """.trimIndent()
 }
 
-private fun VrGenerationParams.visualGenerationVersion(): String {
+internal fun VrGenerationParams.visualGenerationVersion(): String {
     val scale = depthScale.roundToInt()
     val invert = if (invertDepth) "inv1" else "inv0"
     val gpu = if (useGpu) "gpu1" else "gpu0"
     val force = if (forceGpuNoFallback) "force1" else "force0"
-    return "${depthModel}_${IMAGE_GENERATOR_VERSION}_s${scale}_b${blurRadius}_f${fillRadius}_${invert}_m${maxLongEdge}_t${modelThreads}_${gpu}_${gpuTestMode}_$force"
+    return "${depthModel}_${edgeMode.cacheVersion}_s${scale}_b${blurRadius}_f${fillRadius}_${invert}_m${maxLongEdge}_t${modelThreads}_${gpu}_${gpuTestMode}_$force"
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
 }
 
-private fun VrGenerationParams.cacheVersion(): String {
+internal fun VrGenerationParams.cacheVersion(): String {
     return "${visualGenerationVersion()}_$IMAGE_CACHE_ENCODER_VERSION"
 }
 
-private fun VideoGenerationParams.cacheVersion(): String {
+internal fun VideoGenerationParams.cacheVersion(): String {
     return "${toVrParams().visualGenerationVersion()}_dw${depthWorkers.coerceIn(1, 2)}_$VIDEO_ENCODER_VERSION"
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
 }
