@@ -6,6 +6,17 @@ import org.junit.Test
 
 class CacheAndTimelineTest {
     private data class Entry(val key: String, val version: String, val created: Long)
+    @Test fun closingAnUnusedOrReadOnlyStoreCannotEraseExistingPausedJobs() {
+        val root = Files.createTempDirectory("queue-preservation").toFile()
+        try {
+            val file = root.resolve("queue.tsv")
+            file.writeText("saved-paused-job")
+            BufferedTextFile(file).close()
+            assertEquals("saved-paused-job", file.readText())
+            BufferedTextFile(file).use { assertEquals("saved-paused-job", it.read()) }
+            assertEquals("saved-paused-job", file.readText())
+        } finally { root.deleteRecursively() }
+    }
     @Test fun diskScanCannotOverwriteJobsCompletedOrDeletedWhileItWasRunning() {
         val index = VersionedIndex<Entry>({ it.key }, { it.version }, { it.created })
         index.put(Entry("old", "v1", 1), 10)

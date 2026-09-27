@@ -72,11 +72,11 @@ resources, encoder/writer overlap, and exact-once cleanup after stage failures.
 GitHub Actions repeats build/tests/lint and stores reports. CI's ephemeral signing
 key is not used to publish upgrades. Published APKs keep the existing local signer.
 
-Local verification on 2026-09-28: all 18 JVM tests passed, `lintDebug` completed
+Local verification on 2026-09-28: all 19 JVM tests passed, `lintDebug` completed
 with 0 errors and 46 warnings, and `assembleDebug` succeeded. APK metadata:
 `com.local.parallelvrgallerypro`, versionName `1.0.07`, versionCode `10007`.
 The APK signer matches the downloaded v1.0.06 release certificate.
-APK SHA-256: `62B683DE644CC2367AD11858EAFCBA46FF4BA29C84B6D98C28D2DBAB63ADDC57`.
+APK SHA-256: `EFA7071063D3302159690CCB7C3280BAC451C18CAF7A382FFC7A2964E455F831`.
 
 ## Device acceptance still required
 

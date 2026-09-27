@@ -4883,6 +4883,7 @@ private class VideoVrGenerator(
         var ownedMuxer: MediaMuxer? = null
         var ownedAudio: AudioSource? = null
         var renderer: InputSurfaceRenderer? = null
+        var muxerStopped = false
         try {
             val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also { ownedCodec = it }
             val codecCapabilities = codec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
@@ -5057,10 +5058,13 @@ private class VideoVrGenerator(
                 extraSessions.values.forEach { it.close() }
             }
             drain(end = true)
+            check(muxerStarted) { "Encoder finished without producing a video track" }
             if (audio != null && audioTrack >= 0 && muxerStarted) {
                 copyAudio(audio.extractor, muxer, audioTrack)
                 mark("audio copied")
             }
+            muxer.stop()
+            muxerStopped = true
         } finally {
             firstEyes.recycle()
             runCatching { renderer?.release() }
@@ -5068,7 +5072,7 @@ private class VideoVrGenerator(
             runCatching { ownedCodec?.release() }
             runCatching { ownedSurface?.release() }
             runCatching { ownedAudio?.extractor?.release() }
-            runCatching { ownedMuxer?.stop() }
+            if (!muxerStopped) runCatching { ownedMuxer?.stop() }
             runCatching { ownedMuxer?.release() }
         }
     }

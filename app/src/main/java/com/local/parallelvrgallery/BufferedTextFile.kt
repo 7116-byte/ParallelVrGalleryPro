@@ -48,7 +48,11 @@ internal class BufferedTextFile(private val file: File, private val delayMs: Lon
     }
 
     fun flush() {
-        synchronized(this) { scheduled?.cancel(false); scheduled = null }
+        synchronized(this) {
+            if (value == null || savedRevision == revision) return
+            scheduled?.cancel(false)
+            scheduled = null
+        }
         writer.submit { persist() }.get()
         lastError?.let { throw it }
     }
