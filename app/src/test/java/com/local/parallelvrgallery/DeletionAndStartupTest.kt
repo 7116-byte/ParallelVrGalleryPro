@@ -58,26 +58,27 @@ class DeletionAndStartupTest {
         val token = guard.token("photo")
         guard.invalidate(setOf("photo"))
         assertFalse(guard.ifCurrent("photo", token) { fail("Deleted output must not be committed") })
-        assertFalse(guard.permitsAutomatic("photo"))
+        assertTrue(guard.isCurrent("photo", guard.token("photo")))
     }
 
     @Test fun explicitRegenerationDoesNotRevalidateOlderWork() {
         val guard = GenerationGuard()
         val old = guard.token("photo")
         guard.invalidate(setOf("photo"))
-        guard.explicitlyRequest("photo")
         assertFalse(guard.isCurrent("photo", old))
         assertTrue(guard.isCurrent("photo", guard.token("photo")))
-        assertTrue(guard.permitsAutomatic("unrelated"))
+        assertTrue(guard.isCurrent("unrelated", 0L))
     }
 
-    @Test fun deletionSuppressionSurvivesRestartButExplicitOpenRemovesIt() {
-        var persisted = emptySet<String>()
-        GenerationGuard(persistDeleted = { persisted = it }).invalidate(setOf("photo"))
-        val restored = GenerationGuard(persisted) { persisted = it }
-        assertFalse(restored.permitsAutomatic("photo"))
-        restored.explicitlyRequest("photo")
-        assertTrue(persisted.isEmpty())
+    @Test fun repeatedDeletionInvalidatesOnlyEarlierRuns() {
+        val guard = GenerationGuard()
+        val original = guard.token("photo")
+        guard.invalidate(setOf("photo"))
+        val retry = guard.token("photo")
+        guard.invalidate(setOf("photo"))
+        assertFalse(guard.isCurrent("photo", original))
+        assertFalse(guard.isCurrent("photo", retry))
+        assertTrue(guard.isCurrent("photo", guard.token("photo")))
     }
 
     @Test fun queuedCompletionAfterDeleteCannotResurrectCache() {

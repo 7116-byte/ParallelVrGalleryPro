@@ -175,6 +175,9 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -644,6 +647,7 @@ data class UiState(
     val debugIndex: Int? = null,
     val modelProgress: Float? = null,
     val modelStatus: String = "模型未下载 / Model not downloaded",
+    val modelWarmupStatus: String? = null,
     val blockingMessage: String? = null,
     val cacheVersions: List<CacheVersionSummary> = emptyList(),
     val managedCacheItems: List<ManagedCacheItem> = emptyList(),
@@ -733,7 +737,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val generator = VrGenerator(app, cache, modelManager)
     private val videoGenerator = VideoVrGenerator(app, videoCache, generator)
     private val settingsStore = SettingsStore(app)
-    private val imageRuns = GenerationGuard(settingsStore.loadDeletedImageKeys(), settingsStore::saveDeletedImageKeys)
+    private val imageRuns = GenerationGuard()
     private val queueTags = QueueTagStore(app)
     private val videoQueueTags = VideoQueueTagStore(app)
     private val pending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
@@ -756,6 +760,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val runningImageJobs = java.util.concurrent.ConcurrentHashMap<String, QueuedJob>()
     private val claimedImageJobs = mutableSetOf<QueuedJob>()
     private val currentImageFirst = CurrentImageFirst()
+    private var modelWarmupJob: Job? = null
 
     private val _uiState = MutableStateFlow(
         UiState(
@@ -768,13 +773,42 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     val uiState: StateFlow<UiState> = _uiState
 
     init {
+        modelWarmupJob = viewModelScope.launch(Dispatchers.IO) {
+            _uiState.map { it.settings.toParams() }
+                .distinctUntilChanged { old, new -> old.depthSessionKey() == new.depthSessionKey() }
+                .collectLatest { params ->
+                    fun report(status: String) {
+                        _uiState.update {
+                            if (it.settings.toParams().depthSessionKey() == params.depthSessionKey()) it.copy(modelWarmupStatus = status) else it
+                        }
+                    }
+                    if (!modelManager.hasLocalModel(params.depthModel)) {
+                        report("模型未下载，首次生成时下载 / Model downloads on first generation")
+                        return@collectLatest
+                    }
+                    val started = SystemClock.uptimeMillis()
+                    report("正在后台初始化图片模型 / Preparing image model in background")
+                    addLog("model warmup start ${params.depthSessionKey()}")
+                    try {
+                        generator.prepareImageSession(params) { addLog("model warmup $it") }
+                        val elapsed = SystemClock.uptimeMillis() - started
+                        report("图片模型已在内存就绪（${elapsed}ms）/ Image model ready in memory")
+                        addLog("model warmup ready ${params.depthSessionKey()} ${elapsed}ms")
+                    } catch (error: java.util.concurrent.CancellationException) {
+                        throw error
+                    } catch (error: Throwable) {
+                        report("模型预加载失败，生成时可重试 / Model preload failed: ${error.shortMessage()}")
+                        addLog("model warmup failed ${params.depthSessionKey()}: ${error.shortMessage()}")
+                    }
+                }
+        }
         if (_uiState.value.hasPermission) {
             loadPhotos()
         }
     }
 
     override fun onCleared() {
-        val imageJobs = workers.toList() + listOfNotNull(currentWorker)
+        val imageJobs = workers.toList() + listOfNotNull(currentWorker, modelWarmupJob)
         imageJobs.forEach { it.cancel() }
         AppWorkScopes.video.launch {
             imageJobs.forEach { it.join() }
@@ -1807,7 +1841,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             imageRuns.invalidate(keys)
             clearImageQueueForKeys(keys)
             photos.associate { photo ->
-                imageRuns.explicitlyRequest(photo.cacheKey)
                 photo.cacheKey to imageRuns.token(photo.cacheKey)
             }
         }
@@ -1933,7 +1966,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             val photoIndex = scopeIndices.getOrNull(position) ?: return null
             val photo = photos[photoIndex]
             if (photo.kind != MediaKind.IMAGE) return null
-            if (!imageRuns.permitsAutomatic(photo.cacheKey)) return null
             if (photo.cacheKey in targetKeys) return null
             val itemState = state.states[photo.cacheKey] ?: VrState.NORMAL
             if (itemState in occupiedStates) return null
@@ -2018,6 +2050,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 upsertJob(job.photo, job.priority, VrState.PAUSED, 0f, source = job.source, albumId = job.albumId)
             }
         }
+        addLog("image prefetch-window center=${photos[index].displayName} source=${queueContext.source} album=${queueContext.albumId} tier=$window targets=${targets.size} scope=${scopeIndices.size}")
         targets.forEach { (targetIndex, priority) -> enqueuePhoto(targetIndex, priority, force = false, current = false, context = queueContext) }
         rebalanceQueueForActiveSource()
         startWorker()
@@ -2026,7 +2059,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private fun promoteCurrentImageForVr(index: Int, context: QueueContext? = null) = synchronized(imageRuns) {
         val photo = _uiState.value.photos.getOrNull(index) ?: return
         if (photo.kind != MediaKind.IMAGE) return
-        imageRuns.explicitlyRequest(photo.cacheKey)
         if (runningImageJobs[photo.cacheKey]?.let { imageRuns.isCurrent(photo.cacheKey, it.runToken) } == true) return
         val currentVersion = _uiState.value.settings.toParams().cacheVersion()
         cache.findEntry(photo, currentVersion)?.let { entry ->
@@ -2059,8 +2091,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val photo = state.photos.getOrNull(index) ?: return
         if (photo.kind != MediaKind.IMAGE) return
         if (!force && !current && (!canPrefetch(state) || photo.cacheKey !in state.viewerScopeKeys)) return
-        if (force || current) imageRuns.explicitlyRequest(photo.cacheKey)
-        else if (!imageRuns.permitsAutomatic(photo.cacheKey)) return
         val currentVersion = _uiState.value.settings.toParams().cacheVersion()
         if (!force && cache.findEntry(photo, currentVersion) != null) {
             markState(photo.cacheKey, VrState.READY)
@@ -2256,7 +2286,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun restoreQueueTags() {
+    private fun restoreQueueTags(): Unit = synchronized(imageRuns) {
         val state = _uiState.value
         val photoByKey = state.photos.filter { it.kind == MediaKind.IMAGE }.associateBy { it.cacheKey }
         val restoredStates = mutableMapOf<String, VrState>()
@@ -2264,10 +2294,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val pausedJobs = mutableListOf<QueuedJob>()
         queueTags.load().forEach { tag ->
             val photo = photoByKey[tag.photoKey] ?: return@forEach
-            if (!imageRuns.permitsAutomatic(tag.photoKey)) {
-                queueTags.remove(tag.photoKey)
-                return@forEach
-            }
             if (cache.findEntry(photo, state.settings.toParams().cacheVersion()) != null) {
                 queueTags.remove(tag.photoKey)
                 restoredStates[tag.photoKey] = VrState.READY
@@ -2688,6 +2714,12 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     },
                 ) { progress ->
                     imageRuns.ifCurrent(next.photo.cacheKey, next.runToken) {
+                        if (progress == 0.12f) {
+                            _uiState.update {
+                                if (it.settings.toParams().depthSessionKey() == params.depthSessionKey())
+                                    it.copy(modelWarmupStatus = "图片模型已在内存就绪 / Image model ready in memory") else it
+                            }
+                        }
                         upsertJob(next.photo, next.priority, VrState.GENERATING, progress, source = next.source, albumId = next.albumId)
                         if (progress >= 0.30f) releaseCurrentPrefetch(next.photo.cacheKey)
                     }
@@ -3151,13 +3183,9 @@ private fun imagePrefetchSummary(state: UiState, index: Int, lang: AppLanguage):
 private class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
-    fun loadDeletedImageKeys(): Set<String> = prefs.getStringSet("deletedImagePrefetchKeys", emptySet()).orEmpty().toSet()
-
-    fun saveDeletedImageKeys(keys: Set<String>) {
-        prefs.edit().putStringSet("deletedImagePrefetchKeys", keys.toSet()).apply()
-    }
-
     fun load(): AppSettings {
+        // v1.1.00's global deletion blacklist incorrectly disabled normal source prefetch.
+        if (prefs.contains("deletedImagePrefetchKeys")) prefs.edit().remove("deletedImagePrefetchKeys").apply()
         val migratedInvertDefault = prefs.getBoolean("migratedInvertDefaultOffV5", false)
         val invertDepth = if (migratedInvertDefault) {
             prefs.getBoolean("invertDepth", false)
@@ -4025,7 +4053,9 @@ private class ModelManager(private val context: Context) {
         }
     }
 
-    fun ensureModel(modelId: String, onProgress: (Float) -> Unit): File {
+    fun hasLocalModel(modelId: String): Boolean = File(modelsDir, modelSpec(modelId).fileName).isFile
+
+    fun ensureModel(modelId: String, onProgress: (Float) -> Unit, allowDownload: Boolean = true): File {
         val spec = modelSpec(modelId)
         if (!spec.downloadable) {
             error("${spec.displayName} 需要先导入移动端模型资产 / Mobile model asset required")
@@ -4035,6 +4065,8 @@ private class ModelManager(private val context: Context) {
             onProgress(1f)
             return modelFile
         }
+
+        check(allowDownload) { "Local model missing or checksum mismatch; preload does not download" }
 
         val tmp = File(modelsDir, "${spec.fileName}.download")
         val urls = modelDownloadUrls(spec)
@@ -4141,7 +4173,7 @@ private class VrGenerator(
             sessionLease = sharedImageDepthSession(params, onModelProgress) { mark(it) }
             checkCurrent()
             val depthSession = sessionLease.value
-            mark("model session ready key=${imageSessionKey(params)}")
+            mark("model session ready key=${params.depthSessionKey()}")
             onProgress(0.12f)
 
             val decodeMaxLongEdge = memorySafeMaxLongEdge(photo.width, photo.height, params.maxLongEdge)
@@ -4369,8 +4401,17 @@ private class VrGenerator(
         )
     }
 
-    private fun imageSessionKey(params: VrGenerationParams): String {
-        return "${params.depthModel}|threads=${params.modelThreads.coerceIn(1, 8)}|gpu=${params.useGpu}|gpuMode=${params.gpuTestMode}|force=${params.forceGpuNoFallback}"
+    fun prepareImageSession(params: VrGenerationParams, onRuntimeInfo: (String) -> Unit) {
+        imageSessions.acquire(params.depthSessionKey()) {
+            val session = openDepthSession(params, onRuntimeInfo = onRuntimeInfo, allowDownload = false)
+            try {
+                session.prepare()
+                session
+            } catch (error: Throwable) {
+                runCatching { session.close() }.exceptionOrNull()?.let(error::addSuppressed)
+                throw error
+            }
+        }.close()
     }
 
     private fun sharedImageDepthSession(
@@ -4378,7 +4419,7 @@ private class VrGenerator(
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit,
     ): IdleResourcePool.Borrowed<DepthModelSession> {
-        val key = imageSessionKey(params)
+        val key = params.depthSessionKey()
         return imageSessions.acquire(key) { openDepthSession(params, onModelProgress, onRuntimeInfo) }
     }
 
@@ -4386,8 +4427,9 @@ private class VrGenerator(
         params: VrGenerationParams,
         onModelProgress: (Float) -> Unit = {},
         onRuntimeInfo: (String) -> Unit = {},
+        allowDownload: Boolean = true,
     ): DepthModelSession {
-        val modelFile = modelManager.ensureModel(params.depthModel, onModelProgress)
+        val modelFile = modelManager.ensureModel(params.depthModel, onModelProgress, allowDownload)
         return DepthModelSession(modelFile, params.modelThreads, params.useGpu, params.gpuTestMode, params.forceGpuNoFallback, onRuntimeInfo)
     }
 
@@ -4539,6 +4581,8 @@ class DepthModelSession(
         it.run(bitmap)
     }
 
+    fun prepare() = resource.use(priority = 100) { it.prepare() }
+
     override fun close() {
         try { resource.close() } finally { if (ownsWorker) worker.close() }
     }
@@ -4590,6 +4634,9 @@ private class DepthModelRuntime(
         }
         onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu forceGpu=$forceGpuNoFallback delegateActive=$delegateActive gpuMode=${activeGpuMode ?: "CPU"} reusedSession=true ${gpuDiagnostics.joinToString(" ")}")
     }
+
+    @Synchronized
+    fun prepare() { interpreter.allocateTensors() }
 
     @Synchronized
     fun run(bitmap: Bitmap): FloatArray {
@@ -5694,6 +5741,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
             )
             AppScreen.Settings -> SettingsScreen(
                 settings = state.settings,
+                modelWarmupStatus = state.modelWarmupStatus,
                 updateStatus = state.updateStatus,
                 updateUrl = state.updateUrl,
                 updateAvailable = state.updateAvailable,
@@ -6774,7 +6822,8 @@ private fun ManageScreen(
                                     AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
                                     if (item.cacheKey in selectedVideoKeys) SelectionBadge()
                                     StatusBadge(
-                                        text = "${videoState.shortLabel(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}% 吞吐${job?.currentFrameMs ?: 0}ms 均${job?.avgFrameMs ?: 0}ms",
+                                        text = "${videoState.shortLabel(lang)} ${VideoProgress.percent(videoState, job?.progress)}%" +
+                                            (job?.let { " Cur ${it.currentFrameMs}ms Avg ${it.avgFrameMs}ms" } ?: ""),
                                         fontSize = (10 - columnFontReduction(state.generatedColumns)).coerceAtLeast(7).sp,
                                         modifier = Modifier.align(Alignment.BottomStart),
                                         horizontalPadding = 2.dp,
@@ -7103,6 +7152,7 @@ private fun SelectionBadge() {
 @Composable
 private fun SettingsScreen(
     settings: AppSettings,
+    modelWarmupStatus: String?,
     updateStatus: String?,
     updateUrl: String?,
     updateAvailable: Boolean,
@@ -7199,10 +7249,10 @@ private fun SettingsScreen(
             onChange(settings.copy(depthScale = it))
         }
         SettingHelp(lang.t("控制左右眼的水平位移，不是清晰度。沿用旧版单位：位移约为深度值 × 255 × 强度 ÷ 单眼宽度。同一数值在不同分辨率下并不等于固定百分比；越大立体感越强，也越容易出现轮廓拉伸。", "Controls horizontal disparity, not sharpness. Legacy units: depth x 255 x scale / eye width. It is not a fixed percentage across resolutions. Larger values increase depth and edge stretching."))
-        SettingInt(lang.t("深度平滑", "Blur radius"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) {
+        SettingInt(lang.t("深度图滤波窗口", "Depth filter window"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) {
             onChange(settings.copy(blurRadius = it))
         }
-        SettingHelp(lang.t("在 518 × 518 深度图上处理，不模糊原图。0/1 不平滑；较大值抑制深度噪点，但可能混合人物与背景边界。旧版兼容还会改变深度幅度，新版平滑保持均匀区域的幅度，因此切换算法后不应假设同一强度效果相同。", "Filters the 518 x 518 depth map, not the source photo. 0/1 bypass smoothing. Larger values reduce noise but can blend foreground/background boundaries. Legacy also changes depth gain; Centered preserves constant regions. The same strength is not visually equivalent across modes."))
+        SettingHelp(lang.t("滤波在 518 × 518 深度图上进行。新版的数值是窗口边长：3 表示 3×3，5 表示 5×5；旧版保留历史非对称取样及幅度处理，数值相同也不等效。0/1 不滤波。这不是先放大到原图尺寸再反复插值；合成时仍用整数坐标映射取深度值。大窗口能减少噪点，但也可能混合人物与背景边界。", "Filters the 518 x 518 depth map. In Centered mode, 3 means a 3x3 window and 5 means 5x5. Legacy keeps its historical asymmetric sampling and gain, so identical values are not equivalent. 0/1 bypass. This does not upscale and repeatedly interpolate the map; composition uses integer coordinate sampling. Large windows reduce noise but may blend foreground and background edges."))
         SettingInt(lang.t("边缘填充", "Fill radius"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) {
             onChange(settings.copy(fillRadius = it))
         }
@@ -7214,6 +7264,10 @@ private fun SettingsScreen(
         Spacer(Modifier.height(12.dp))
 
         SettingsSectionTitle(lang.t("图片生成设置", "Image generation"))
+        modelWarmupStatus?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(8.dp))
+        }
         ModelPicker(
             title = lang.t("图片模型选择", "Image model"),
             selectedModelId = settings.imageModelId,
@@ -7535,7 +7589,7 @@ private fun ViewerScreen(
                         active = activePage,
                         sbsMode = generated != null,
                         controlsVisible = controlsVisible,
-                        stateLine = "${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}",
+                        stateLine = listOfNotNull(videoState.label(lang), VideoProgress.frames(videoState, job?.currentFrame, job?.totalFrames)).joinToString("  "),
                         metricsLine = "out ${job?.currentFrameMs ?: 0}ms · avg ${job?.avgFrameMs ?: 0}ms",
                         onSingleTap = { controlsVisible = !controlsVisible },
                     )
@@ -7719,8 +7773,9 @@ private fun DebugScreen(
             if (isVideo) {
                 DebugSection(lang.t("视频运行状态", "Video runtime")) {
                     DebugLine("State", "${photo?.let { state.videoStates[it.cacheKey] } ?: VideoVrState.NORMAL}")
-                    DebugLine("Frame", "${videoJob?.currentFrame ?: 0}/${videoJob?.totalFrames ?: 0}")
-                    DebugLine("Progress", "${((videoJob?.progress ?: 0f) * 100f).roundToInt()}%")
+                    val videoState = photo?.let { state.videoStates[it.cacheKey] } ?: VideoVrState.NORMAL
+                    DebugLine("Frame", VideoProgress.frames(videoState, videoJob?.currentFrame, videoJob?.totalFrames) ?: "-")
+                    DebugLine("Progress", "${VideoProgress.percent(videoState, videoJob?.progress)}%")
                     DebugLine("FPS", "${videoJob?.fps ?: videoEntry?.fps ?: 30}")
                     DebugLine(lang.t("吞吐间隔", "Throughput interval"), "${videoJob?.currentFrameMs ?: 0}ms")
                     DebugLine(lang.t("平均吞吐", "Avg throughput"), "${videoJob?.avgFrameMs ?: 0}ms")
@@ -7802,7 +7857,7 @@ private fun DebugScreen(
             }
             DebugSection(lang.t("队列", "Queue")) {
                 state.videoJobs.take(4).forEach {
-                    DebugMonoLine("${it.state.label(lang)} ${(it.progress * 100f).roundToInt()}% f=${it.currentFrame}/${it.totalFrames} ${it.item.displayName}")
+                    DebugMonoLine("${it.state.label(lang)} ${VideoProgress.percent(it.state, it.progress)}% f=${VideoProgress.frames(it.state, it.currentFrame, it.totalFrames) ?: "-"} ${it.item.displayName}")
                 }
                 state.jobs.take(4).forEach {
                     val sourceLabel = it.source?.name?.let { source -> "$source${it.albumId?.let { album -> ":$album" } ?: ""}" } ?: "-"
@@ -9311,6 +9366,9 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, outputWi
         }
     """.trimIndent()
 }
+
+internal fun VrGenerationParams.depthSessionKey(): String =
+    "$depthModel|threads=${modelThreads.coerceIn(1, 8)}|gpu=$useGpu|gpuMode=$gpuTestMode|force=$forceGpuNoFallback"
 
 internal fun VrGenerationParams.visualGenerationVersion(): String {
     val scale = depthScale.roundToInt()
