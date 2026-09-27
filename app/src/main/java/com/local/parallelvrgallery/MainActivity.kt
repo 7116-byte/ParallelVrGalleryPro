@@ -455,13 +455,13 @@ private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
-private const val IMAGE_GENERATOR_VERSION = "depthV6"
+private const val IMAGE_GENERATOR_VERSION = "depthV7"
 private const val IMAGE_CACHE_ENCODER_VERSION = "eyesJpegQ100V1"
 private const val IMAGE_EYE_JPEG_QUALITY = 100
-private const val VIDEO_ENCODER_VERSION = "encoderV14"
+private const val VIDEO_ENCODER_VERSION = "encoderV15"
 private const val VIDEO_FRAME_JPEG_QUALITY = 100
 private const val VIDEO_TARGET_BITS_PER_PIXEL_FRAME = 0.10f
-private val READABLE_VIDEO_ENCODER_VERSIONS = setOf("encoderV12", "encoderV13", VIDEO_ENCODER_VERSION)
+private val READABLE_VIDEO_ENCODER_VERSIONS = setOf("encoderV12", "encoderV13", "encoderV14", VIDEO_ENCODER_VERSION)
 private val CURRENT_VERSION_TAG: String get() = "v${BuildConfig.VERSION_NAME}"
 private val CURRENT_VERSION_CODE: Long get() = BuildConfig.VERSION_CODE.toLong()
 private const val GITHUB_REPO = "7116-byte/ParallelVrGalleryPro"
@@ -540,6 +540,8 @@ data class VideoPipelineStats(
     val generatedQueue: Int = 0,
     val waitingFrames: Int = 0,
     val cacheHits: Int = 0,
+    val cacheWriteQueue: Int = 0,
+    val lastCacheWriteMs: Long = 0L,
 )
 
 data class VideoFrameTimings(
@@ -747,7 +749,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val workers = mutableListOf<Job>()
     private val videoWorkers = mutableListOf<Job>()
     private var currentWorker: Job? = null
-    private var activeKey: String? = null
+    private val activeImageKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     private val _uiState = MutableStateFlow(
         UiState(
@@ -766,7 +768,15 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     override fun onCleared() {
-        generator.close()
+        val imageJobs = workers.toList() + listOfNotNull(currentWorker)
+        imageJobs.forEach { it.cancel() }
+        AppWorkScopes.video.launch {
+            imageJobs.forEach { it.join() }
+            generator.close()
+            queueTags.close()
+            videoWorkers.toList().forEach { it.join() }
+            videoQueueTags.close()
+        }
         super.onCleared()
     }
 
@@ -779,6 +789,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             _uiState.update { it.copy(loading = true, message = null) }
             val snapshot = withContext(Dispatchers.IO) {
+                cache.refresh()
+                videoCache.refresh()
                 val systemPhotos = repository.loadMedia(INITIAL_MEDIA_LIMIT)
                 val imageItems = systemPhotos.filter { it.kind == MediaKind.IMAGE }
                 val videoItems = systemPhotos.filter { it.kind == MediaKind.VIDEO }
@@ -1493,7 +1505,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun clearQueuedImagePrefetch() {
-        val active = activeKey
+        val active = activeImageKeys.toSet()
         val queuedKeys = mutableSetOf<String>()
         synchronized(pending) {
             queuedKeys += pending.map { it.photo.cacheKey }
@@ -1509,7 +1521,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             autoPausedKeys.clear()
             sourcePausedKeys.clear()
         }
-        queuedKeys.remove(active)
+        queuedKeys.removeAll(active)
         queuedKeys.forEach { queueTags.remove(it) }
         if (queuedKeys.isNotEmpty()) {
             _uiState.update {
@@ -1822,17 +1834,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private fun enqueueWindow(index: Int, includeCurrent: Boolean) {
         val state = _uiState.value
         val photos = state.photos
-        if (!state.vrMode) return
-        if (state.viewerOrigin != ViewerOrigin.NORMAL) return
+        if (!ViewerScope.canPrefetch(state.vrMode, state.viewerOrigin == ViewerOrigin.NORMAL)) return
         if (photos.isEmpty()) return
-        val photoIndexByKey = photos.mapIndexed { photoIndex, item -> item.cacheKey to photoIndex }.toMap()
-        val scopeIndices = if (state.viewerScopeOrderedKeys.isNotEmpty()) {
-            state.viewerScopeOrderedKeys.mapNotNull { photoIndexByKey[it] }.distinct()
-        } else if (state.viewerScopeKeys.isNotEmpty()) {
-            photos.mapIndexedNotNull { photoIndex, item -> if (item.cacheKey in state.viewerScopeKeys) photoIndex else null }
-        } else {
-            photos.indices.toList()
-        }
+        val scopeIndices = ViewerScope.indices(photos.map { it.cacheKey }, state.viewerScopeOrderedKeys, state.viewerScopeKeys)
         val scopePosition = scopeIndices.indexOf(index)
         if (scopePosition < 0) return
         val currentVersion = state.settings.toParams().cacheVersion()
@@ -1938,6 +1942,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private fun promoteCurrentImageForVr(index: Int, context: QueueContext? = null) {
         val photo = _uiState.value.photos.getOrNull(index) ?: return
         if (photo.kind != MediaKind.IMAGE) return
+        if (photo.cacheKey in activeImageKeys) return
         val currentVersion = _uiState.value.settings.toParams().cacheVersion()
         cache.findEntry(photo, currentVersion)?.let { entry ->
             markReady(photo.cacheKey, entry)
@@ -2324,6 +2329,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
         synchronized(pausedVideoParams) { activeVideoParams[next.item.cacheKey] = next.params }
         val vrParams = next.params.toVrParams()
+        val effectiveDepthWorkers = if (vrParams.useGpu) 1 else next.params.depthWorkers.coerceIn(1, 2)
         val videoCacheVersion = next.params.cacheVersion()
         var lastRuntimeInfo = "pending"
         _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.GENERATING)) }
@@ -2340,7 +2346,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             modelId = vrParams.depthModel,
             cacheVersion = videoCacheVersion,
             modelThreads = vrParams.modelThreads,
-            depthWorkers = next.params.depthWorkers,
+            depthWorkers = effectiveDepthWorkers,
             useGpu = vrParams.useGpu,
             runtimeInfo = lastRuntimeInfo,
         )
@@ -2354,6 +2360,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 videoGenerator.generate(
                     next.item,
                     next.params,
+                    checkActive = {
+                        if (!isCurrentVideoRun(next.item.cacheKey, next.runToken)) throw VideoStaleException()
+                        if (synchronized(pausedVideos) { pausedVideos.contains(next.item.cacheKey) }) throw VideoPausedException()
+                    },
                     onModelProgress = { progress ->
                         _uiState.update {
                             it.copy(
@@ -2367,7 +2377,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                             addLog("video runtime ${next.item.displayName}: $runtime")
                         }
                         lastRuntimeInfo = runtime
-                        upsertVideoJob(next.item, VideoVrState.GENERATING, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = next.params.depthWorkers, useGpu = vrParams.useGpu, runtimeInfo = runtime)
+                        upsertVideoJob(next.item, VideoVrState.GENERATING, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = runtime)
                     },
                 ) { progress, frame, total, fps, frameMetrics, frameTimings, pipelineStats ->
                     if (!isCurrentVideoRun(next.item.cacheKey, next.runToken)) {
@@ -2396,7 +2406,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         modelId = vrParams.depthModel,
                         cacheVersion = videoCacheVersion,
                         modelThreads = vrParams.modelThreads,
-                        depthWorkers = next.params.depthWorkers,
+                        depthWorkers = effectiveDepthWorkers,
                         useGpu = vrParams.useGpu,
                         runtimeInfo = lastRuntimeInfo,
                         frameTimings = frameTimings,
@@ -2424,7 +2434,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
             refreshGeneratedLibrary()
-            upsertVideoJob(next.item, VideoVrState.READY, 1f, currentFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.currentFrameMs ?: 0L, avgFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.avgFrameMs ?: 0L, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = next.params.depthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis())
+            upsertVideoJob(next.item, VideoVrState.READY, 1f, currentFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.currentFrameMs ?: 0L, avgFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.avgFrameMs ?: 0L, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis())
             videoQueueTags.remove(next.item.cacheKey)
             synchronized(pausedVideoParams) {
                 pausedVideoParams.remove(next.item.cacheKey)
@@ -2442,13 +2452,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     pausedVideoParams[next.item.cacheKey] = next.params
                     activeVideoParams.remove(next.item.cacheKey)
                 }
-                upsertVideoJob(next.item, VideoVrState.PAUSED, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = next.params.depthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
+                upsertVideoJob(next.item, VideoVrState.PAUSED, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
                 addLog("video paused ${next.item.displayName}")
             } else {
                 _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.FAILED), modelProgress = null) }
                 videoQueueTags.upsert(next.item.cacheKey, VideoVrState.FAILED, next.params)
                 synchronized(pausedVideoParams) { activeVideoParams.remove(next.item.cacheKey) }
-                upsertVideoJob(next.item, VideoVrState.FAILED, 1f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = next.params.depthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis(), error = error.message)
+                upsertVideoJob(next.item, VideoVrState.FAILED, 1f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis(), error = error.message)
                 videoNotifier.failed(next.item, error.message ?: "生成失败")
                 addLog("video failed ${next.item.displayName}: ${error.message}")
             }
@@ -2476,58 +2486,59 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun processJob(next: QueuedJob) {
-        activeKey = next.photo.cacheKey
-        queueTags.upsert(next, VrState.GENERATING)
-        markState(next.photo.cacheKey, VrState.GENERATING)
-        upsertJob(next.photo, next.priority, VrState.GENERATING, 0.1f, source = next.source, albumId = next.albumId)
-        val started = System.currentTimeMillis()
-        val result = runCatching {
-            generator.generate(
-                next.photo,
-                _uiState.value.settings.toParams(),
-                onModelProgress = { progress ->
-                    _uiState.update {
-                        it.copy(
-                            modelProgress = progress,
-                            modelStatus = if (progress < 1f) {
-                                "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%"
-                            } else {
-                                "模型已就绪 / Model ready"
-                            },
-                        )
-                    }
-                },
-            ) { progress ->
-                upsertJob(next.photo, next.priority, VrState.GENERATING, progress, source = next.source, albumId = next.albumId)
+        if (!activeImageKeys.add(next.photo.cacheKey)) return
+        try {
+            queueTags.upsert(next, VrState.GENERATING)
+            markState(next.photo.cacheKey, VrState.GENERATING)
+            upsertJob(next.photo, next.priority, VrState.GENERATING, 0.1f, source = next.source, albumId = next.albumId)
+            val started = System.currentTimeMillis()
+            val result = runCatching {
+                generator.generate(
+                    next.photo,
+                    _uiState.value.settings.toParams(),
+                    priority = next.priority,
+                    onModelProgress = { progress ->
+                        _uiState.update {
+                            it.copy(
+                                modelProgress = progress,
+                                modelStatus = if (progress < 1f) {
+                                    "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%"
+                                } else {
+                                    "模型已就绪 / Model ready"
+                                },
+                            )
+                        }
+                    },
+                ) { progress ->
+                    upsertJob(next.photo, next.priority, VrState.GENERATING, progress, source = next.source, albumId = next.albumId)
+                }
             }
-        }
-        result.onSuccess { entry ->
-            queueTags.remove(next.photo.cacheKey)
-            synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey) }
-            markReady(next.photo.cacheKey, entry)
-            upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis(), source = next.source, albumId = next.albumId)
-            addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
-            val currentState = _uiState.value
-            val selected = currentState.selectedIndex ?: currentState.galleryAnchorIndex
-            val doneIndex = currentState.photos.indexOfFirst { it.cacheKey == next.photo.cacheKey }
-            val generationInfo = LastGenerationInfo(relativeIndexInViewerScope(currentState, doneIndex, selected), System.currentTimeMillis() - started)
-            _uiState.update {
-                it.copy(
-                    modelProgress = null,
-                    modelStatus = modelStatusText(it.settings),
-                    cacheVersions = cache.summaries(),
-                    lastGeneration = generationInfo,
-                    recentGenerations = (listOf(generationInfo) + it.recentGenerations).take(3),
-                )
+            result.onSuccess { entry ->
+                queueTags.remove(next.photo.cacheKey)
+                synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey) }
+                markReady(next.photo.cacheKey, entry)
+                upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis(), source = next.source, albumId = next.albumId)
+                addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
+                val currentState = _uiState.value
+                val selected = currentState.selectedIndex ?: currentState.galleryAnchorIndex
+                val doneIndex = currentState.photos.indexOfFirst { it.cacheKey == next.photo.cacheKey }
+                val generationInfo = LastGenerationInfo(relativeIndexInViewerScope(currentState, doneIndex, selected), System.currentTimeMillis() - started)
+                _uiState.update {
+                    it.copy(
+                        modelProgress = null,
+                        modelStatus = modelStatusText(it.settings),
+                        lastGeneration = generationInfo,
+                        recentGenerations = (listOf(generationInfo) + it.recentGenerations).take(3),
+                    )
+                }
+            }.onFailure { error ->
+                synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey) }
+                queueTags.upsert(next, VrState.FAILED)
+                markState(next.photo.cacheKey, VrState.FAILED)
+                upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message, source = next.source, albumId = next.albumId)
+                addLog("failed ${next.photo.displayName}: ${error.message}")
             }
-        }.onFailure { error ->
-            synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey) }
-            queueTags.upsert(next, VrState.FAILED)
-            markState(next.photo.cacheKey, VrState.FAILED)
-            upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message, source = next.source, albumId = next.albumId)
-            addLog("failed ${next.photo.displayName}: ${error.message}")
-        }
-        activeKey = null
+        } finally { activeImageKeys.remove(next.photo.cacheKey) }
     }
 
     private fun expandAutoPrefetchIfNeeded(): Boolean {
@@ -2546,13 +2557,20 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun markReady(key: String, entry: VrCacheEntry) {
+        cache.register(entry)
+        val summaries = cache.summaries()
         _uiState.update {
+            val photo = it.photos.firstOrNull { photo -> photo.cacheKey == key }
+            val managed = if (photo == null) it.managedCacheItems else (
+                it.managedCacheItems.filterNot { item -> item.entry.photoKey == key && item.entry.version == entry.version } + ManagedCacheItem(photo, entry)
+            ).sortedByDescending { item -> item.entry.createdAt }
             it.copy(
                 states = it.states + (key to VrState.READY),
                 entries = it.entries + (key to entry),
+                managedCacheItems = managed,
+                cacheVersions = summaries,
             )
         }
-        refreshGeneratedLibrary()
     }
 
     private fun markState(key: String, state: VrState) {
@@ -2572,9 +2590,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { current ->
             current.copy(
                 entries = current.entries + imageEntries,
-                states = current.states + imageEntries.keys.associateWith { VrState.READY },
+                states = imageEntries.keys.associateWith { VrState.READY } + current.states.filterValues { it != VrState.NORMAL },
                 videoEntries = current.videoEntries + videoEntries,
-                videoStates = current.videoStates + videoEntries.keys.associateWith { VideoVrState.READY },
+                videoStates = videoEntries.keys.associateWith { VideoVrState.READY } + current.videoStates.filterValues { it != VideoVrState.NORMAL },
                 managedCacheItems = managedItems,
                 cacheVersions = cacheVersions,
                 message = message ?: current.message,
@@ -3176,14 +3194,15 @@ private class PhotoRepository(private val context: Context) {
     }
 }
 
-private class QueueTagStore(context: Context) {
+private class QueueTagStore(context: Context) : Closeable {
     private val root = File(context.getExternalFilesDir(null), "queue_index").also { it.mkdirs() }
     private val file = File(root, "image_queue.tsv")
+    private val storage = BufferedTextFile(file)
+    override fun close() { storage.close() }
 
     @Synchronized
     fun load(): List<QueueTag> {
-        if (!file.exists()) return emptyList()
-        return file.readLines(Charsets.UTF_8).mapNotNull { line ->
+        return storage.read().lineSequence().mapNotNull { line ->
             val parts = line.split('\t')
             if (parts.size < 6) return@mapNotNull null
             val source = runCatching { QueueSource.valueOf(parts[1]) }.getOrNull() ?: return@mapNotNull null
@@ -3196,7 +3215,7 @@ private class QueueTagStore(context: Context) {
                 state = state,
                 updatedAt = parts[5].toLongOrNull() ?: 0L,
             )
-        }.distinctBy { it.photoKey }
+        }.distinctBy { it.photoKey }.toList()
     }
 
     @Synchronized
@@ -3231,11 +3250,7 @@ private class QueueTagStore(context: Context) {
     }
 
     private fun write(tags: List<QueueTag>) {
-        if (tags.isEmpty()) {
-            if (file.exists()) file.delete()
-            return
-        }
-        file.writeText(
+        storage.write(
             tags.joinToString("\n") { tag ->
                 listOf(
                     tag.photoKey.safeQueueField(),
@@ -3246,21 +3261,21 @@ private class QueueTagStore(context: Context) {
                     tag.updatedAt.toString(),
                 ).joinToString("\t")
             },
-            Charsets.UTF_8,
         )
     }
 
     private fun String.safeQueueField(): String = replace('\t', '_').replace('\n', '_').replace('\r', '_')
 }
 
-private class VideoQueueTagStore(context: Context) {
+private class VideoQueueTagStore(context: Context) : Closeable {
     private val root = File(context.getExternalFilesDir(null), "queue_index").also { it.mkdirs() }
     private val file = File(root, "video_queue.tsv")
+    private val storage = BufferedTextFile(file)
+    override fun close() { storage.close() }
 
     @Synchronized
     fun load(): List<VideoQueueTag> {
-        if (!file.exists()) return emptyList()
-        return file.readLines(Charsets.UTF_8).mapNotNull { line ->
+        return storage.read().lineSequence().mapNotNull { line ->
             val parts = line.split('\t')
             if (parts.size < 3) return@mapNotNull null
             val state = runCatching { VideoVrState.valueOf(parts[1]) }.getOrNull() ?: VideoVrState.PAUSED
@@ -3270,7 +3285,7 @@ private class VideoQueueTagStore(context: Context) {
                 updatedAt = parts[2].toLongOrNull() ?: 0L,
                 params = parts.getOrNull(3)?.let { decodeVideoParams(it) },
             )
-        }.distinctBy { it.videoKey }
+        }.distinctBy { it.videoKey }.toList()
     }
 
     @Synchronized
@@ -3294,11 +3309,7 @@ private class VideoQueueTagStore(context: Context) {
     }
 
     private fun write(tags: List<VideoQueueTag>) {
-        if (tags.isEmpty()) {
-            if (file.exists()) file.delete()
-            return
-        }
-        file.writeText(
+        storage.write(
             tags.joinToString("\n") { tag ->
                 listOf(
                     tag.videoKey.safeQueueField(),
@@ -3307,7 +3318,6 @@ private class VideoQueueTagStore(context: Context) {
                     tag.params?.encodeForQueue().orEmpty(),
                 ).joinToString("\t")
             },
-            Charsets.UTF_8,
         )
     }
 
@@ -3363,41 +3373,48 @@ private class VideoQueueTagStore(context: Context) {
 
 private class VrCacheManager(private val context: Context) {
     val root: File = File(context.getExternalFilesDir(null), "vr_cache").also { it.mkdirs() }
+    private val index = VersionedIndex<VrCacheEntry>({ it.photoKey }, { it.version }, { it.createdAt })
+    private val virtualItems = mutableMapOf<String, PhotoItem>()
+    private val scanLock = Any()
+
+    fun refresh() = synchronized(scanLock) {
+        val since = index.scanRevision()
+        val scanned = mutableListOf<Pair<VrCacheEntry, Long>>()
+        root.listFiles()?.filter { it.isDirectory }?.forEach { photoDir ->
+            readEntry(photoDir.name, DEFAULT_VERSION, photoDir)?.let { scanned += it to it.cacheBytes() }
+            photoDir.listFiles()?.filter { it.isDirectory }?.forEach { dir ->
+                readEntry(photoDir.name, dir.name, dir)?.let { scanned += it to it.cacheBytes() }
+            }
+        }
+        index.replaceFromScan(scanned, since)
+        synchronized(this) { virtualItems.clear() }
+    }
+    @Synchronized fun register(entry: VrCacheEntry) {
+        index.put(entry, entry.cacheBytes())
+        virtualItems.remove(entry.photoKey)
+    }
 
     fun entryDir(photo: PhotoItem, version: String): File {
         return if (version == DEFAULT_VERSION) File(root, photo.cacheKey) else File(File(root, photo.cacheKey), version)
     }
 
     fun findEntry(photo: PhotoItem, version: String? = null): VrCacheEntry? {
-        if (version != null) {
-            return readEntry(photo.cacheKey, version, entryDir(photo, version))
-        }
-        return latestEntry(photo.cacheKey)
+        return validEntry(index.get(photo.cacheKey, version))
     }
 
     fun latestEntry(photoKey: String): VrCacheEntry? {
-        val base = File(root, photoKey)
-        val candidates = mutableListOf<Pair<String, File>>()
-        candidates += DEFAULT_VERSION to base
-        base.listFiles()?.filter { it.isDirectory }?.forEach { candidates += it.name to it }
-        return candidates.mapNotNull { (version, dir) -> readEntry(photoKey, version, dir) }.maxByOrNull { it.createdAt }
+        return validEntry(index.get(photoKey))
+    }
+
+    private fun validEntry(entry: VrCacheEntry?): VrCacheEntry? {
+        if (entry == null) return null
+        if (entry.hasSplitEyes || entry.hasLegacySbs) return entry
+        index.removeWhere { it.photoKey == entry.photoKey && it.version == entry.version }
+        return null
     }
 
     fun summaries(): List<CacheVersionSummary> {
-        val map = linkedMapOf<String, Pair<Int, Long>>()
-        root.listFiles()?.filter { it.isDirectory }?.forEach { photoDir ->
-            readEntry(photoDir.name, DEFAULT_VERSION, photoDir)?.let { entry ->
-                val current = map[DEFAULT_VERSION] ?: (0 to 0L)
-                map[DEFAULT_VERSION] = current.first + 1 to current.second + entry.cacheBytes()
-            }
-            photoDir.listFiles()?.filter { it.isDirectory }?.forEach { versionDir ->
-                readEntry(photoDir.name, versionDir.name, versionDir)?.let { entry ->
-                    val current = map[versionDir.name] ?: (0 to 0L)
-                    map[versionDir.name] = current.first + 1 to current.second + entry.cacheBytes()
-                }
-            }
-        }
-        return map.map { (version, value) ->
+        return index.summaries().map { (version, value) ->
             CacheVersionSummary(version = version, kind = "图片 / Images", count = value.first, bytes = value.second)
         }.sortedBy { it.version }
     }
@@ -3407,21 +3424,12 @@ private class VrCacheManager(private val context: Context) {
     }
 
     fun allEntriesByKey(photoByKey: Map<String, PhotoItem>): List<ManagedCacheItem> {
-        return root.listFiles()?.asSequence()
-            ?.filter { it.isDirectory }
-            ?.flatMap { photoDir ->
-                val entries = mutableListOf<VrCacheEntry>()
-                readEntry(photoDir.name, DEFAULT_VERSION, photoDir)?.let { entries += it }
-                photoDir.listFiles()?.filter { it.isDirectory }?.forEach { versionDir ->
-                    readEntry(photoDir.name, versionDir.name, versionDir)?.let { entries += it }
-                }
-                val latest = entries.maxByOrNull { it.createdAt } ?: return@flatMap emptySequence()
-                val photo = photoByKey[photoDir.name] ?: virtualPhotoItem(photoDir.name, latest)
-                entries.asSequence().map { ManagedCacheItem(photo, it) }
+        return index.all().map { entry ->
+            val photo = photoByKey[entry.photoKey] ?: synchronized(this) {
+                virtualItems.getOrPut(entry.photoKey) { virtualPhotoItem(entry.photoKey, entry) }
             }
-            ?.sortedByDescending { it.entry.createdAt }
-            ?.toList()
-            ?: emptyList()
+            ManagedCacheItem(photo, entry)
+        }
     }
 
     fun allEntriesSlow(photos: List<PhotoItem>): List<ManagedCacheItem> {
@@ -3435,7 +3443,7 @@ private class VrCacheManager(private val context: Context) {
         }.sortedByDescending { it.entry.createdAt }
     }
 
-    fun deleteVersion(version: String) {
+    @Synchronized fun deleteVersion(version: String) {
         root.listFiles()?.filter { it.isDirectory }?.forEach { photoDir ->
             if (version == DEFAULT_VERSION) {
                 IMAGE_CACHE_FILES.forEach {
@@ -3445,9 +3453,11 @@ private class VrCacheManager(private val context: Context) {
                 File(photoDir, version).deleteRecursively()
             }
         }
+        index.removeWhere { it.version == version }
+        virtualItems.clear()
     }
 
-    fun deleteEntry(entry: VrCacheEntry) {
+    @Synchronized fun deleteEntry(entry: VrCacheEntry) {
         val photoDir = File(root, entry.photoKey)
         if (entry.version == DEFAULT_VERSION) {
             IMAGE_CACHE_FILES.forEach {
@@ -3456,10 +3466,14 @@ private class VrCacheManager(private val context: Context) {
         } else {
             File(photoDir, entry.version).deleteRecursively()
         }
+        index.removeWhere { it.photoKey == entry.photoKey && it.version == entry.version }
+        virtualItems.remove(entry.photoKey)
     }
 
-    fun deletePhoto(photo: PhotoItem) {
+    @Synchronized fun deletePhoto(photo: PhotoItem) {
         File(root, photo.cacheKey).deleteRecursively()
+        index.removeWhere { it.photoKey == photo.cacheKey }
+        virtualItems.remove(photo.cacheKey)
     }
 
     private fun readEntry(photoKey: String, version: String, dir: File): VrCacheEntry? {
@@ -3536,19 +3550,38 @@ private class VrCacheManager(private val context: Context) {
 
 private class VideoVrCacheManager(private val context: Context) {
     val root: File = File(context.getExternalFilesDir(null), "video_vr_cache").also { it.mkdirs() }
+    private val index = VersionedIndex<VideoCacheEntry>({ it.videoKey }, { File(it.outputPath).parent.orEmpty() }, { it.createdAt })
+    private val virtualItems = mutableMapOf<String, GalleryItem>()
+    private val scanLock = Any()
+
+    fun refresh() = synchronized(scanLock) {
+        val since = index.scanRevision()
+        val scanned = mutableListOf<Pair<VideoCacheEntry, Long>>()
+        root.listFiles()?.filter { it.isDirectory }?.forEach { videoDir ->
+            readEntry(videoDir.name, videoDir)?.let { scanned += it to File(it.outputPath).length() }
+            videoDir.listFiles()?.filter { it.isDirectory }?.forEach { dir ->
+                readEntry(videoDir.name, dir)?.let { scanned += it to File(it.outputPath).length() }
+            }
+        }
+        index.replaceFromScan(scanned, since)
+        synchronized(this) { virtualItems.clear() }
+    }
+    @Synchronized fun register(item: GalleryItem, dir: File): VideoCacheEntry? {
+        return readEntry(item.cacheKey, dir)?.also {
+            index.put(it, File(it.outputPath).length())
+            virtualItems.remove(it.videoKey)
+        }
+    }
 
     fun entryDir(item: GalleryItem): File = File(root, item.cacheKey).also { it.mkdirs() }
 
     fun entryDir(item: GalleryItem, version: String): File = File(entryDir(item), version).also { it.mkdirs() }
 
     fun findEntry(item: GalleryItem): VideoCacheEntry? {
-        val base = entryDir(item)
-        val entries = mutableListOf<VideoCacheEntry>()
-        readEntry(item.cacheKey, base)?.let { entries += it }
-        base.listFiles()?.filter { it.isDirectory }?.forEach { dir ->
-            readEntry(item.cacheKey, dir)?.let { entries += it }
-        }
-        return entries.maxByOrNull { it.createdAt }
+        val entry = index.get(item.cacheKey) ?: return null
+        if (File(entry.outputPath).isFile) return entry
+        index.removeWhere { it.outputPath == entry.outputPath }
+        return null
     }
 
     fun allEntries(items: List<GalleryItem>): List<Pair<GalleryItem, VideoCacheEntry>> {
@@ -3556,25 +3589,18 @@ private class VideoVrCacheManager(private val context: Context) {
     }
 
     fun allEntriesByKey(videoByKey: Map<String, GalleryItem>): List<Pair<GalleryItem, VideoCacheEntry>> {
-        return root.listFiles()?.asSequence()
-            ?.filter { it.isDirectory }
-            ?.mapNotNull { videoDir ->
-                val entries = mutableListOf<VideoCacheEntry>()
-                readEntry(videoDir.name, videoDir)?.let { entries += it }
-                videoDir.listFiles()?.filter { it.isDirectory }?.forEach { dir ->
-                    readEntry(videoDir.name, dir)?.let { entries += it }
-                }
-                val latest = entries.maxByOrNull { it.createdAt } ?: return@mapNotNull null
-                val item = videoByKey[videoDir.name] ?: virtualVideoItem(videoDir.name, latest)
-                item to latest
+        return index.all().distinctBy { it.videoKey }.map { entry ->
+            val item = videoByKey[entry.videoKey] ?: synchronized(this) {
+                virtualItems.getOrPut(entry.videoKey) { virtualVideoItem(entry.videoKey, entry) }
             }
-            ?.sortedByDescending { it.second.createdAt }
-            ?.toList()
-            ?: emptyList()
+            item to entry
+        }
     }
 
-    fun delete(item: GalleryItem) {
+    @Synchronized fun delete(item: GalleryItem) {
         File(root, item.cacheKey).deleteRecursively()
+        index.removeWhere { it.videoKey == item.cacheKey }
+        virtualItems.remove(item.cacheKey)
     }
 
     private fun readEntry(videoKey: String, dir: File): VideoCacheEntry? {
@@ -3861,13 +3887,13 @@ private class VrGenerator(
     private val cache: VrCacheManager,
     private val modelManager: ModelManager,
 ) : Closeable {
-    private val imageSessionLock = Any()
-    private val imageSessions = linkedMapOf<String, DepthModelSession>()
+    private val imageSessions = IdleResourcePool<String, DepthModelSession>(maxIdle = 1)
 
     fun generate(
         photo: PhotoItem,
         params: VrGenerationParams,
         onModelProgress: (Float) -> Unit,
+        priority: Int = 1,
         onProgress: (Float) -> Unit,
     ): VrCacheEntry {
         val version = params.cacheVersion()
@@ -3880,130 +3906,139 @@ private class VrGenerator(
         }
 
         mark("start name=${photo.displayName} size=${photo.size} modified=${photo.modifiedTime}")
-        val depthSession = sharedImageDepthSession(params, onModelProgress) { runtime ->
+        val sessionLease = sharedImageDepthSession(params, onModelProgress) { runtime ->
             mark(runtime)
         }
-        mark("model session ready key=${imageSessionKey(params)}")
-        onProgress(0.12f)
+        val ownedBitmaps = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Bitmap, Boolean>())
+        try {
+            val depthSession = sessionLease.value
+            mark("model session ready key=${imageSessionKey(params)}")
+            onProgress(0.12f)
 
-        val decodeMaxLongEdge = memorySafeMaxLongEdge(photo.width, photo.height, params.maxLongEdge)
-        if (decodeMaxLongEdge < params.maxLongEdge) {
-            mark("memory capped maxLongEdge ${params.maxLongEdge} -> $decodeMaxLongEdge")
-        }
-        val decodeStart = System.currentTimeMillis()
-        var original = decodeScaledBitmap(context, photo.uri, decodeMaxLongEdge)
-        val decodeMs = System.currentTimeMillis() - decodeStart
-        mark("decode ${decodeMs}ms size=${original.width}x${original.height}")
-        if (max(photo.width, photo.height) > decodeMaxLongEdge) {
-            mark("downsampled source because original long edge exceeded $decodeMaxLongEdge")
-        }
-        onProgress(0.25f)
+            val decodeMaxLongEdge = memorySafeMaxLongEdge(photo.width, photo.height, params.maxLongEdge)
+            if (decodeMaxLongEdge < params.maxLongEdge) {
+                mark("memory capped maxLongEdge ${params.maxLongEdge} -> $decodeMaxLongEdge")
+            }
+            val decodeStart = System.currentTimeMillis()
+            var original = decodeScaledBitmap(context, photo.uri, decodeMaxLongEdge).also { ownedBitmaps.add(it) }
+            val decodeMs = System.currentTimeMillis() - decodeStart
+            mark("decode ${decodeMs}ms size=${original.width}x${original.height}")
+            if (max(photo.width, photo.height) > decodeMaxLongEdge) {
+                mark("downsampled source because original long edge exceeded $decodeMaxLongEdge")
+            }
+            onProgress(0.25f)
 
-        val depthStart = System.currentTimeMillis()
-        val rawDepth = depthSession.run(original)
-        val modelMs = System.currentTimeMillis() - depthStart
-        mark("model inference ${modelMs}ms")
-        val depthPostStart = System.currentTimeMillis()
-        val depthSmall = smoothDepth(rawDepth, params.blurRadius, params.invertDepth)
-        onProgress(0.55f)
+            val depthStart = System.currentTimeMillis()
+            val rawDepth = depthSession.run(original, priority)
+            val modelMs = System.currentTimeMillis() - depthStart
+            mark("model inference ${modelMs}ms")
+            val depthPostStart = System.currentTimeMillis()
+            val depthSmall = smoothDepth(rawDepth, params.blurRadius, params.invertDepth)
+            onProgress(0.55f)
 
-        val depthBitmap = depthToBitmap(depthSmall)
-        val depthPath = File(dir, "depth.png")
-        FileOutputStream(depthPath).use { depthBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
-        val depthPostMs = System.currentTimeMillis() - depthPostStart
-        mark("depth post ${depthPostMs}ms output=${depthBitmap.width}x${depthBitmap.height}")
-        onProgress(0.7f)
+            val depthBitmap = depthToBitmap(depthSmall).also { ownedBitmaps.add(it) }
+            val depthPath = File(dir, "depth.png")
+            FileOutputStream(depthPath).use { depthBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            val depthPostMs = System.currentTimeMillis() - depthPostStart
+            mark("depth post ${depthPostMs}ms output=${depthBitmap.width}x${depthBitmap.height}")
+            onProgress(0.7f)
 
-        val sbsStart = System.currentTimeMillis()
-        val pair = runCatching {
-            makeParallelStereoPair(original, depthSmall, params.depthScale, params.fillRadius)
-        }.getOrElse { error ->
-            if (error !is OutOfMemoryError || max(original.width, original.height) <= 960) throw error
-            val retryLongEdge = max(960, (max(original.width, original.height) * 0.72f).roundToInt())
-            val scale = retryLongEdge.toFloat() / max(original.width, original.height).toFloat()
-            mark("sbs oom retry maxLongEdge=$retryLongEdge error=${error.message}")
-            val reduced = Bitmap.createScaledBitmap(
-                original,
-                max(1, (original.width * scale).roundToInt()),
-                max(1, (original.height * scale).roundToInt()),
-                true,
+            val sbsStart = System.currentTimeMillis()
+            val pair = runCatching {
+                makeParallelStereoPair(original, depthSmall, params.depthScale, params.fillRadius)
+            }.getOrElse { error ->
+                if (error !is OutOfMemoryError || max(original.width, original.height) <= 960) throw error
+                val retryLongEdge = max(960, (max(original.width, original.height) * 0.72f).roundToInt())
+                val scale = retryLongEdge.toFloat() / max(original.width, original.height).toFloat()
+                mark("sbs oom retry maxLongEdge=$retryLongEdge error=${error.message}")
+                val reduced = Bitmap.createScaledBitmap(
+                    original,
+                    max(1, (original.width * scale).roundToInt()),
+                    max(1, (original.height * scale).roundToInt()),
+                    true,
+                )
+                original.recycle()
+                original = reduced.also { ownedBitmaps.add(it) }
+                makeParallelStereoPair(original, depthSmall, params.depthScale, params.fillRadius)
+            }
+            ownedBitmaps.add(pair.left)
+            ownedBitmaps.add(pair.right)
+            val sbsMs = System.currentTimeMillis() - sbsStart
+            mark("stereo ${sbsMs}ms output=${pair.sbsWidth}x${pair.height}")
+            val writeStart = System.currentTimeMillis()
+            val vrPath = File(dir, "vr_sbs.jpg")
+            val leftPath = File(dir, "left.jpg")
+            val rightPath = File(dir, "right.jpg")
+            val stereoWrite = writeStereoJpegParallel(
+                pair.left,
+                leftPath,
+                pair.right,
+                rightPath,
+                IMAGE_EYE_JPEG_QUALITY,
             )
+            onProgress(0.9f)
+            val outputWidth = pair.sbsWidth
+            val outputHeight = pair.height
+
+            val paramsPath = File(dir, "params.json")
+            val logPath = File(dir, "job.log")
+            val totalBeforeFinalLog = System.currentTimeMillis() - start
+            val timings = GenerationTimings(
+                decodeMs = decodeMs,
+                modelMs = modelMs,
+                depthPostMs = depthPostMs,
+                sbsMs = sbsMs,
+                writeLeftMs = stereoWrite.leftMs,
+                writeRightMs = stereoWrite.rightMs,
+                writeMs = 0L,
+                totalMs = totalBeforeFinalLog,
+            )
+            val writeParamsStart = System.currentTimeMillis()
+            paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, timings), Charsets.UTF_8)
+            val writeParamsFirstMs = System.currentTimeMillis() - writeParamsStart
+            val writeMsBeforeLog = System.currentTimeMillis() - writeStart
+            val finalTimingsBeforeLog = timings.copy(
+                writeParamsMs = writeParamsFirstMs,
+                writeMs = writeMsBeforeLog,
+                totalMs = System.currentTimeMillis() - start,
+            )
+            val rewriteParamsStart = System.currentTimeMillis()
+            paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, finalTimingsBeforeLog), Charsets.UTF_8)
+            val writeParamsMs = writeParamsFirstMs + (System.currentTimeMillis() - rewriteParamsStart)
+            val logWriteStart = System.currentTimeMillis()
+            mark("write leftJpegQ$IMAGE_EYE_JPEG_QUALITY=${stereoWrite.leftMs}ms rightJpegQ$IMAGE_EYE_JPEG_QUALITY=${stereoWrite.rightMs}ms params=${writeParamsMs}ms")
+            mark("done total=${System.currentTimeMillis() - start}ms")
+            logPath.writeText(log.toString(), Charsets.UTF_8)
+            val writeLogMs = System.currentTimeMillis() - logWriteStart
+            val writeMs = System.currentTimeMillis() - writeStart
+            val finalTimings = timings.copy(
+                writeParamsMs = writeParamsMs,
+                writeLogMs = writeLogMs,
+                writeMs = writeMs,
+                totalMs = System.currentTimeMillis() - start,
+            )
+            paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, finalTimings), Charsets.UTF_8)
+            depthBitmap.recycle()
             original.recycle()
-            original = reduced
-            makeParallelStereoPair(original, depthSmall, params.depthScale, params.fillRadius)
+            pair.recycle()
+
+            return VrCacheEntry(
+                photoKey = photo.cacheKey,
+                version = version,
+                outputPath = vrPath.absolutePath,
+                leftPath = leftPath.absolutePath,
+                rightPath = rightPath.absolutePath,
+                depthPath = depthPath.absolutePath,
+                paramsPath = paramsPath.absolutePath,
+                logPath = logPath.absolutePath,
+                width = outputWidth,
+                height = outputHeight,
+                createdAt = System.currentTimeMillis(),
+            )
+        } finally {
+            ownedBitmaps.forEach { if (!it.isRecycled) it.recycle() }
+            sessionLease.close()
         }
-        val sbsMs = System.currentTimeMillis() - sbsStart
-        mark("stereo ${sbsMs}ms output=${pair.sbsWidth}x${pair.height}")
-        val writeStart = System.currentTimeMillis()
-        val vrPath = File(dir, "vr_sbs.jpg")
-        val leftPath = File(dir, "left.jpg")
-        val rightPath = File(dir, "right.jpg")
-        val stereoWrite = writeStereoJpegParallel(
-            pair.left,
-            leftPath,
-            pair.right,
-            rightPath,
-            IMAGE_EYE_JPEG_QUALITY,
-        )
-        onProgress(0.9f)
-        val outputWidth = pair.sbsWidth
-        val outputHeight = pair.height
-
-        val paramsPath = File(dir, "params.json")
-        val logPath = File(dir, "job.log")
-        val totalBeforeFinalLog = System.currentTimeMillis() - start
-        val timings = GenerationTimings(
-            decodeMs = decodeMs,
-            modelMs = modelMs,
-            depthPostMs = depthPostMs,
-            sbsMs = sbsMs,
-            writeLeftMs = stereoWrite.leftMs,
-            writeRightMs = stereoWrite.rightMs,
-            writeMs = 0L,
-            totalMs = totalBeforeFinalLog,
-        )
-        val writeParamsStart = System.currentTimeMillis()
-        paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, timings), Charsets.UTF_8)
-        val writeParamsFirstMs = System.currentTimeMillis() - writeParamsStart
-        val writeMsBeforeLog = System.currentTimeMillis() - writeStart
-        val finalTimingsBeforeLog = timings.copy(
-            writeParamsMs = writeParamsFirstMs,
-            writeMs = writeMsBeforeLog,
-            totalMs = System.currentTimeMillis() - start,
-        )
-        val rewriteParamsStart = System.currentTimeMillis()
-        paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, finalTimingsBeforeLog), Charsets.UTF_8)
-        val writeParamsMs = writeParamsFirstMs + (System.currentTimeMillis() - rewriteParamsStart)
-        val logWriteStart = System.currentTimeMillis()
-        mark("write leftJpegQ$IMAGE_EYE_JPEG_QUALITY=${stereoWrite.leftMs}ms rightJpegQ$IMAGE_EYE_JPEG_QUALITY=${stereoWrite.rightMs}ms params=${writeParamsMs}ms")
-        mark("done total=${System.currentTimeMillis() - start}ms")
-        logPath.writeText(log.toString(), Charsets.UTF_8)
-        val writeLogMs = System.currentTimeMillis() - logWriteStart
-        val writeMs = System.currentTimeMillis() - writeStart
-        val finalTimings = timings.copy(
-            writeParamsMs = writeParamsMs,
-            writeLogMs = writeLogMs,
-            writeMs = writeMs,
-            totalMs = System.currentTimeMillis() - start,
-        )
-        paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, finalTimings), Charsets.UTF_8)
-        depthBitmap.recycle()
-        original.recycle()
-        pair.recycle()
-
-        return VrCacheEntry(
-            photoKey = photo.cacheKey,
-            version = version,
-            outputPath = vrPath.absolutePath,
-            leftPath = leftPath.absolutePath,
-            rightPath = rightPath.absolutePath,
-            depthPath = depthPath.absolutePath,
-            paramsPath = paramsPath.absolutePath,
-            logPath = logPath.absolutePath,
-            width = outputWidth,
-            height = outputHeight,
-            createdAt = System.currentTimeMillis(),
-        )
     }
 
     fun generateSbsBitmap(
@@ -4054,7 +4089,10 @@ private class VrGenerator(
             source
         }
         val depthStart = SystemClock.uptimeMillis()
-        val rawDepth = depthSession.run(working)
+        val rawDepth = try { depthSession.run(working) } catch (error: Throwable) {
+            if (working !== source) working.recycle()
+            throw error
+        }
         val depthMs = SystemClock.uptimeMillis() - depthStart
         return VideoDepthResult(
             source = working,
@@ -4100,14 +4138,9 @@ private class VrGenerator(
         params: VrGenerationParams,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit,
-    ): DepthModelSession {
+    ): IdleResourcePool.Borrowed<DepthModelSession> {
         val key = imageSessionKey(params)
-        synchronized(imageSessionLock) {
-            imageSessions[key]?.let { return it }
-            val session = openDepthSession(params, onModelProgress, onRuntimeInfo)
-            imageSessions[key] = session
-            return session
-        }
+        return imageSessions.acquire(key) { openDepthSession(params, onModelProgress, onRuntimeInfo) }
     }
 
     fun openDepthSession(
@@ -4147,10 +4180,7 @@ private class VrGenerator(
     }
 
     override fun close() {
-        synchronized(imageSessionLock) {
-            imageSessions.values.forEach { session -> runCatching { session.close() } }
-            imageSessions.clear()
-        }
+        imageSessions.close()
     }
 
     private fun depthToBitmap(depth: FloatArray): Bitmap {
@@ -4166,33 +4196,7 @@ private class VrGenerator(
     }
 
     private fun smoothDepth(depth: FloatArray, radius: Int, invert: Boolean): FloatArray {
-        val size = 518
-        if (radius <= 0) {
-            return if (invert) FloatArray(depth.size) { 1f - depth[it] } else depth.copyOf()
-        }
-        val r = radius.coerceAtLeast(1) / 2
-        val horizontal = FloatArray(depth.size)
-        val output = FloatArray(depth.size)
-        for (y in 0 until size) {
-            var sum = 0f
-            for (x in 0 until size) {
-                sum += depth[y * size + x]
-                if (x > r) sum -= depth[y * size + x - r - 1]
-                val count = min(x + r + 1, size) - max(0, x - r)
-                horizontal[y * size + x] = sum / count.toFloat()
-            }
-        }
-        for (x in 0 until size) {
-            var sum = 0f
-            for (y in 0 until size) {
-                sum += horizontal[y * size + x]
-                if (y > r) sum -= horizontal[(y - r - 1) * size + x]
-                val count = min(y + r + 1, size) - max(0, y - r)
-                val value = sum / count.toFloat()
-                output[y * size + x] = if (invert) 1f - value else value
-            }
-        }
-        return output
+        return DepthFilters.boxMean(depth, 518, 518, radius, invert)
     }
 
     private fun makeParallelStereoPair(source: Bitmap, depth: FloatArray, depthScale: Float, fillRadius: Int): StereoBitmapPair {
@@ -4201,27 +4205,36 @@ private class VrGenerator(
         val fill = fillRadius.coerceIn(1, 32)
         val depthScaling = depthScale / w.toFloat()
         val left = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val right = source.copy(Bitmap.Config.ARGB_8888, false)
-        val srcRow = IntArray(w)
-        val leftRow = IntArray(w)
-        val dxForX = IntArray(w) { x -> (x * 517 / max(1, w - 1)).coerceIn(0, 517) }
-
-        for (y in 0 until h) {
-            source.getPixels(srcRow, 0, w, 0, y, w, 1)
-            srcRow.copyInto(leftRow)
-            val depthBase = (y * 517 / max(1, h - 1)).coerceIn(0, 517) * 518
-            for (x in w - 1 downTo 0) {
-                val d = depth[depthBase + dxForX[x]]
-                val shift = (d.coerceIn(0f, 1f) * 255f * depthScaling).toInt().coerceIn(0, w - 1)
-                val color = srcRow[x]
-                for (offset in 0 until fill) {
-                    val leftX = (x + shift + offset).coerceIn(0, w - 1)
-                    leftRow[leftX] = color
-                }
-            }
-            left.setPixels(leftRow, 0, w, 0, y, w, 1)
+        val right = try { source.copy(Bitmap.Config.ARGB_8888, false) } catch (error: Throwable) {
+            left.recycle()
+            throw error
         }
-        return StereoBitmapPair(left, right)
+        try {
+            val srcRow = IntArray(w)
+            val leftRow = IntArray(w)
+            val dxForX = IntArray(w) { x -> (x * 517 / max(1, w - 1)).coerceIn(0, 517) }
+
+            for (y in 0 until h) {
+                source.getPixels(srcRow, 0, w, 0, y, w, 1)
+                srcRow.copyInto(leftRow)
+                val depthBase = (y * 517 / max(1, h - 1)).coerceIn(0, 517) * 518
+                for (x in w - 1 downTo 0) {
+                    val d = depth[depthBase + dxForX[x]]
+                    val shift = (d.coerceIn(0f, 1f) * 255f * depthScaling).toInt().coerceIn(0, w - 1)
+                    val color = srcRow[x]
+                    for (offset in 0 until fill) {
+                        val leftX = (x + shift + offset).coerceIn(0, w - 1)
+                        leftRow[leftX] = color
+                    }
+                }
+                left.setPixels(leftRow, 0, w, 0, y, w, 1)
+            }
+            return StereoBitmapPair(left, right)
+        } catch (error: Throwable) {
+            left.recycle()
+            right.recycle()
+            throw error
+        }
     }
 
     private fun makeParallelSbs(source: Bitmap, depth: FloatArray, depthScale: Float, fillRadius: Int): Bitmap {
@@ -4265,6 +4278,36 @@ private enum class GpuMode {
 }
 
 class DepthModelSession(
+    modelFile: File,
+    modelThreads: Int,
+    useGpu: Boolean,
+    gpuTestMode: GpuTestMode,
+    forceGpuNoFallback: Boolean,
+    onRuntimeInfo: (String) -> Unit = {},
+) : Closeable {
+    private val ownsWorker = !useGpu
+    private val worker = if (useGpu) gpuWorker else AffinityWorker("depth-cpu")
+    private val resource = try {
+        ThreadBoundResource(worker) {
+            DepthModelRuntime(modelFile, modelThreads, useGpu, gpuTestMode, forceGpuNoFallback, onRuntimeInfo)
+        }
+    } catch (error: Throwable) {
+        if (ownsWorker) worker.close()
+        throw error
+    }
+
+    fun run(bitmap: Bitmap, priority: Int = 1): FloatArray = resource.use(priority) { it.run(bitmap) }
+
+    override fun close() {
+        try { resource.close() } finally { if (ownsWorker) worker.close() }
+    }
+
+    companion object {
+        private val gpuWorker = AffinityWorker("depth-gpu-owner")
+    }
+}
+
+private class DepthModelRuntime(
     modelFile: File,
     private val modelThreads: Int,
     private val useGpu: Boolean,
@@ -4312,7 +4355,7 @@ class DepthModelSession(
         val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         input.clear()
         scaled.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
-        scaled.recycle()
+        if (scaled !== bitmap) scaled.recycle()
         for (pixel in pixels) {
             input.putFloat(Color.red(pixel) / 255f)
             input.putFloat(Color.green(pixel) / 255f)
@@ -4569,6 +4612,7 @@ data class VideoDepthResult(
 )
 
 private data class VideoFramePlan(
+    val timeline: VideoTimeline,
     val durationMs: Long,
     val fps: Int,
     val totalFrames: Int,
@@ -4626,6 +4670,7 @@ private class VideoVrGenerator(
         params: VideoGenerationParams,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit = {},
+        checkActive: () -> Unit = {},
         onProgress: (Float, Int, Int, Int, VideoFrameMetrics, VideoFrameTimings, VideoPipelineStats) -> Unit,
     ): VideoCacheEntry {
         val vrParams = params.toVrParams()
@@ -4640,9 +4685,10 @@ private class VideoVrGenerator(
             .filter { candidate -> candidate.isDirectory }
             .toList()
         val output = File(dir, "vr_sbs.mp4")
+        val pendingOutput = File(dir, "vr_sbs.mp4.pending")
         val logPath = File(dir, "job.log")
         val metaPath = File(dir, "video_params.txt")
-        if (output.exists()) output.delete()
+        if (pendingOutput.exists()) pendingOutput.delete()
         val log = StringBuilder()
         val started = System.currentTimeMillis()
         fun mark(line: String) {
@@ -4652,102 +4698,114 @@ private class VideoVrGenerator(
 
         val retriever = MediaMetadataRetriever()
         retriever.setDataSource(context, item.uri)
-        val framePlan = buildFramePlan(retriever)
-        val durationMs = framePlan.durationMs
-        val fps = framePlan.fps
-        val totalFrames = framePlan.totalFrames
-        mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames frameMode=${if (framePlan.useFrameIndex) "index" else "time"} metadataFrames=${framePlan.metadataFrameCount ?: "-"} captureFps=${framePlan.captureFps ?: "-"} sourceBitrate=${framePlan.sourceBitrate ?: 0} version=$version model=${vrParams.depthModel} threads=${vrParams.modelThreads} depthWorkers=${params.depthWorkers.coerceIn(1, 2)} useGpu=${vrParams.useGpu}")
-        if (previousFramesDirs.isNotEmpty()) {
-            mark("frame cache fallbacks=${previousFramesDirs.joinToString("|") { it.absolutePath }}")
-        }
-
-        var width = 0
-        var height = 0
-        val temporalSmoother = DepthTemporalSmoother()
-        frameGenerator.openDepthSession(vrParams, onModelProgress, onRuntimeInfo).use { depthSession ->
-            val cachedFirst = readCachedStereoFrame(framesDir, 0, previousFramesDirs)?.also {
-                onRuntimeInfo("frame cache hit frame=0 version=$version")
+        var frameReader: VideoFrameReader? = null
+        try {
+            checkActive()
+            val framePlan = buildFramePlan(retriever, VideoTrackInfo.read(context, item.uri))
+            val reader = VideoFrameReader(context, item.uri, framePlan.timeline, retriever, checkActive, onRuntimeInfo)
+            frameReader = reader
+            val durationMs = framePlan.durationMs
+            val fps = framePlan.fps
+            val totalFrames = framePlan.totalFrames
+            mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames frameMode=${if (framePlan.useFrameIndex) "index" else "time"} metadataFrames=${framePlan.metadataFrameCount ?: "-"} captureFps=${framePlan.captureFps ?: "-"} sourceBitrate=${framePlan.sourceBitrate ?: 0} version=$version model=${vrParams.depthModel} threads=${vrParams.modelThreads} depthWorkers=${params.depthWorkers.coerceIn(1, 2)} useGpu=${vrParams.useGpu}")
+            if (previousFramesDirs.isNotEmpty()) {
+                mark("frame cache fallbacks=${previousFramesDirs.joinToString("|") { it.absolutePath }}")
             }
-            val firstEyes = cachedFirst ?: run {
-                val first = decodeVideoFrame(retriever, 0, framePlan) ?: error("Unable to decode first video frame")
-                try {
-                    val firstSource = if (first.config == Bitmap.Config.ARGB_8888) {
-                        first
-                    } else {
-                        first.copy(Bitmap.Config.ARGB_8888, false)
-                    }
-                    val generated = frameGenerator.generateVideoSbsBitmap(firstSource, vrParams, depthSession, temporalSmoother)
-                    try {
-                        writeStereoFrameCache(framesDir, 0, generated.eyes)
-                    } catch (error: Throwable) {
-                        generated.eyes.recycle()
-                        throw error
-                    }
-                    generated.eyes
-                } finally {
-                    if (!first.isRecycled) first.recycle()
+
+            var width = 0
+            var height = 0
+            val temporalSmoother = DepthTemporalSmoother()
+            frameGenerator.openDepthSession(vrParams, onModelProgress, onRuntimeInfo).use { depthSession ->
+                val cachedFirst = readCachedStereoFrame(framesDir, 0, previousFramesDirs)?.also {
+                    onRuntimeInfo("frame cache hit frame=0 version=$version")
                 }
+                val firstEyes = cachedFirst ?: run {
+                    val first = reader.frameAt(0)
+                    try {
+                        val firstSource = if (first.config == Bitmap.Config.ARGB_8888) {
+                            first
+                        } else {
+                            first.copy(Bitmap.Config.ARGB_8888, false)
+                        }
+                        val generated = frameGenerator.generateVideoSbsBitmap(firstSource, vrParams, depthSession, temporalSmoother)
+                        try {
+                            writeStereoFrameCache(framesDir, 0, generated.eyes)
+                        } catch (error: Throwable) {
+                            generated.eyes.recycle()
+                            throw error
+                        }
+                        generated.eyes
+                    } finally {
+                        if (!first.isRecycled) first.recycle()
+                    }
+                }
+                width = even(firstEyes.sbsWidth)
+                height = even(firstEyes.height)
+                mark("first frame eyes=${firstEyes.left.width}x${firstEyes.left.height} encode=${width}x${height} cached=${cachedFirst != null}")
+
+                encodeVideo(
+                    item = item,
+                    reader = reader,
+                    checkActive = checkActive,
+                    firstEyes = firstEyes,
+                    firstCacheHit = cachedFirst != null,
+                    framesDir = framesDir,
+                    fallbackFramesDirs = previousFramesDirs,
+                    output = pendingOutput,
+                    width = width,
+                    height = height,
+                    fps = fps,
+                    totalFrames = totalFrames,
+                    framePlan = framePlan,
+                    version = version,
+                    params = vrParams,
+                    videoParams = params,
+                    depthSession = depthSession,
+                    temporalSmoother = temporalSmoother,
+                    onModelProgress = onModelProgress,
+                    onRuntimeInfo = onRuntimeInfo,
+                    onProgress = onProgress,
+                    mark = ::mark,
+                )
             }
-            width = even(firstEyes.sbsWidth)
-            height = even(firstEyes.height)
-            mark("first frame eyes=${firstEyes.left.width}x${firstEyes.left.height} encode=${width}x${height} cached=${cachedFirst != null}")
 
-            encodeVideo(
-                item = item,
-                retriever = retriever,
-                firstEyes = firstEyes,
-                firstCacheHit = cachedFirst != null,
-                framesDir = framesDir,
-                fallbackFramesDirs = previousFramesDirs,
-                output = output,
-                width = width,
-                height = height,
-                fps = fps,
-                totalFrames = totalFrames,
-                framePlan = framePlan,
-                version = version,
-                params = vrParams,
-                videoParams = params,
-                depthSession = depthSession,
-                temporalSmoother = temporalSmoother,
-                onModelProgress = onModelProgress,
-                onRuntimeInfo = onRuntimeInfo,
-                onProgress = onProgress,
-                mark = ::mark,
+            checkActive()
+            metaPath.writeText(
+                listOf(
+                    "width=$width",
+                    "height=$height",
+                    "durationMs=$durationMs",
+                    "fps=$fps",
+                    "frameMode=${if (framePlan.useFrameIndex) "index" else "time"}",
+                    "metadataFrameCount=${framePlan.metadataFrameCount ?: 0}",
+                    "captureFps=${framePlan.captureFps ?: 0}",
+                    "sourceBitrate=${framePlan.sourceBitrate ?: 0}",
+                    "source=${item.displayName}",
+                    "depthModel=${vrParams.depthModel}",
+                    "cacheVersion=$version",
+                    "encoderVersion=$VIDEO_ENCODER_VERSION",
+                    "frameCache=split_jpeg_q$VIDEO_FRAME_JPEG_QUALITY",
+                    "frameCacheFallbacks=${previousFramesDirs.joinToString("|") { it.absolutePath }}",
+                    "modelThreads=${vrParams.modelThreads}",
+                    "depthWorkers=${params.depthWorkers.coerceIn(1, 2)}",
+                    "useGpu=${vrParams.useGpu}",
+                    "gpuTestMode=${vrParams.gpuTestMode}",
+                    "forceGpuNoFallback=${vrParams.forceGpuNoFallback}",
+                    "maxLongEdge=${vrParams.maxLongEdge}",
+                ).joinToString("\n"),
+                Charsets.UTF_8,
             )
+            java.nio.file.Files.move(pendingOutput.toPath(), output.toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            mark("done output=${output.absolutePath}")
+            return cache.register(item, dir) ?: error("Video output cache missing")
+        } finally {
+            frameReader?.close()
+            retriever.release()
+            pendingOutput.delete()
         }
-        retriever.release()
-
-        metaPath.writeText(
-            listOf(
-                "width=$width",
-                "height=$height",
-                "durationMs=$durationMs",
-                "fps=$fps",
-                "frameMode=${if (framePlan.useFrameIndex) "index" else "time"}",
-                "metadataFrameCount=${framePlan.metadataFrameCount ?: 0}",
-                "captureFps=${framePlan.captureFps ?: 0}",
-                "sourceBitrate=${framePlan.sourceBitrate ?: 0}",
-                "source=${item.displayName}",
-                "depthModel=${vrParams.depthModel}",
-                "cacheVersion=$version",
-                "encoderVersion=$VIDEO_ENCODER_VERSION",
-                "frameCache=split_jpeg_q$VIDEO_FRAME_JPEG_QUALITY",
-                "frameCacheFallbacks=${previousFramesDirs.joinToString("|") { it.absolutePath }}",
-                "modelThreads=${vrParams.modelThreads}",
-                "depthWorkers=${params.depthWorkers.coerceIn(1, 2)}",
-                "useGpu=${vrParams.useGpu}",
-                "gpuTestMode=${vrParams.gpuTestMode}",
-                "forceGpuNoFallback=${vrParams.forceGpuNoFallback}",
-                "maxLongEdge=${vrParams.maxLongEdge}",
-            ).joinToString("\n"),
-            Charsets.UTF_8,
-        )
-        mark("done output=${output.absolutePath}")
-        return cache.findEntry(item) ?: error("Video output cache missing")
     }
 
-    private fun buildFramePlan(retriever: MediaMetadataRetriever): VideoFramePlan {
+    private fun buildFramePlan(retriever: MediaMetadataRetriever, track: VideoTrackInfo): VideoFramePlan {
         val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
             ?.toLongOrNull()
             ?.coerceAtLeast(1L)
@@ -4755,7 +4813,7 @@ private class VideoVrGenerator(
         val captureFps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
             ?.toFloatOrNull()
             ?.roundToInt()
-            ?.coerceIn(1, 60)
+            ?.coerceIn(1, 240)
         val sourceBitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)
             ?.toLongOrNull()
             ?.coerceIn(1L, Int.MAX_VALUE.toLong())
@@ -4767,11 +4825,10 @@ private class VideoVrGenerator(
         } else {
             null
         }
-        val derivedFps = metadataFrameCount
-            ?.let { ((it * 1000f) / durationMs.toFloat()).roundToInt().coerceIn(1, 60) }
-        val fps = derivedFps ?: captureFps ?: 30
-        val totalFrames = metadataFrameCount ?: ((durationMs / 1000f) * fps).roundToInt().coerceAtLeast(1)
+        val totalFrames = track.timeline.size
+        val fps = ((totalFrames * 1000.0) / durationMs).roundToInt().coerceIn(1, 240)
         return VideoFramePlan(
+            timeline = track.timeline,
             durationMs = durationMs,
             fps = fps,
             totalFrames = totalFrames,
@@ -4799,7 +4856,8 @@ private class VideoVrGenerator(
 
     private fun encodeVideo(
         item: GalleryItem,
-        retriever: MediaMetadataRetriever,
+        reader: VideoFrameReader,
+        checkActive: () -> Unit,
         firstEyes: StereoBitmapPair,
         firstCacheHit: Boolean,
         framesDir: File,
@@ -4820,363 +4878,183 @@ private class VideoVrGenerator(
         onProgress: (Float, Int, Int, Int, VideoFrameMetrics, VideoFrameTimings, VideoPipelineStats) -> Unit,
         mark: (String) -> Unit,
     ) {
-        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        val codecCapabilities = codec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        val videoCapabilities = requireNotNull(codecCapabilities.videoCapabilities) { "AVC encoder has no video capabilities" }
-        val encoderCapabilities = requireNotNull(codecCapabilities.encoderCapabilities) { "AVC encoder has no encoder capabilities" }
-        val pixelRateTarget = (width.toDouble() * height.toDouble() * fps.toDouble() * VIDEO_TARGET_BITS_PER_PIXEL_FRAME.toDouble())
-            .roundToInt()
-            .coerceAtLeast(2_000_000)
-        val sourceRateTarget = framePlan.sourceBitrate?.let { (it.toLong() * 2L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt() } ?: 0
-        val targetBitrate = videoCapabilities.bitrateRange.clamp(max(pixelRateTarget, sourceRateTarget))
-        val useVbr = encoderCapabilities.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            if (useVbr) {
-                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-            }
-        }
-        val supportsHighProfile = codecCapabilities.profileLevels.any {
-            it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh
-        }
-        if (supportsHighProfile) {
-            format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
-            if (!codecCapabilities.isFormatSupported(format)) {
-                format.removeKey(MediaFormat.KEY_PROFILE)
-            }
-        }
-        mark("encoder codec=${codec.codecInfo.name} bitrate=$targetBitrate sourceBitrate=${framePlan.sourceBitrate ?: 0} mode=${if (useVbr) "VBR" else "default"} highProfile=${format.containsKey(MediaFormat.KEY_PROFILE)} frameCache=jpegQ$VIDEO_FRAME_JPEG_QUALITY")
-        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        val surface = codec.createInputSurface()
-        codec.start()
-
-        val muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        val audio = prepareAudioExtractor(item)
-        val audioTrack = audio?.format?.let { muxer.addTrack(it) } ?: -1
-        var videoTrack = -1
-        var muxerStarted = false
-        val bufferInfo = MediaCodec.BufferInfo()
-
-        fun drain(end: Boolean) {
-            if (end) codec.signalEndOfInputStream()
-            while (true) {
-                val outputIndex = codec.dequeueOutputBuffer(bufferInfo, 10_000)
-                when {
-                    outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> if (!end) return
-                    outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        videoTrack = muxer.addTrack(codec.outputFormat)
-                        muxer.start()
-                        muxerStarted = true
-                    }
-                    outputIndex >= 0 -> {
-                        val encoded = codec.getOutputBuffer(outputIndex)
-                        if (encoded != null && bufferInfo.size > 0 && muxerStarted) {
-                            encoded.position(bufferInfo.offset)
-                            encoded.limit(bufferInfo.offset + bufferInfo.size)
-                            muxer.writeSampleData(videoTrack, encoded, bufferInfo)
-                        }
-                        val flags = bufferInfo.flags
-                        codec.releaseOutputBuffer(outputIndex, false)
-                        if ((flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) return
-                    }
-                }
-            }
-        }
-
+        var ownedCodec: MediaCodec? = null
+        var ownedSurface: Surface? = null
+        var ownedMuxer: MediaMuxer? = null
+        var ownedAudio: AudioSource? = null
         var renderer: InputSurfaceRenderer? = null
         try {
+            val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also { ownedCodec = it }
+            val codecCapabilities = codec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            val videoCapabilities = requireNotNull(codecCapabilities.videoCapabilities) { "AVC encoder has no video capabilities" }
+            val encoderCapabilities = requireNotNull(codecCapabilities.encoderCapabilities) { "AVC encoder has no encoder capabilities" }
+            val pixelRateTarget = (width.toDouble() * height.toDouble() * fps.toDouble() * VIDEO_TARGET_BITS_PER_PIXEL_FRAME.toDouble())
+                .roundToInt()
+                .coerceAtLeast(2_000_000)
+            val sourceRateTarget = framePlan.sourceBitrate?.let { (it.toLong() * 2L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt() } ?: 0
+            val targetBitrate = videoCapabilities.bitrateRange.clamp(max(pixelRateTarget, sourceRateTarget))
+            val useVbr = encoderCapabilities.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+                setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+                setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+                if (useVbr) {
+                    setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                }
+            }
+            val supportsHighProfile = codecCapabilities.profileLevels.any {
+                it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh
+            }
+            if (supportsHighProfile) {
+                format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+                if (!codecCapabilities.isFormatSupported(format)) {
+                    format.removeKey(MediaFormat.KEY_PROFILE)
+                }
+            }
+            mark("encoder codec=${codec.codecInfo.name} bitrate=$targetBitrate sourceBitrate=${framePlan.sourceBitrate ?: 0} mode=${if (useVbr) "VBR" else "default"} highProfile=${format.containsKey(MediaFormat.KEY_PROFILE)} frameCache=jpegQ$VIDEO_FRAME_JPEG_QUALITY")
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            val surface = codec.createInputSurface().also { ownedSurface = it }
+            codec.start()
+
+            val muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4).also { ownedMuxer = it }
+            val audio = prepareAudioExtractor(item).also { ownedAudio = it }
+            val audioTrack = audio?.format?.let { muxer.addTrack(it) } ?: -1
+            var videoTrack = -1
+            var muxerStarted = false
+            val bufferInfo = MediaCodec.BufferInfo()
+
+            fun drain(end: Boolean) {
+                if (end) codec.signalEndOfInputStream()
+                var lastProgress = SystemClock.elapsedRealtime()
+                while (true) {
+                    checkActive()
+                    check(SystemClock.elapsedRealtime() - lastProgress < 15_000) { "Video encoder timed out while draining" }
+                    val outputIndex = codec.dequeueOutputBuffer(bufferInfo, 10_000)
+                    when {
+                        outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> if (!end) return
+                        outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            videoTrack = muxer.addTrack(codec.outputFormat)
+                            muxer.start()
+                            muxerStarted = true
+                        }
+                        outputIndex >= 0 -> {
+                            lastProgress = SystemClock.elapsedRealtime()
+                            val encoded = codec.getOutputBuffer(outputIndex)
+                            if (encoded != null && bufferInfo.size > 0 && muxerStarted && bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                                encoded.position(bufferInfo.offset)
+                                encoded.limit(bufferInfo.offset + bufferInfo.size)
+                                muxer.writeSampleData(videoTrack, encoded, bufferInfo)
+                            }
+                            val flags = bufferInfo.flags
+                            codec.releaseOutputBuffer(outputIndex, false)
+                            if ((flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) return
+                        }
+                    }
+                }
+            }
+
             val activeRenderer = InputSurfaceRenderer(surface, width, height)
             renderer = activeRenderer
-            data class FrameResult(
-                val eyes: StereoBitmapPair,
-                val generatedLatencyMs: Long,
-                val timings: VideoFrameTimings,
-                val cacheHit: Boolean,
+            data class PipelineFrame(
+                val index: Int,
+                var source: Bitmap? = null,
+                var depth: VideoDepthResult? = null,
+                var eyes: StereoBitmapPair? = null,
+                var timings: VideoFrameTimings = VideoFrameTimings(),
+                var cacheHit: Boolean = false,
+                var startedAt: Long = 0L,
+                var decodedAt: Long = 0L,
+                var generatedLatencyMs: Long = 0L,
             )
-            data class PipelineInput(val frame: Int, val source: Bitmap?, val cachedEyes: StereoBitmapPair?, val decodeMs: Long)
-            data class PipelineDepthOutput(val frame: Int, val source: Bitmap?, val cachedEyes: StereoBitmapPair?, val depth: VideoDepthResult?, val decodeMs: Long, val depthStartedAt: Long)
-            data class PipelineOutput(val frame: Int, val result: FrameResult)
-
-            val decodedChannel = Channel<PipelineInput>(capacity = 2) { input ->
-                input.source?.recycle()
-                input.cachedEyes?.recycle()
-            }
-            val depthChannel = Channel<PipelineDepthOutput>(capacity = 2) { output ->
-                output.cachedEyes?.recycle()
-                output.depth?.source?.recycle()
-                if (output.source !== output.depth?.source) output.source?.recycle()
-            }
-            val generatedChannel = Channel<PipelineOutput>(capacity = 2) { output ->
-                output.result.eyes.recycle()
-            }
-            val decodeQueueSize = AtomicInteger(0)
-            val depthQueueSize = AtomicInteger(0)
-            val generatedQueueSize = AtomicInteger(0)
+            val available = Runtime.getRuntime().let { it.maxMemory() - (it.totalMemory() - it.freeMemory()) }
+            val pairBytes = firstEyes.left.allocationByteCount.toLong() + firstEyes.right.allocationByteCount
+            val inFlightLimit = ((available * 0.4) / (pairBytes * 2).coerceAtLeast(1)).toInt().coerceIn(2, 4)
             val cacheHits = AtomicInteger(if (firstCacheHit) 1 else 0)
-            val depthWorkerCount = videoParams.depthWorkers.coerceIn(1, 2)
-            var timingWindow = VideoFrameTimings()
-            var timingWindowCount = 0
+            val depthWorkerCount = if (params.useGpu) 1 else videoParams.depthWorkers.coerceIn(1, 2)
+            val extraSessions = mutableMapOf<Int, DepthModelSession>()
             var lastGeneratedEncodedAt = 0L
+            mark("pipeline inFlightLimit=$inFlightLimit depthWorkers=$depthWorkerCount cacheWriter=independent")
 
-            fun stats(waitingFrames: Int): VideoPipelineStats {
-                return VideoPipelineStats(
-                    decodeQueue = decodeQueueSize.get().coerceAtLeast(0),
-                    depthQueue = depthQueueSize.get().coerceAtLeast(0),
-                    generatedQueue = generatedQueueSize.get().coerceAtLeast(0),
-                    waitingFrames = waitingFrames,
-                    cacheHits = cacheHits.get(),
-                )
+            fun releaseFrame(data: PipelineFrame) {
+                data.source?.let { if (!it.isRecycled) it.recycle() }
+                data.depth?.source?.let { if (!it.isRecycled) it.recycle() }
+                data.eyes?.recycle()
             }
-
-            fun addTiming(a: VideoFrameTimings, b: VideoFrameTimings): VideoFrameTimings {
-                return VideoFrameTimings(
-                    decodeMs = a.decodeMs + b.decodeMs,
-                    depthMs = a.depthMs + b.depthMs,
-                    temporalMs = a.temporalMs + b.temporalMs,
-                    depthPostMs = a.depthPostMs + b.depthPostMs,
-                    sbsMs = a.sbsMs + b.sbsMs,
-                    cacheWriteMs = a.cacheWriteMs + b.cacheWriteMs,
-                    encodeMs = a.encodeMs + b.encodeMs,
-                )
-            }
-
-            fun averageTiming(total: VideoFrameTimings, count: Int): VideoFrameTimings {
-                if (count <= 0) return VideoFrameTimings()
-                return VideoFrameTimings(
-                    decodeMs = total.decodeMs / count,
-                    depthMs = total.depthMs / count,
-                    temporalMs = total.temporalMs / count,
-                    depthPostMs = total.depthPostMs / count,
-                    sbsMs = total.sbsMs / count,
-                    cacheWriteMs = total.cacheWriteMs / count,
-                    encodeMs = total.encodeMs / count,
-                )
-            }
-
-            fun encodeFrame(frame: Int, frameResult: FrameResult, waitingFrames: Int) {
-                val presentationTimeUs = frame * 1_000_000L / fps
+            fun encodeFrame(data: PipelineFrame, pipeline: FramePipelineStats) {
+                checkActive()
+                val eyes = requireNotNull(data.eyes)
                 val encodeStart = SystemClock.uptimeMillis()
-                try {
-                    activeRenderer.drawStereo(frameResult.eyes.left, frameResult.eyes.right, presentationTimeUs)
-                } finally {
-                    if (frame != 0) frameResult.eyes.recycle()
-                }
+                activeRenderer.drawStereo(eyes.left, eyes.right, framePlan.timeline[data.index])
                 drain(end = false)
-                val encodeMs = SystemClock.uptimeMillis() - encodeStart
-                val timings = frameResult.timings.copy(encodeMs = encodeMs)
+                val timings = data.timings.copy(encodeMs = SystemClock.uptimeMillis() - encodeStart)
                 val now = SystemClock.uptimeMillis()
-                val throughputMs = if (!frameResult.cacheHit && lastGeneratedEncodedAt > 0L) {
-                    now - lastGeneratedEncodedAt
-                } else {
-                    0L
-                }
-                if (!frameResult.cacheHit) lastGeneratedEncodedAt = now
-                val activeGenerationMs = timings.depthMs + timings.temporalMs + timings.depthPostMs + timings.sbsMs + timings.cacheWriteMs
-                val queueWaitMs = (frameResult.generatedLatencyMs - activeGenerationMs).coerceAtLeast(0L)
+                val throughput = if (!data.cacheHit && lastGeneratedEncodedAt > 0L) now - lastGeneratedEncodedAt else 0L
+                if (!data.cacheHit) lastGeneratedEncodedAt = now
+                val activeMs = timings.depthMs + timings.temporalMs + timings.depthPostMs + timings.sbsMs
+                val latency = if (data.decodedAt > 0L) now - data.decodedAt else 0L
                 val metrics = VideoFrameMetrics(
-                    throughputMs = throughputMs,
-                    latencyMs = frameResult.generatedLatencyMs,
-                    queueWaitMs = queueWaitMs,
-                    cacheHitReadMs = if (frameResult.cacheHit) timings.decodeMs else 0L,
-                    cacheHit = frameResult.cacheHit,
+                    throughputMs = throughput, latencyMs = latency,
+                    queueWaitMs = (latency - activeMs - timings.decodeMs - timings.encodeMs).coerceAtLeast(0L),
+                    cacheHitReadMs = if (data.cacheHit) timings.decodeMs else 0L, cacheHit = data.cacheHit,
                 )
-                timingWindow = addTiming(timingWindow, timings)
-                timingWindowCount++
-                if (timingWindowCount >= 30) {
-                    val avg = averageTiming(timingWindow, timingWindowCount)
-                    mark("pipeline avg ${timingWindowCount} frames decode=${avg.decodeMs} depth=${avg.depthMs} temporal=${avg.temporalMs} depthPost=${avg.depthPostMs} sbs=${avg.sbsMs} cache=${avg.cacheWriteMs} encode=${avg.encodeMs} cacheHits=${cacheHits.get()}")
-                    timingWindow = VideoFrameTimings()
-                    timingWindowCount = 0
-                }
-                onProgress((frame + 1).toFloat() / totalFrames.toFloat(), frame + 1, totalFrames, fps, metrics, timings, stats(waitingFrames))
+                val stats = VideoPipelineStats(
+                    decodeQueue = pipeline.decoded, depthQueue = pipeline.depths, generatedQueue = pipeline.generated,
+                    waitingFrames = pipeline.generated, cacheHits = cacheHits.get(),
+                    cacheWriteQueue = pipeline.writes, lastCacheWriteMs = pipeline.lastWriteMs,
+                )
+                onProgress((data.index + 1).toFloat() / totalFrames, data.index + 1, totalFrames, fps, metrics, timings, stats)
             }
-
-            runBlocking {
-                val decodeJob = launch(Dispatchers.IO) {
-                    try {
-                        for (frame in 1 until totalFrames) {
-                            val decodeStart = SystemClock.uptimeMillis()
-                            val cached = readCachedStereoFrame(framesDir, frame, fallbackFramesDirs)
-                            if (cached != null) {
-                                val decodeMs = SystemClock.uptimeMillis() - decodeStart
-                                onRuntimeInfo("frame cache hit frame=$frame version=$version")
-                                decodeQueueSize.incrementAndGet()
-                                decodedChannel.send(PipelineInput(frame, source = null, cachedEyes = cached, decodeMs = decodeMs))
-                                continue
-                            }
-                            val bitmap = decodeVideoFrame(retriever, frame, framePlan)
-                                ?: error("Unable to decode video frame $frame")
-                            val source = if (bitmap.config == Bitmap.Config.ARGB_8888) {
-                                bitmap
-                            } else {
-                                bitmap.copy(Bitmap.Config.ARGB_8888, false).also { bitmap.recycle() }
-                            }
-                            val decodeMs = SystemClock.uptimeMillis() - decodeStart
-                            decodeQueueSize.incrementAndGet()
-                            decodedChannel.send(PipelineInput(frame, source = source, cachedEyes = null, decodeMs = decodeMs))
-                        }
-                    } finally {
-                        decodedChannel.close()
-                    }
-                }
-
-                val depthJobs = (0 until depthWorkerCount).map { workerIndex ->
-                    launch(Dispatchers.IO) {
-                        val workerSession = if (workerIndex == 0) {
-                            depthSession
-                        } else {
-                            frameGenerator.openDepthSession(params, onModelProgress, onRuntimeInfo)
-                        }
+            try {
+                val pipelineResult = OrderedFramePipeline<PipelineFrame>(inFlightLimit, depthWorkerCount).run(
+                    first = 1, endExclusive = totalFrames,
+                    checkActive = checkActive,
+                    load = { index ->
+                        val data = PipelineFrame(index)
                         try {
-                            for (inputFrame in decodedChannel) {
-                                decodeQueueSize.decrementAndGet()
-                                if (inputFrame.cachedEyes != null) {
-                                    cacheHits.incrementAndGet()
-                                    depthQueueSize.incrementAndGet()
-                                    depthChannel.send(
-                                        PipelineDepthOutput(
-                                            frame = inputFrame.frame,
-                                            source = null,
-                                            cachedEyes = inputFrame.cachedEyes,
-                                            depth = null,
-                                            decodeMs = inputFrame.decodeMs,
-                                            depthStartedAt = 0L,
-                                        ),
-                                    )
-                                } else {
-                                    val source = inputFrame.source ?: error("Missing source frame ${inputFrame.frame}")
-                                    val started = SystemClock.uptimeMillis()
-                                    val depth = frameGenerator.generateVideoDepth(source, params, workerSession)
-                                    depthQueueSize.incrementAndGet()
-                                    depthChannel.send(
-                                        PipelineDepthOutput(
-                                            frame = inputFrame.frame,
-                                            source = source,
-                                            cachedEyes = null,
-                                            depth = depth,
-                                            decodeMs = inputFrame.decodeMs,
-                                            depthStartedAt = started,
-                                        ),
-                                    )
-                                }
+                            val started = SystemClock.uptimeMillis()
+                            data.decodedAt = started
+                            data.eyes = readCachedStereoFrame(framesDir, index, fallbackFramesDirs)
+                            data.cacheHit = data.eyes != null
+                            if (!data.cacheHit) data.source = reader.frameAt(index) else cacheHits.incrementAndGet()
+                            data.timings = VideoFrameTimings(decodeMs = SystemClock.uptimeMillis() - started)
+                            data
+                        } catch (error: Throwable) { releaseFrame(data); throw error }
+                    },
+                    depth = { data, worker ->
+                        if (!data.cacheHit) {
+                            val session = if (worker == 0) depthSession else synchronized(extraSessions) {
+                                extraSessions.getOrPut(worker) { frameGenerator.openDepthSession(params, onModelProgress, onRuntimeInfo) }
                             }
-                        } finally {
-                            if (workerIndex != 0) workerSession.close()
+                            data.startedAt = SystemClock.uptimeMillis()
+                            data.depth = frameGenerator.generateVideoDepth(requireNotNull(data.source), params, session)
                         }
-                    }
-                }
-
-                val depthCloserJob = launch(Dispatchers.Default) {
-                    depthJobs.forEach { it.join() }
-                    depthChannel.close()
-                }
-
-                val generateJob = launch(Dispatchers.IO) {
-                    try {
-                        val pendingDepthFrames = mutableMapOf<Int, PipelineDepthOutput>()
-                        var expectedDepthFrame = 1
-                        while (expectedDepthFrame < totalFrames) {
-                            val depthOutput = depthChannel.receiveCatching().getOrNull() ?: break
-                            depthQueueSize.decrementAndGet()
-                            pendingDepthFrames[depthOutput.frame] = depthOutput
-                            var lastWaitingFrames = pendingDepthFrames.size
-                            while (true) {
-                                val inputFrame = pendingDepthFrames.remove(expectedDepthFrame) ?: break
-                                lastWaitingFrames = pendingDepthFrames.size
-                                val started = SystemClock.uptimeMillis()
-                                val output = if (inputFrame.cachedEyes != null) {
-                                    PipelineOutput(
-                                        inputFrame.frame,
-                                        FrameResult(
-                                            eyes = inputFrame.cachedEyes,
-                                            generatedLatencyMs = 0L,
-                                            timings = VideoFrameTimings(decodeMs = inputFrame.decodeMs),
-                                            cacheHit = true,
-                                        ),
-                                    )
-                                } else {
-                                    val depth = inputFrame.depth ?: error("Missing depth frame ${inputFrame.frame}")
-                                    val generatedResult = frameGenerator.finishVideoSbs(depth, params, temporalSmoother)
-                                    if (inputFrame.source != depth.source) inputFrame.source?.recycle()
-                                    val cacheStart = SystemClock.uptimeMillis()
-                                    try {
-                                        writeStereoFrameCache(framesDir, inputFrame.frame, generatedResult.eyes)
-                                    } catch (error: Throwable) {
-                                        generatedResult.eyes.recycle()
-                                        throw error
-                                    }
-                                    val cacheWriteMs = SystemClock.uptimeMillis() - cacheStart
-                                    PipelineOutput(
-                                        inputFrame.frame,
-                                        FrameResult(
-                                            eyes = generatedResult.eyes,
-                                            generatedLatencyMs = if (inputFrame.depthStartedAt > 0L) {
-                                                SystemClock.uptimeMillis() - inputFrame.depthStartedAt
-                                            } else {
-                                                SystemClock.uptimeMillis() - started
-                                            },
-                                            timings = generatedResult.timings.copy(
-                                                decodeMs = inputFrame.decodeMs,
-                                                cacheWriteMs = cacheWriteMs,
-                                            ),
-                                            cacheHit = false,
-                                        ),
-                                    )
-                                }
-                                generatedQueueSize.incrementAndGet()
-                                generatedChannel.send(output)
-                                expectedDepthFrame++
-                            }
-                            if (lastWaitingFrames > 0) {
-                                onProgress(
-                                    expectedDepthFrame.toFloat() / totalFrames.toFloat(),
-                                    expectedDepthFrame,
-                                    totalFrames,
-                                    fps,
-                                    VideoFrameMetrics(),
-                                    VideoFrameTimings(),
-                                    stats(lastWaitingFrames),
-                                )
-                            }
+                    },
+                    generate = { data ->
+                        if (!data.cacheHit) {
+                            val result = frameGenerator.finishVideoSbs(requireNotNull(data.depth), params, temporalSmoother)
+                            data.eyes = result.eyes
+                            data.source?.let { if (!it.isRecycled) it.recycle() }
+                            data.source = null
+                            data.depth = null
+                            data.timings = result.timings.copy(decodeMs = data.timings.decodeMs)
+                            data.generatedLatencyMs = SystemClock.uptimeMillis() - data.startedAt
                         }
-                        if (expectedDepthFrame < totalFrames) {
-                            error("Depth pipeline ended before frame $expectedDepthFrame/$totalFrames")
-                        }
-                    } finally {
-                        generatedChannel.close()
-                    }
-                }
-
-                encodeFrame(0, FrameResult(firstEyes, 0L, VideoFrameTimings(), firstCacheHit), waitingFrames = 0)
-                val pendingFrames = mutableMapOf<Int, FrameResult>()
-                var expectedFrame = 1
-                while (expectedFrame < totalFrames) {
-                    val output = generatedChannel.receiveCatching().getOrNull() ?: break
-                    generatedQueueSize.decrementAndGet()
-                    pendingFrames[output.frame] = output.result
-                    while (true) {
-                        val nextResult = pendingFrames.remove(expectedFrame) ?: break
-                        encodeFrame(expectedFrame, nextResult, waitingFrames = pendingFrames.size)
-                        expectedFrame++
-                    }
-                }
-                if (expectedFrame < totalFrames) {
-                    decodeJob.cancel()
-                    depthJobs.forEach { it.cancel() }
-                    depthCloserJob.cancel()
-                    generateJob.cancel()
-                    error("Pipeline ended before frame $expectedFrame/$totalFrames")
-                }
-                decodeJob.join()
-                depthCloserJob.join()
-                generateJob.join()
-                if (timingWindowCount > 0) {
-                    val avg = averageTiming(timingWindow, timingWindowCount)
-                    mark("pipeline avg ${timingWindowCount} frames decode=${avg.decodeMs} depth=${avg.depthMs} temporal=${avg.temporalMs} depthPost=${avg.depthPostMs} sbs=${avg.sbsMs} cache=${avg.cacheWriteMs} encode=${avg.encodeMs} cacheHits=${cacheHits.get()}")
-                }
+                        !data.cacheHit
+                    },
+                    persist = { data -> writeStereoFrameCache(framesDir, data.index, requireNotNull(data.eyes)) },
+                    encode = ::encodeFrame,
+                    dispose = ::releaseFrame,
+                    beforeConsume = {
+                        encodeFrame(PipelineFrame(0, eyes = firstEyes, cacheHit = firstCacheHit), FramePipelineStats(0, 0, 0, 0, 0))
+                    },
+                )
+                mark("cache writer completed=" + pipelineResult.writes + " averageMs=" + pipelineResult.writeTimeMs / pipelineResult.writes.coerceAtLeast(1))
+            } finally {
+                extraSessions.values.forEach { it.close() }
             }
             drain(end = true)
             if (audio != null && audioTrack >= 0 && muxerStarted) {
@@ -5185,13 +5063,13 @@ private class VideoVrGenerator(
             }
         } finally {
             firstEyes.recycle()
-            renderer?.release()
-            runCatching { codec.stop() }
-            codec.release()
-            surface.release()
-            audio?.extractor?.release()
-            runCatching { muxer.stop() }
-            muxer.release()
+            runCatching { renderer?.release() }
+            runCatching { ownedCodec?.stop() }
+            runCatching { ownedCodec?.release() }
+            runCatching { ownedSurface?.release() }
+            runCatching { ownedAudio?.extractor?.release() }
+            runCatching { ownedMuxer?.stop() }
+            runCatching { ownedMuxer?.release() }
         }
     }
 
@@ -5199,17 +5077,19 @@ private class VideoVrGenerator(
 
     private fun prepareAudioExtractor(item: GalleryItem): AudioSource? {
         val extractor = MediaExtractor()
-        extractor.setDataSource(context, item.uri, null)
-        for (i in 0 until extractor.trackCount) {
-            val format = extractor.getTrackFormat(i)
-            val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
-            if (mime.startsWith("audio/")) {
-                extractor.selectTrack(i)
-                return AudioSource(extractor, format)
+        try {
+            extractor.setDataSource(context, item.uri, null)
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
+                if (mime.startsWith("audio/")) {
+                    extractor.selectTrack(i)
+                    return AudioSource(extractor, format)
+                }
             }
-        }
-        extractor.release()
-        return null
+            extractor.release()
+            return null
+        } catch (error: Throwable) { extractor.release(); throw error }
     }
 
     private fun copyAudio(extractor: MediaExtractor, muxer: MediaMuxer, track: Int) {
@@ -7273,11 +7153,11 @@ private fun ViewerScreen(
     val initialPage = viewerItems.indexOfFirst { it.first == startIndex }.takeIf { it >= 0 } ?: 0
     val pagerState = rememberPagerState(initialPage = initialPage) { viewerItems.size }
     val viewerFlingBehavior = PagerDefaults.flingBehavior(state = pagerState)
-    val viewerBitmapCache = remember { mutableStateMapOf<String, Bitmap>() }
     val viewerCacheSignature = remember(viewerItems) { viewerItems.joinToString("|") { it.second.cacheKey } }
-    LaunchedEffect(viewerCacheSignature) {
-        viewerBitmapCache.clear()
-    }
+    val metrics = context.resources.displayMetrics
+    val previewSide = (max(metrics.widthPixels, metrics.heightPixels) / 2).coerceIn(960, 1600)
+    val viewerBitmapCache = remember(viewerCacheSignature, previewSide) { ViewerImageLoader(context, previewSide) }
+    DisposableEffect(viewerBitmapCache) { onDispose { viewerBitmapCache.close() } }
     LaunchedEffect(viewerCacheSignature, pagerState.settledPage, state.vrMode, generatedViewer, state.entries, generatedEntryByKey) {
         val preloadPages = listOf(
             pagerState.settledPage,
@@ -7285,8 +7165,6 @@ private fun ViewerScreen(
             pagerState.settledPage - 1,
             pagerState.settledPage + 2,
             pagerState.settledPage - 2,
-            pagerState.settledPage + 3,
-            pagerState.settledPage - 3,
         )
         val nearbyTargets = preloadPages
             .mapNotNull { page -> viewerItems.getOrNull(page)?.second }
@@ -7296,30 +7174,19 @@ private fun ViewerScreen(
                 if ((state.vrMode || generatedViewer) && entry != null) {
                     if (entry.hasSplitEyes) {
                         listOf(
-                            Uri.fromFile(File(entry.leftPath)) to 4096,
-                            Uri.fromFile(File(entry.rightPath)) to 4096,
+                            Uri.fromFile(File(entry.leftPath)) to previewSide,
+                            Uri.fromFile(File(entry.rightPath)) to previewSide,
                         )
                     } else {
-                        listOf(Uri.fromFile(File(entry.outputPath)) to 4096)
+                        listOf(Uri.fromFile(File(entry.outputPath)) to previewSide)
                     }
                 } else {
-                    listOf(item.uri to 2560)
+                    listOf(item.uri to previewSide)
                 }
             }
             .distinct()
         nearbyTargets.forEach { (uri, maxSide) ->
-            val key = bitmapCacheKey(uri, maxSide)
-            if (viewerBitmapCache[key] == null) {
-                val bitmap = withContext(Dispatchers.IO) {
-                    runCatching { decodeScaledBitmap(context, uri, maxSide) }.getOrNull()
-                }
-                if (bitmap != null) {
-                    viewerBitmapCache[key] = bitmap
-                    while (viewerBitmapCache.size > 12) {
-                        viewerBitmapCache.keys.firstOrNull()?.let { viewerBitmapCache.remove(it) } ?: break
-                    }
-                }
-            }
+            viewerBitmapCache.load(uri, maxSide)
         }
     }
     LaunchedEffect(pagerState.settledPage) {
@@ -7341,7 +7208,7 @@ private fun ViewerScreen(
         HorizontalPager(
             state = pagerState,
             modifier = Modifier.fillMaxSize(),
-            beyondViewportPageCount = 2,
+            beyondViewportPageCount = 1,
             flingBehavior = viewerFlingBehavior,
         ) { page ->
             val (sourceIndex, photo) = viewerItems.getOrNull(page) ?: return@HorizontalPager
@@ -7377,7 +7244,7 @@ private fun ViewerScreen(
                 } else {
                     AsyncBitmapImage(
                         photo.uri,
-                        2560,
+                        previewSide,
                         ContentScale.Fit,
                         viewerBitmapCache,
                         Modifier
@@ -7555,13 +7422,14 @@ private fun DebugScreen(
                     DebugLine(lang.t("生成队列", "Generated queue"), "${pipeline.generatedQueue}")
                     DebugLine(lang.t("等待编码", "Encode waiting"), "${pipeline.waitingFrames}")
                     DebugLine(lang.t("缓存命中", "Cache hits"), "${pipeline.cacheHits}")
+                    DebugLine(lang.t("后台写入队列", "Cache write queue"), "${pipeline.cacheWriteQueue}")
                     val timings = videoJob?.frameTimings ?: VideoFrameTimings()
                     DebugLine(lang.t("取帧", "Decode"), "${timings.decodeMs}ms")
                     DebugLine(lang.t("深度推理", "Depth"), "${timings.depthMs}ms")
                     DebugLine(lang.t("时序平滑", "Temporal"), "${timings.temporalMs}ms")
                     DebugLine(lang.t("深度后处理", "Depth post"), "${timings.depthPostMs}ms")
                     DebugLine("SBS", "${timings.sbsMs}ms")
-                    DebugLine(lang.t("缓存写入", "Cache write"), "${timings.cacheWriteMs}ms")
+                    DebugLine(lang.t("最近后台写入", "Last async cache write"), "${pipeline.lastCacheWriteMs}ms")
                     DebugLine(lang.t("编码提交", "Encode submit"), "${timings.encodeMs}ms")
                     DebugLine("Model", videoJob?.modelId?.ifBlank { state.settings.videoModelId } ?: state.settings.videoModelId)
                     DebugLine("Cache", videoJob?.cacheVersion?.ifBlank { "-" } ?: "-")
@@ -7723,43 +7591,37 @@ private fun DebugImagePanel(title: String, uri: Uri?, modifier: Modifier = Modif
 @Composable
 private fun SyncStereoEntryImage(
     entry: VrCacheEntry,
-    bitmapCache: MutableMap<String, Bitmap>,
+    bitmapCache: ViewerImageLoader,
     modifier: Modifier = Modifier,
     onTap: () -> Unit,
 ) {
-    if (entry.hasSplitEyes) {
-        SyncSplitZoomImage(
-            leftUri = Uri.fromFile(File(entry.leftPath)),
-            rightUri = Uri.fromFile(File(entry.rightPath)),
-            bitmapCache = bitmapCache,
-            modifier = modifier,
-            onTap = onTap,
-        )
-    } else {
-        SyncSbsZoomImage(Uri.fromFile(File(entry.outputPath)), bitmapCache, modifier, onTap)
+    key(entry.photoKey, entry.version, entry.createdAt) {
+        if (entry.hasSplitEyes) {
+            SyncSplitZoomImage(
+                leftUri = Uri.fromFile(File(entry.leftPath)),
+                rightUri = Uri.fromFile(File(entry.rightPath)),
+                bitmapCache = bitmapCache,
+                modifier = modifier,
+                onTap = onTap,
+            )
+        } else {
+            SyncSbsZoomImage(Uri.fromFile(File(entry.outputPath)), bitmapCache, modifier, onTap)
+        }
     }
 }
 
 @Composable
 private fun SyncSbsZoomImage(
     uri: Uri,
-    bitmapCache: MutableMap<String, Bitmap>,
+    bitmapCache: ViewerImageLoader,
     modifier: Modifier = Modifier,
     onTap: () -> Unit,
 ) {
-    val context = LocalContext.current
-    val cacheKey = bitmapCacheKey(uri, 4096)
-    var bitmap by remember(uri) { mutableStateOf(bitmapCache[cacheKey]) }
-    var scale by remember(uri) { mutableStateOf(1f) }
-    var offset by remember(uri) { mutableStateOf(Offset.Zero) }
-    var viewportSize by remember(uri) { mutableStateOf(IntSize.Zero) }
-    var lastTapAt by remember(uri) { mutableStateOf(0L) }
-    LaunchedEffect(uri) {
-        bitmap = bitmapCache[cacheKey] ?: withContext(Dispatchers.IO) {
-            runCatching { decodeScaledBitmap(context, uri, 4096) }.getOrNull()
-        }?.also { bitmapCache[cacheKey] = it }
-        scale = 1f
-        offset = Offset.Zero
+    var detailed by remember(uri) { mutableStateOf(false) }
+    val side = if (detailed) bitmapCache.detailSide else bitmapCache.previewSide
+    var bitmap by remember(uri) { mutableStateOf(bitmapCache.peek(uri, side)) }
+    LaunchedEffect(uri, side, bitmapCache) {
+        bitmapCache.load(uri, side)?.let { bitmap = it }
     }
     if (bitmap == null) {
         Box(modifier.background(androidx.compose.ui.graphics.Color(0xff202326)), contentAlignment = Alignment.Center) {
@@ -7772,29 +7634,30 @@ private fun SyncSbsZoomImage(
     val halfWidth = (source.width / 2).coerceAtLeast(1)
     val left = remember(source) { Bitmap.createBitmap(source, 0, 0, halfWidth, source.height).asImageBitmap() }
     val right = remember(source) { Bitmap.createBitmap(source, halfWidth, 0, source.width - halfWidth, source.height).asImageBitmap() }
-    SyncStereoZoomContent(left, right, uri, modifier, onTap)
+    SyncStereoZoomContent(left, right, uri, modifier, onTap, onZoomChanged = { if (it > 1.2f) detailed = true })
 }
 
 @Composable
 private fun SyncSplitZoomImage(
     leftUri: Uri,
     rightUri: Uri,
-    bitmapCache: MutableMap<String, Bitmap>,
+    bitmapCache: ViewerImageLoader,
     modifier: Modifier = Modifier,
     onTap: () -> Unit,
 ) {
-    val context = LocalContext.current
-    val leftKey = bitmapCacheKey(leftUri, 4096)
-    val rightKey = bitmapCacheKey(rightUri, 4096)
-    var leftBitmap by remember(leftUri) { mutableStateOf(bitmapCache[leftKey]) }
-    var rightBitmap by remember(rightUri) { mutableStateOf(bitmapCache[rightKey]) }
-    LaunchedEffect(leftUri, rightUri) {
-        leftBitmap = bitmapCache[leftKey] ?: withContext(Dispatchers.IO) {
-            runCatching { decodeScaledBitmap(context, leftUri, 4096) }.getOrNull()
-        }?.also { bitmapCache[leftKey] = it }
-        rightBitmap = bitmapCache[rightKey] ?: withContext(Dispatchers.IO) {
-            runCatching { decodeScaledBitmap(context, rightUri, 4096) }.getOrNull()
-        }?.also { bitmapCache[rightKey] = it }
+    var detailed by remember(leftUri, rightUri) { mutableStateOf(false) }
+    val side = if (detailed) bitmapCache.detailSide else bitmapCache.previewSide
+    var leftBitmap by remember(leftUri) { mutableStateOf(bitmapCache.peek(leftUri, side)) }
+    var rightBitmap by remember(rightUri) { mutableStateOf(bitmapCache.peek(rightUri, side)) }
+    LaunchedEffect(leftUri, rightUri, side, bitmapCache) {
+        val leftResult = async { bitmapCache.load(leftUri, side) }
+        val rightResult = async { bitmapCache.load(rightUri, side) }
+        val loadedLeft = leftResult.await()
+        val loadedRight = rightResult.await()
+        if (loadedLeft != null && loadedRight != null) {
+            leftBitmap = loadedLeft
+            rightBitmap = loadedRight
+        }
     }
     val left = leftBitmap
     val right = rightBitmap
@@ -7804,7 +7667,7 @@ private fun SyncSplitZoomImage(
         }
         return
     }
-    SyncStereoZoomContent(left.asImageBitmap(), right.asImageBitmap(), "$leftUri|$rightUri", modifier, onTap)
+    SyncStereoZoomContent(left.asImageBitmap(), right.asImageBitmap(), "$leftUri|$rightUri", modifier, onTap, onZoomChanged = { if (it > 1.2f) detailed = true })
 }
 
 @Composable
@@ -7814,8 +7677,10 @@ private fun SyncStereoZoomContent(
     gestureKey: Any,
     modifier: Modifier = Modifier,
     onTap: () -> Unit,
+    onZoomChanged: (Float) -> Unit = {},
 ) {
     var scale by remember(gestureKey) { mutableStateOf(1f) }
+    LaunchedEffect(scale) { onZoomChanged(scale) }
     var offset by remember(gestureKey) { mutableStateOf(Offset.Zero) }
     var viewportSize by remember(gestureKey) { mutableStateOf(IntSize.Zero) }
     var lastTapAt by remember(gestureKey) { mutableStateOf(0L) }
@@ -8008,7 +7873,7 @@ private class SbsVideoGlPlayerView(context: Context) :
 
     private var textureId = 0
     private var surfaceTexture: SurfaceTexture? = null
-    private var surface: Surface? = null
+    @Volatile private var surface: Surface? = null
     private var program = 0
     private var positionHandle = 0
     private var texCoordHandle = 0
@@ -8016,11 +7881,14 @@ private class SbsVideoGlPlayerView(context: Context) :
     private var texMatrixHandle = 0
     private val textureMatrix = FloatArray(16)
     private var frameAvailable = false
-    private var surfaceCallback: ((Surface?) -> Unit)? = null
+    @Volatile private var surfaceCallback: ((Surface?) -> Unit)? = null
+    private var requestedActive = false
     private var videoWidth = 0
     private var videoHeight = 0
     private var zoomScale = 1f
     private var zoomOffset = Offset.Zero
+    private val verticesBuffer = floatBuffer(FloatArray(8))
+    private val textureCoordsBuffer = floatBuffer(FloatArray(8))
 
     init {
         setEGLContextClientVersion(2)
@@ -8037,23 +7905,32 @@ private class SbsVideoGlPlayerView(context: Context) :
     }
 
     fun setVideoSize(width: Int, height: Int) {
-        videoWidth = width
-        videoHeight = height
         queueEvent {
-            runCatching { surfaceTexture?.setDefaultBufferSize(width, height) }
-            requestRender()
+            if (videoWidth != width || videoHeight != height) {
+                videoWidth = width
+                videoHeight = height
+                runCatching { surfaceTexture?.setDefaultBufferSize(width, height) }
+                requestRender()
+            }
         }
     }
 
     fun setActive(isActive: Boolean) {
-        renderMode = if (isActive) RENDERMODE_CONTINUOUSLY else RENDERMODE_WHEN_DIRTY
-        requestRender()
+        // SurfaceTexture callbacks supply frames; a paused player needs no continuous GL loop.
+        if (requestedActive != isActive) {
+            requestedActive = isActive
+            if (isActive) requestRender()
+        }
     }
 
     fun setZoom(scale: Float, offset: Offset) {
-        zoomScale = scale
-        zoomOffset = offset
-        requestRender()
+        queueEvent {
+            if (zoomScale != scale || zoomOffset != offset) {
+                zoomScale = scale
+                zoomOffset = offset
+                requestRender()
+            }
+        }
     }
 
     fun release() {
@@ -8061,6 +7938,7 @@ private class SbsVideoGlPlayerView(context: Context) :
     }
 
     override fun onSurfaceCreated(gl: javax.microedition.khronos.opengles.GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
+        synchronized(this) { frameAvailable = false }
         runCatching { surface?.release() }
         runCatching { surfaceTexture?.release() }
         surface = null
@@ -8106,6 +7984,7 @@ private class SbsVideoGlPlayerView(context: Context) :
     }
 
     override fun onFrameAvailable(surfaceTexture: SurfaceTexture?) {
+        if (surfaceTexture !== this.surfaceTexture) return
         synchronized(this) { frameAvailable = true }
         requestRender()
     }
@@ -8149,8 +8028,8 @@ private class SbsVideoGlPlayerView(context: Context) :
     }
 
     private fun drawTexturedQuad(vertices: FloatArray, texCoords: FloatArray) {
-        val vertexBuffer = floatBuffer(vertices)
-        val texBuffer = floatBuffer(texCoords)
+        val vertexBuffer = verticesBuffer.apply { clear(); put(vertices); position(0) }
+        val texBuffer = textureCoordsBuffer.apply { clear(); put(texCoords); position(0) }
         GLES20.glEnableVertexAttribArray(positionHandle)
         GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer)
         GLES20.glEnableVertexAttribArray(texCoordHandle)
@@ -8252,16 +8131,15 @@ private fun AsyncBitmapImage(
     uri: Uri,
     maxSide: Int,
     contentScale: ContentScale,
-    bitmapCache: MutableMap<String, Bitmap>? = null,
+    bitmapCache: ViewerImageLoader? = null,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    val cacheKey = bitmapCacheKey(uri, maxSide)
-    var bitmap by remember(uri, maxSide) { mutableStateOf(bitmapCache?.get(cacheKey)) }
-    LaunchedEffect(uri, maxSide) {
-        bitmap = bitmapCache?.get(cacheKey) ?: withContext(Dispatchers.IO) {
+    var bitmap by remember(uri, maxSide) { mutableStateOf(bitmapCache?.peek(uri, maxSide)) }
+    LaunchedEffect(uri, maxSide, bitmapCache) {
+        bitmap = if (bitmapCache != null) bitmapCache.load(uri, maxSide) else withContext(Dispatchers.IO) {
             runCatching { decodeScaledBitmap(context, uri, maxSide) }.getOrNull()
-        }?.also { decoded -> bitmapCache?.put(cacheKey, decoded) }
+        }
     }
     if (bitmap == null) {
         Box(modifier.background(androidx.compose.ui.graphics.Color(0xff202326)), contentAlignment = Alignment.Center) {
@@ -8756,7 +8634,7 @@ private fun mediaPermissions(): Array<String> {
     }
 }
 
-private fun decodeScaledBitmap(context: Context, uri: Uri, maxLongEdge: Int): Bitmap {
+internal fun decodeScaledBitmap(context: Context, uri: Uri, maxLongEdge: Int): Bitmap {
     if (Build.VERSION.SDK_INT >= 28) {
         val source = ImageDecoder.createSource(context.contentResolver, uri)
         return ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
@@ -8766,7 +8644,10 @@ private fun decodeScaledBitmap(context: Context, uri: Uri, maxLongEdge: Int): Bi
             decoder.setTargetSize(max(1, (w * scale).roundToInt()), max(1, (h * scale).roundToInt()))
             decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
             decoder.isMutableRequired = false
-        }.copy(Bitmap.Config.ARGB_8888, false)
+        }.let { decoded ->
+            if (decoded.config == Bitmap.Config.ARGB_8888) decoded
+            else decoded.copy(Bitmap.Config.ARGB_8888, false).also { decoded.recycle() }
+        }
     }
 
     val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -8944,6 +8825,8 @@ private fun readCachedStereoFrame(framesDir: File, frame: Int, fallbackFramesDir
 
 private fun readCachedStereoFrameInDir(framesDir: File, frame: Int): StereoBitmapPair? {
     val frameNumber = frame.toString().padStart(6, '0')
+    if (framesDir.parentFile?.name?.endsWith("_$VIDEO_ENCODER_VERSION") == true &&
+        !File(framesDir, "$frameNumber.complete").isFile) return null
     val splitEyes = listOf(
         File(framesDir, "left_$frameNumber.jpg") to File(framesDir, "right_$frameNumber.jpg"),
         File(framesDir, "left_$frameNumber.webp") to File(framesDir, "right_$frameNumber.webp"),
@@ -8954,6 +8837,11 @@ private fun readCachedStereoFrameInDir(framesDir: File, frame: Int): StereoBitma
         val rightBitmap = BitmapFactory.decodeFile(right.absolutePath)
         if (rightBitmap == null) {
             leftBitmap.recycle()
+            return null
+        }
+        if (leftBitmap.width != rightBitmap.width || leftBitmap.height != rightBitmap.height) {
+            leftBitmap.recycle()
+            rightBitmap.recycle()
             return null
         }
         return StereoBitmapPair(leftBitmap, rightBitmap)
@@ -8975,13 +8863,19 @@ private fun readCachedStereoFrameInDir(framesDir: File, frame: Int): StereoBitma
 private fun writeStereoFrameCache(framesDir: File, frame: Int, eyes: StereoBitmapPair) {
     framesDir.mkdirs()
     val frameNumber = frame.toString().padStart(6, '0')
-    writeStereoJpegParallel(
-        eyes.left,
-        File(framesDir, "left_$frameNumber.jpg"),
-        eyes.right,
-        File(framesDir, "right_$frameNumber.jpg"),
-        VIDEO_FRAME_JPEG_QUALITY,
-    )
+    val complete = File(framesDir, "$frameNumber.complete")
+    val left = File(framesDir, "left_$frameNumber.jpg.part")
+    val right = File(framesDir, "right_$frameNumber.jpg.part")
+    complete.delete()
+    try {
+        writeStereoJpegParallel(eyes.left, left, eyes.right, right, VIDEO_FRAME_JPEG_QUALITY)
+        java.nio.file.Files.move(left.toPath(), File(framesDir, "left_$frameNumber.jpg").toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        java.nio.file.Files.move(right.toPath(), File(framesDir, "right_$frameNumber.jpg").toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        complete.writeText("split-jpeg-complete")
+    } finally {
+        left.delete()
+        right.delete()
+    }
 }
 
 private fun composeSbsBitmap(left: Bitmap, right: Bitmap): Bitmap {

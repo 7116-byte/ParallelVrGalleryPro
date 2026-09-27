@@ -12,8 +12,8 @@ android {
         applicationId = "com.local.parallelvrgallerypro"
         minSdk = 30
         targetSdk = 35
-        versionCode = 10006
-        versionName = "1.0.06"
+        versionCode = 10007
+        versionName = "1.0.07"
     }
 
     buildFeatures {
@@ -37,6 +37,7 @@ kotlin {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.compose.material3:material3:1.3.1")
