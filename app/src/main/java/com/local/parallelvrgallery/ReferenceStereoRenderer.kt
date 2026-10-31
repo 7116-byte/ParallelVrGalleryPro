@@ -5,6 +5,8 @@ import org.opencv.android.OpenCVLoader
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.photo.Photo
+import org.opencv.core.Size
+import org.opencv.imgproc.Imgproc
 
 /** Only the new reference mode uses OpenCV. No CPU/GPU inference policy is changed. */
 internal object ReferenceStereoRenderer {
@@ -15,13 +17,16 @@ internal object ReferenceStereoRenderer {
 
     // Bound native inpaint allocations across concurrent image workers.
     @Synchronized
-    fun render(source: Bitmap, depth: FloatArray, depthWidth: Int, depthHeight: Int, scale: Float): Pair<Bitmap, Bitmap> {
+    fun render(source: Bitmap, depth: FloatArray, depthWidth: Int, depthHeight: Int, scale: Float, continuousDepth: Boolean = false): Pair<Bitmap, Bitmap> {
         check(initialized)
         val width = source.width
         val height = source.height
         val original = IntArray(width * height)
         source.getPixels(original, 0, width, 0, 0, width, height)
-        val raster = ReferenceProjection.project(original, width, height, depth, depthWidth, depthHeight, scale)
+        val raster = if (continuousDepth) {
+            val restored = restoreContinuousDepth(depth, depthWidth, depthHeight, width, height)
+            ReferenceProjection.project(original, width, height, restored, width, height, scale)
+        } else ReferenceProjection.project(original, width, height, depth, depthWidth, depthHeight, scale)
         val bgr = ByteArray(original.size * 3)
         for (i in raster.pixels.indices) {
             val pixel = raster.pixels[i]
@@ -51,5 +56,21 @@ internal object ReferenceStereoRenderer {
             mask.release()
             image.release()
         }
+    }
+
+    /** The external node expects an already restored depth image. Reconstruct floats
+     * before 8-bit quantization so the 518-grid is not enlarged into contour steps.
+     * This is a mobile preprocessing revision; V8 and saved V8 jobs retain their path.
+     */
+    internal fun restoreContinuousDepth(depth: FloatArray, depthWidth: Int, depthHeight: Int, width: Int, height: Int): FloatArray {
+        check(initialized)
+        val input = Mat(); val resized = Mat(); val smoothed = Mat()
+        try {
+            input.create(depthHeight, depthWidth, CvType.CV_32FC1)
+            input.put(0, 0, depth)
+            Imgproc.resize(input, resized, Size(width.toDouble(), height.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+            Imgproc.GaussianBlur(resized, smoothed, Size(3.0, 3.0), 0.0)
+            return FloatArray(width * height).also { smoothed.get(0, 0, it) }
+        } finally { smoothed.release(); resized.release(); input.release() }
     }
 }

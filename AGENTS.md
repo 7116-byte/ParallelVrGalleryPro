@@ -25,11 +25,13 @@
 
 ## 验证与备份边界
 
-恢复基线有 7 类、58 项 JVM 测试；v1.3.00 新增后为 9 类、77 项。实际通过数、Lint 数量、APK 哈希和签名以本次运行的 `.local/verification/runs/*/result.json` 为证，历史记录不能充当新验收。构建通过与真机通过分开记录。
+恢复基线有 7 类、58 项 JVM 测试；v1.3.00 为 9 类、77 项，v1.3.01 为 10 类、81 项。实际通过数、Lint 数量、APK 哈希和签名以本次运行的 `.local/verification/runs/*/result.json` 为证，历史记录不能充当新验收。构建通过与真机通过分开记录。
 
 `.local/recovery/` 是完整旧备份的逐文件校验副本，保持不变；`.local/toolchain/` 是日常可写工具链。普通版的 bundle、含未提交改动的快照、旧工作副本、3.0.08 APK、共享签名/模型、v2.32 基准及技术记录均需保留。Pro 恢复完成不代表整个旧备份可删；删除条件见恢复验收记录。
 
 ## v1.3.00 UI 与参考模式
+
+当前修正及证据还应先读 docs/studio-v1.3.01.md、docs/releases/v1.3.01.md。REFERENCE_V9 独立缓存 depthSSS22V9；当前参考设置从 V8 转 V9，旧缓存及已持久化的视频队列仍按原版本。不要把旧队列恢复改为偏好迁移入口。最终眼图浮点恢复/3×3 Gaussian 在量化前执行；V6/V7/V8 不变。参考 QA 可用 Debug kind=referenceRaster，只读写 PVG_QA_reference_1301 专属目录，不经过 MediaStore；所有私人素材及 .codex-attachments 均禁止提交。
 
 - 深浅跟随系统，统一 StudioTheme；手机/平板按可用宽度和字体缩放计算显示列数，不改用户保存的列数偏好。列表标题/提示整体随滚动移出，浮动操作槽以实测高度给内容留底部空间。
 - REFERENCE_V8 是显式可选的当前上游外部深度 V2.2 参考模式，cacheVersion 为 depthSSS22V8。保留 V6/V7 算法与原缓存键。它采用左眼原图、右眼相对图宽投影及 Telea 3px 补洞；强度单位不同，建议 5。不开旧滤波与旧水平填充，保留原模型和可选深度放大。不要暗中迁移既有模式或覆盖旧结果。

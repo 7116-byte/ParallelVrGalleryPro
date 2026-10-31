@@ -134,6 +134,7 @@ import androidx.compose.material.icons.filled.FastForward
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Replay
@@ -3270,7 +3271,7 @@ private class SettingsStore(context: Context) {
             videoModelThreads = prefs.getInt("videoModelThreads", 4),
             videoUseGpu = prefs.getBoolean("videoUseGpu", false),
             videoDepthWorkers = prefs.getInt("videoDepthWorkers", 2).coerceIn(1, 2),
-            edgeMode = DepthEdgeMode.restore(prefs.getString("edgeMode", null)),
+            edgeMode = DepthEdgeMode.forCurrentSettings(prefs.getString("edgeMode", null)),
             depthUpscale = DepthUpscaleSettings(
                 enabled = prefs.getBoolean("depthUpscaleEnabled", false),
                 maxLongEdge = prefs.getInt("depthUpscaleMaxLongEdge", 0),
@@ -4466,7 +4467,7 @@ private class VrGenerator(
         val heap = Runtime.getRuntime()
         val heapAvailable = heap.maxMemory() - (heap.totalMemory() - heap.freeMemory())
         val budget = min(160L * 1024L * 1024L, max(48L * 1024L * 1024L, (heapAvailable * 55L) / 100L))
-        val bytesPerSourcePixel = if (mode == DepthEdgeMode.REFERENCE_V8) 48f else 18f
+        val bytesPerSourcePixel = when (mode) { DepthEdgeMode.REFERENCE_V9 -> 64f; DepthEdgeMode.REFERENCE_V8 -> 48f; else -> 18f }
         val requestedPixels = requested.toFloat() * requested.toFloat() * ratio
         val requestedBytes = requestedPixels * bytesPerSourcePixel
         if (requestedBytes <= budget) return requested
@@ -4515,8 +4516,8 @@ private class VrGenerator(
     }
 
     private fun makeParallelStereoPair(source: Bitmap, depth: DepthMap, depthScale: Float, fillRadius: Int, mode: DepthEdgeMode = DepthEdgeMode.LEGACY_V6): StereoBitmapPair {
-        if (mode == DepthEdgeMode.REFERENCE_V8) {
-            val (left, right) = ReferenceStereoRenderer.render(source, depth.values, depth.width, depth.height, depthScale)
+        if (mode.isReference) {
+            val (left, right) = ReferenceStereoRenderer.render(source, depth.values, depth.width, depth.height, depthScale, mode == DepthEdgeMode.REFERENCE_V9)
             return StereoBitmapPair(left, right)
         }
         val w = source.width
@@ -5983,7 +5984,7 @@ private fun GalleryScreen(
         if (state.homeTab != "generated") generatedSelectionActions = null
     }
 
-    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).safeDrawingPadding().imePadding()) {
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).studioSafeArea().imePadding()) {
         Scaffold(
             containerColor = androidx.compose.ui.graphics.Color.Transparent,
             contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0.dp),
@@ -6335,10 +6336,16 @@ private fun GridScrollbar(
     gridState: androidx.compose.foundation.lazy.grid.LazyGridState,
     modifier: Modifier = Modifier,
 ) {
+    var dragging by remember { mutableStateOf(false) }
+    var shown by remember { mutableStateOf(false) }
+    LaunchedEffect(gridState.isScrollInProgress, dragging) {
+        if (gridState.isScrollInProgress || dragging) shown = true
+        else { delay(1000); shown = false }
+    }
     val layoutInfo = gridState.layoutInfo
     val total = layoutInfo.totalItemsCount
     val visible = layoutInfo.visibleItemsInfo
-    if (total <= 0 || visible.isEmpty() || total <= visible.size) return
+    if (!shown || total <= 0 || visible.isEmpty() || total <= visible.size) return
     val first = visible.first().index
     val visibleCount = visible.size.coerceAtLeast(1)
     val thumbFraction = (visibleCount.toFloat() / total.toFloat()).coerceIn(0.06f, 1f)
@@ -6358,7 +6365,9 @@ private fun GridScrollbar(
             .onSizeChanged { trackHeight = it.height.coerceAtLeast(1) }
             .pointerInput(total, trackHeight) {
                 detectVerticalDragGestures(
-                    onDragStart = { offset -> scrollToTrackPosition(offset.y) },
+                    onDragStart = { offset -> dragging = true; scrollToTrackPosition(offset.y) },
+                    onDragEnd = { dragging = false },
+                    onDragCancel = { dragging = false },
                     onVerticalDrag = { change, _ ->
                         scrollToTrackPosition(change.position.y)
                         change.consume()
@@ -6369,17 +6378,17 @@ private fun GridScrollbar(
     ) {
         Box(
             Modifier
-                .width(5.dp)
+                .width(3.dp)
                 .fillMaxHeight()
-                .background(androidx.compose.ui.graphics.Color(0x22000000), RoundedCornerShape(3.dp)),
+                .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f), RoundedCornerShape(3.dp)),
         )
         Box(
             Modifier
-                .width(5.dp)
+                .width(3.dp)
                 .fillMaxHeight(thumbFraction)
                 .align(Alignment.TopCenter)
                 .graphicsLayer { translationY = size.height * topFraction / thumbFraction }
-                .background(androidx.compose.ui.graphics.Color(0x99000000), RoundedCornerShape(3.dp)),
+                .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f), RoundedCornerShape(3.dp)),
         )
     }
 }
@@ -6406,12 +6415,11 @@ private fun HomeBottomNav(current: String, lang: AppLanguage, onSelect: (String)
                     .clip(RoundedCornerShape(28.dp))
                     .clickable { onSelect(key) },
             ) {
-                Text(
-                    text = label,
-                    color = if (selected) androidx.compose.ui.graphics.Color.White else MaterialTheme.colorScheme.onSurface,
-                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
-                )
+                Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 8.dp, vertical = 8.dp), contentAlignment = Alignment.Center) {
+                    Text(text = label, color = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                        style = MaterialTheme.typography.labelLarge, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                }
             }
         }
     }
@@ -6611,9 +6619,13 @@ private fun PhotoTile(
                 modifier = Modifier.align(Alignment.TopEnd).background(androidx.compose.ui.graphics.Color(0xcc111315)).padding(horizontal = 8.dp, vertical = 2.dp),
             )
         }
-        if (statusText != lang.t("原图", "Original") && statusText != lang.t("未生成", "Not generated")) StatusBadge(
+        if (statusText == lang.t("已生成", "Ready")) {
+            Icon(Icons.Default.Check, null, Modifier.align(Alignment.BottomEnd).padding(4.dp)
+                .background(androidx.compose.ui.graphics.Color(0xCC10231B), RoundedCornerShape(8.dp)).padding(3.dp).size(14.dp),
+                tint = androidx.compose.ui.graphics.Color.White)
+        } else if (statusText != lang.t("原图", "Original") && statusText != lang.t("未生成", "Not generated")) StatusBadge(
             text = statusText,
-            fontSize = labelSize,
+            fontSize = 10.sp,
             modifier = Modifier.align(Alignment.BottomStart),
             horizontalPadding = labelPaddingH,
             verticalPadding = labelPaddingV,
@@ -6632,12 +6644,14 @@ private fun StatusBadge(
 ) {
     Text(
         text = text,
-        color = statusBadgeTextColor(text),
+        color = androidx.compose.ui.graphics.Color.White,
         fontSize = fontSize,
         fontWeight = FontWeight.Bold,
         maxLines = maxLines,
         overflow = TextOverflow.Ellipsis,
         modifier = modifier
+            .padding(3.dp)
+            .background(androidx.compose.ui.graphics.Color(0xCC10231B), RoundedCornerShape(6.dp))
             .padding(horizontal = horizontalPadding, vertical = verticalPadding),
     )
 }
@@ -7076,7 +7090,8 @@ private fun ManageScreen(
 
 private fun cacheVersionTitle(version: String, lang: AppLanguage): String {
     val mode = when {
-        version.contains("_depthSSS22V8_") -> lang.t("参考新版 v2.2", "SSS reference v2.2")
+        version.contains("_depthSSS22V9_") -> lang.t("参考 · 平滑轮廓", "Reference · smooth contours")
+        version.contains("_depthSSS22V8_") -> lang.t("参考 · 1.3.00", "Reference · 1.3.00")
         version.contains("_depthV7_") -> lang.t("居中平滑", "Centered")
         else -> lang.t("旧版兼容", "Legacy")
     }
@@ -7101,7 +7116,7 @@ private fun GeneratedVersionTile(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .aspectRatio(1f)
+                .aspectRatio(4f / 3f)
                 .background(androidx.compose.ui.graphics.Color(0xff16191c), RoundedCornerShape(6.dp))
                 .clip(RoundedCornerShape(6.dp)),
         ) {
@@ -7128,6 +7143,7 @@ private fun GeneratedVersionTile(
         Text(
             text = cacheVersionTitle(summary.version, lang),
             color = MaterialTheme.colorScheme.onSurface,
+            style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.Bold,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
@@ -7284,12 +7300,13 @@ private fun SettingsScreen(
             }
             "depth" -> {
                 StudioCard(lang.t("边缘与视差", "Edges & disparity")) {
-                    SettingChoice(lang.t("投影与边缘模式", "Projection & edge mode"), settings.edgeMode, listOf(DepthEdgeMode.REFERENCE_V8, DepthEdgeMode.LEGACY_V6, DepthEdgeMode.CENTERED_V7), { when (it) { DepthEdgeMode.LEGACY_V6 -> lang.t("旧版兼容 · depthV6", "Legacy · depthV6"); DepthEdgeMode.CENTERED_V7 -> lang.t("居中平滑 · depthV7", "Centered · depthV7"); DepthEdgeMode.REFERENCE_V8 -> lang.t("参考新版 v2.2 · Telea", "SSS reference v2.2 · Telea") } }) { onChange(settings.copy(edgeMode = it)) }
-                    SettingHelp(lang.t("旧版保留历史非对称取样与位移幅度；居中模式相同强度下可能产生更大视差。两种缓存独立保存，切换不会重做已有结果。", "Legacy keeps historical asymmetric sampling and gain. Centered may produce more disparity at the same strength. Both caches remain separate; switching does not regenerate results."))
-                    if (settings.edgeMode == DepthEdgeMode.REFERENCE_V8) SettingHelp(lang.t("参考当前上游外部深度 V2.2：左眼原图，右眼按图宽比例右移，遮挡洞使用 Telea 3px 修补。强度 5 约为图宽 1%，建议从 5 开始；不是旧版强度单位。此模式不使用旧滤波窗口和边缘填充，模型仍为原稳定模型。", "Current upstream external-depth V2.2: static left eye, width-relative right-eye projection and Telea 3px hole filling. Scale 5 means about 1% width; start at 5. These are not legacy units. Legacy filter/fill controls do not apply; the stable depth model is unchanged."))
-                    SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, (if (settings.edgeMode == DepthEdgeMode.REFERENCE_V8) listOf(1f, 2f, 5f, 10f, 20f, 30f, 50f) else listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f))) { onChange(settings.copy(depthScale = it)) }
-                    if (settings.edgeMode != DepthEdgeMode.REFERENCE_V8) SettingHelp(lang.t("控制水平位移，不是清晰度；越大立体感越强，也越容易拉伸轮廓。旧版单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。", "Controls disparity, not sharpness. Higher values increase depth and edge stretching. Legacy units: depth × 255 × scale / eye width; not a fixed percentage."))
-                    if (settings.edgeMode != DepthEdgeMode.REFERENCE_V8) {
+                    SettingChoice(lang.t("投影与边缘模式", "Projection & edge mode"), settings.edgeMode, listOf(DepthEdgeMode.REFERENCE_V9, DepthEdgeMode.LEGACY_V6, DepthEdgeMode.CENTERED_V7, DepthEdgeMode.REFERENCE_V8), { when (it) { DepthEdgeMode.LEGACY_V6 -> lang.t("旧版兼容 · depthV6", "Legacy · depthV6"); DepthEdgeMode.CENTERED_V7 -> lang.t("居中平滑 · depthV7", "Centered · depthV7"); DepthEdgeMode.REFERENCE_V8 -> lang.t("参考旧结果 · 1.3.00", "Reference · 1.3.00"); DepthEdgeMode.REFERENCE_V9 -> lang.t("参考新版 · 平滑轮廓", "Reference · smooth contours") } }) { onChange(settings.copy(edgeMode = it)) }
+                    if (!settings.edgeMode.isReference) SettingHelp(lang.t("旧版保留历史非对称取样与位移幅度；居中模式相同强度下可能产生更大视差。两种缓存独立保存，切换不会重做已有结果。", "Legacy keeps historical asymmetric sampling and gain. Centered may produce more disparity at the same strength. Both caches remain separate; switching does not regenerate results."))
+                    if (settings.edgeMode == DepthEdgeMode.REFERENCE_V9) SettingHelp(lang.t("修正轮廓采样：先连续恢复浮点深度，再投影并用 Telea 3px 补洞。强度 5 约为图宽 1%。旧结果保留；遮挡区域仍可能模糊。", "Restores continuous float depth before projection and Telea 3px filling. Scale 5 is about 1% width. Existing results stay available; occluded regions can remain soft."))
+                    else if (settings.edgeMode.isReference) SettingHelp(lang.t("参考当前上游外部深度 V2.2：左眼原图，右眼按图宽比例右移，遮挡洞使用 Telea 3px 修补。强度 5 约为图宽 1%，建议从 5 开始；不是旧版强度单位。此模式不使用旧滤波窗口和边缘填充，模型仍为原稳定模型。", "Current upstream external-depth V2.2: static left eye, width-relative right-eye projection and Telea 3px hole filling. Scale 5 means about 1% width; start at 5. These are not legacy units. Legacy filter/fill controls do not apply; the stable depth model is unchanged."))
+                    SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, (if (settings.edgeMode.isReference) listOf(1f, 2f, 5f, 10f, 20f, 30f, 50f) else listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f))) { onChange(settings.copy(depthScale = it)) }
+                    if (!settings.edgeMode.isReference) SettingHelp(lang.t("控制水平位移，不是清晰度；越大立体感越强，也越容易拉伸轮廓。旧版单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。", "Controls disparity, not sharpness. Higher values increase depth and edge stretching. Legacy units: depth × 255 × scale / eye width; not a fixed percentage."))
+                    if (!settings.edgeMode.isReference) {
                     SettingInt(lang.t("深度图滤波窗口", "Depth filter window"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) { onChange(settings.copy(blurRadius = it)) }
                     SettingHelp(lang.t("3 表示 3×3 窗口，不是插值次数；0/1 不滤波。默认在 518×518 深度图处理，先放大后平滑则作用于放大图。大窗口可能混合前后景。", "3 means a 3×3 window, not interpolation passes. 0/1 bypass. Filtering normally uses the 518×518 map; resize-first filters the larger map. Large windows can blend foreground and background."))
                     SettingInt(lang.t("边缘填充（输出像素）", "Edge fill (output pixels)"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) { onChange(settings.copy(fillRadius = it)) }
@@ -7344,8 +7361,21 @@ private fun SettingsScreen(
 
 @Composable
 private fun SettingHelp(text: String) {
-    Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    Spacer(Modifier.height(12.dp))
+    var showDetails by remember { mutableStateOf(false) }
+    var clipped by remember(text) { mutableStateOf(false) }
+    val chinese = text.any { it in '\u4e00'..'\u9fff' }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+        Text(text, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 3, overflow = TextOverflow.Ellipsis,
+            onTextLayout = { if (it.hasVisualOverflow) clipped = true })
+        if (text.length > 80 || clipped) IconButton(onClick = { showDetails = true }) {
+            Icon(Icons.Default.HelpOutline, if (chinese) "参数说明" else "Parameter details")
+        }
+    }
+    if (showDetails) AlertDialog(onDismissRequest = { showDetails = false },
+        title = { Text(if (chinese) "参数说明" else "Parameter details") },
+        text = { Text(text, Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState())) },
+        confirmButton = { TextButton(onClick = { showDetails = false }) { Text(if (chinese) "知道了" else "Got it") } })
 }
 
 @Composable
@@ -9383,9 +9413,10 @@ private fun loadModelFile(file: File): ByteBuffer {
 private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, outputWidth: Int, outputHeight: Int, timings: GenerationTimings, depth: DepthMap): String {
     val existing = org.json.JSONObject()
         .put("photoKey", photo.cacheKey).put("cacheVersion", cacheVersion()).put("displayName", photo.displayName)
-        .put("projection", if (edgeMode == DepthEdgeMode.REFERENCE_V8) "SSS_EXTERNAL_V2_2_30372fec" else "LEGACY_PHONE")
-        .put("inpaint", if (edgeMode == DepthEdgeMode.REFERENCE_V8) "OpenCV_4_12_TELEA_radius_3" else "HORIZONTAL_FILL")
-        .put("legacyFilterAndFillApplied", edgeMode != DepthEdgeMode.REFERENCE_V8)
+        .put("projection", if (edgeMode.isReference) "SSS_EXTERNAL_V2_2_30372fec" else "LEGACY_PHONE")
+        .put("projectionDepthPreparation", if (edgeMode == DepthEdgeMode.REFERENCE_V9) "FLOAT_LINEAR_EYE_SIZE_GAUSSIAN_3_BEFORE_QUANTIZE" else "HISTORICAL")
+        .put("inpaint", if (edgeMode.isReference) "OpenCV_4_12_TELEA_radius_3" else "HORIZONTAL_FILL")
+        .put("legacyFilterAndFillApplied", !edgeMode.isReference)
         .put("sourceWidth", source.width).put("sourceHeight", source.height)
         .put("outputWidth", outputWidth).put("outputHeight", outputHeight)
         .put("depthModel", depthModel).put("outputMode", "SPLIT_EYES_JPEG_Q$IMAGE_EYE_JPEG_QUALITY")

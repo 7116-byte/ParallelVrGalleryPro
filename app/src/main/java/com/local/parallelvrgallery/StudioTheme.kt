@@ -22,6 +22,13 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 
+/** Keep gallery chrome clear of transient bars after leaving an immersive Viewer. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun Modifier.studioSafeArea(): Modifier = windowInsetsPadding(
+    WindowInsets.safeDrawing.union(WindowInsets.systemBarsIgnoringVisibility),
+)
+
 private val StudioLight = lightColorScheme(
     primary = Color(0xFF206B58), onPrimary = Color.White,
     primaryContainer = Color(0xFFD4EEE3), onPrimaryContainer = Color(0xFF103E31),
@@ -69,7 +76,7 @@ fun StudioTheme(dark: Boolean = isSystemInDarkTheme(), content: @Composable () -
 /** A bounded reading column; every control remains reachable with the IME or large fonts. */
 @Composable
 fun StudioPage(content: @Composable ColumnScope.() -> Unit) {
-    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).safeDrawingPadding().imePadding(), contentAlignment = Alignment.TopCenter) {
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).studioSafeArea().imePadding(), contentAlignment = Alignment.TopCenter) {
         Column(
             Modifier.widthIn(max = 840.dp).fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp), content = content,

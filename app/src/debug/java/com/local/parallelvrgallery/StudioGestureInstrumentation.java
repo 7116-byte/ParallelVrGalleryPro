@@ -30,6 +30,46 @@ public final class StudioGestureInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if(kind.equals("referenceRaster")) {
+                File root=new File(getTargetContext().getExternalFilesDir(null),"PVG_QA_reference_1301");
+                if(!root.isDirectory())throw new AssertionError("Explicit private QA directory missing");
+                StringBuilder runtime=new StringBuilder();
+                DepthModelSession session=new DepthModelSession(new File(getTargetContext().getExternalFilesDir(null),"models/depth_anything_v2.tflite"),4,true,GpuTestMode.ACCURATE_UNSET,true,value->{runtime.append(value).append('\n');return kotlin.Unit.INSTANCE;});
+                try {
+                    for(String name:new String[]{"PVG_QA_O1.png","PVG_QA_P1.jpg","PVG_QA_P2.jpg","PVG_QA_P3.jpg"}){
+                        android.graphics.Bitmap bitmap=android.graphics.BitmapFactory.decodeFile(new File(root,name).getPath());
+                        if(bitmap==null)throw new AssertionError("Missing explicit QA input: "+name);
+                        try {
+                            try(java.io.FileOutputStream stream=new java.io.FileOutputStream(new File(root,name+".decoded.png"))){bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG,100,stream);}
+                            float[] depth=session.run(bitmap,0,()->kotlin.Unit.INSTANCE);
+                            try(java.io.DataOutputStream stream=new java.io.DataOutputStream(new java.io.FileOutputStream(new File(root,name+".depth-f32-be")))){for(float value:depth)stream.writeFloat(value);}
+                            for(boolean smooth:new boolean[]{false,true}){
+                                kotlin.Pair<android.graphics.Bitmap,android.graphics.Bitmap> eyes=ReferenceStereoRenderer.INSTANCE.render(bitmap,depth,518,518,5f,smooth);
+                                if(!smooth)try(java.io.FileOutputStream stream=new java.io.FileOutputStream(new File(root,name+".decoded.png"))){eyes.getFirst().compress(android.graphics.Bitmap.CompressFormat.PNG,100,stream);}
+                                try(java.io.FileOutputStream stream=new java.io.FileOutputStream(new File(root,name+(smooth?".v9.png":".v8.png")))){eyes.getSecond().compress(android.graphics.Bitmap.CompressFormat.PNG,100,stream);}
+                                finally{eyes.getFirst().recycle();eyes.getSecond().recycle();}
+                            }
+                            android.content.SharedPreferences prefs=getTargetContext().getSharedPreferences("settings",0);
+                            DepthUpscaleSettings upscale=new DepthUpscaleSettings(prefs.getBoolean("depthUpscaleEnabled",false),prefs.getInt("depthUpscaleMaxLongEdge",0),DepthInterpolation.Companion.restore(prefs.getString("depthInterpolation",null)),DepthResizeOrder.Companion.restore(prefs.getString("depthResizeOrder",null)));
+                            for(boolean smooth:new boolean[]{false,true}){
+                                VrGenerationParams params=new VrGenerationParams("depth_anything_v2.tflite","SBS_PARALLEL",prefs.getFloat("depthScale",5f),prefs.getInt("blurRadius",3),prefs.getInt("fillRadius",10),prefs.getBoolean("invertDepth",false),1536,4,true,GpuTestMode.ACCURATE_UNSET,true,"FOREGROUND_FILL",94,smooth?DepthEdgeMode.REFERENCE_V9:DepthEdgeMode.REFERENCE_V8,upscale);
+                                long budget=Math.min(Runtime.getRuntime().maxMemory()/8,96L*1024*1024);
+                                DepthMap prepared=DepthPostProcessing.INSTANCE.process(new DepthMap(depth,518,518),bitmap.getWidth(),bitmap.getHeight(),params,Math.max(1,budget/16));
+                                if(!smooth){
+                                    try(java.io.DataOutputStream stream=new java.io.DataOutputStream(new java.io.FileOutputStream(new File(root,name+".current-depth-f32-be")))){for(float value:prepared.getValues())stream.writeFloat(value);}
+                                    org.json.JSONObject meta=new org.json.JSONObject().put("width",prepared.getWidth()).put("height",prepared.getHeight()).put("scale",params.getDepthScale()).put("depthUpscale",upscale.getEnabled()).put("interpolation",upscale.getInterpolation().name()).put("order",upscale.getOrder().name());
+                                    try(java.io.FileOutputStream stream=new java.io.FileOutputStream(new File(root,name+".current.json"))){stream.write(meta.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));}
+                                }
+                                kotlin.Pair<android.graphics.Bitmap,android.graphics.Bitmap> eyes=ReferenceStereoRenderer.INSTANCE.render(bitmap,prepared.getValues(),prepared.getWidth(),prepared.getHeight(),params.getDepthScale(),smooth);
+                                try(java.io.FileOutputStream stream=new java.io.FileOutputStream(new File(root,name+(smooth?".current-v9.png":".current-v8.png")))){eyes.getSecond().compress(android.graphics.Bitmap.CompressFormat.PNG,100,stream);}
+                                finally{eyes.getFirst().recycle();eyes.getSecond().recycle();}
+                            }
+                        } finally{bitmap.recycle();}
+                    }
+                } finally{session.close();}
+                try(java.io.FileOutputStream stream=new java.io.FileOutputStream(new File(root,"runtime.txt"))){stream.write(runtime.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));}
+                result.putString("result","PASS: four explicit private QA inputs; forced GPU; same float depth rendered by V8 and V9; no MediaStore/queue operations");finish(-1,result);return;
+            }
             android.accessibilityservice.AccessibilityServiceInfo info=getUiAutomation().getServiceInfo();
             info.flags |= android.accessibilityservice.AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
                     | android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
@@ -104,7 +144,9 @@ public final class StudioGestureInstrumentation extends Instrumentation {
             for (int i = 0; i < 8; i++) drag(bounds, i % 2 == 0);
             getUiAutomation().setRotation(UiAutomation.ROTATION_FREEZE_0);
             SystemClock.sleep(600);
-            if (!"com.local.parallelvrgallerypro".contentEquals(requireRoot().getPackageName())) throw new AssertionError("Viewer lost foreground");
+            if (!"com.local.parallelvrgallerypro".contentEquals(requireRoot().getPackageName())) {
+                throw new AssertionError("Viewer lost foreground");
+            }
             result.putString("result", "PASS: pinch visibly changes image; cross-center two-pointer drag; held drag; reset; rotation; 8 rapid swipes");
             finish(-1, result);
         } catch (Throwable error) {
@@ -138,13 +180,18 @@ public final class StudioGestureInstrumentation extends Instrumentation {
         File[] sources=root.listFiles();if(sources==null)return false;
         for(File source:sources)if(source.getName().startsWith("VIDEO_"+id+"_")){
             File[] versions=source.listFiles();if(versions==null)continue;
-            for(File version:versions)if(new File(version,"video_params.txt").isFile()&&new File(version,"vr_sbs.mp4").length()>0)return true;
+            for(File version:versions) {
+                if(new File(version,"video_params.txt").isFile()&&new File(version,"vr_sbs.mp4").length()>0) {
+                    return true;
+                }
+            }
         }
         return false;
     }
     private AccessibilityNodeInfo requireRoot() {
         AccessibilityNodeInfo root = getUiAutomation().getRootInActiveWindow();
-        if (root == null) throw new AssertionError("No active window"); return root;
+        if (root == null) { throw new AssertionError("No active window"); }
+        return root;
     }
     private AccessibilityNodeInfo find(String value) {
         return findNode(getUiAutomation().getRootInActiveWindow(), value);

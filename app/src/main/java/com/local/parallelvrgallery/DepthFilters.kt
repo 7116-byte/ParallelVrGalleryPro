@@ -6,12 +6,19 @@ import kotlin.math.min
 enum class DepthEdgeMode(val cacheVersion: String) {
     LEGACY_V6("depthV6"),
     CENTERED_V7("depthV7"),
-    REFERENCE_V8("depthSSS22V8");
+    REFERENCE_V8("depthSSS22V8"),
+    REFERENCE_V9("depthSSS22V9");
+
+    val isReference: Boolean get() = this == REFERENCE_V8 || this == REFERENCE_V9
 
     companion object {
+        // Preferences move to the corrected renderer; saved jobs and old results
+        // use restore() directly and retain the exact algorithm they recorded.
+        fun forCurrentSettings(name: String?): DepthEdgeMode = restore(name).let { if (it == REFERENCE_V8) REFERENCE_V9 else it }
         fun restore(name: String?, previousCacheVersion: String? = null): DepthEdgeMode =
             entries.firstOrNull { it.name == name }
                 ?: when {
+                    previousCacheVersion?.contains("_depthSSS22V9_") == true -> REFERENCE_V9
                     previousCacheVersion?.contains("_depthSSS22V8_") == true -> REFERENCE_V8
                     previousCacheVersion?.contains("_depthV7_") == true -> CENTERED_V7
                     else -> LEGACY_V6
@@ -26,7 +33,7 @@ internal object DepthFilters {
             DepthEdgeMode.CENTERED_V7 -> boxMean(depth, width, height, diameter, invert)
             // The upstream external-depth V2.2 node does not apply its blur argument.
             // Keep raw depth (and requested inversion); projection quantizes separately.
-            DepthEdgeMode.REFERENCE_V8 -> {
+            DepthEdgeMode.REFERENCE_V8, DepthEdgeMode.REFERENCE_V9 -> {
                 require(width > 0 && height > 0 && depth.size == width * height)
                 FloatArray(depth.size) { if (invert) 1f - depth[it] else depth[it] }
             }

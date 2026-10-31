@@ -15,5 +15,6 @@ release-notes-v*.md
 !release-notes-v1.0.03.md
 _workspace_artifacts/
 .local/
+.codex-attachments/
 *.keystore
 *.jks
