@@ -31,7 +31,7 @@ data class DepthUpscaleSettings(
     fun cacheSuffix(): String = if (!enabled) "" else "_du1_m${boundedLongEdge}_i${interpolation.code}_o${order.code}"
 }
 
-internal data class DepthMap(val values: FloatArray, val width: Int, val height: Int) {
+internal data class DepthMap @JvmOverloads constructor(val values: FloatArray, val width: Int, val height: Int, val projectionScale: Float? = null) {
     init { require(width > 0 && height > 0 && width.toLong() * height == values.size.toLong()) }
 }
 

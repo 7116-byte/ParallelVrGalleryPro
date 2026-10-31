@@ -350,18 +350,19 @@ private val IMAGE_CACHE_FILES = listOf(
     "export_sbs.avif",
     "export_sbs.jpg",
     "depth.png",
+    "model_depth.png",
     "params.json",
     "job.log",
     "source_preview.jpg",
 )
 
 private fun VrCacheEntry.cacheBytes(): Long {
-    return listOf(outputPath, leftPath, rightPath, depthPath, paramsPath, logPath)
+    return listOf(outputPath, leftPath, rightPath, depthPath, paramsPath, logPath, File(File(paramsPath).parentFile, "model_depth.png").absolutePath)
         .filter { it.isNotBlank() }
         .sumOf { File(it).takeIf { file -> file.exists() }?.length() ?: 0L }
 }
 
-data class VrGenerationParams(
+data class VrGenerationParams @JvmOverloads constructor(
     val depthModel: String = "depth_anything_v2.tflite",
     val outputMode: String = "SBS_PARALLEL",
     val depthScale: Float = 40f,
@@ -377,6 +378,9 @@ data class VrGenerationParams(
     val quality: Int = 94,
     val edgeMode: DepthEdgeMode = DepthEdgeMode.LEGACY_V6,
     val depthUpscale: DepthUpscaleSettings = DepthUpscaleSettings(),
+    val matchV10Default: Boolean = false,
+    val resultVariant: String = "",
+    val invertModelDepth: Boolean = false,
 )
 
 data class VideoGenerationParams(
@@ -423,6 +427,8 @@ data class AppSettings(
     val videoDepthWorkers: Int = 2,
     val edgeMode: DepthEdgeMode = DepthEdgeMode.LEGACY_V6,
     val depthUpscale: DepthUpscaleSettings = DepthUpscaleSettings(),
+    val matchV10Default: Boolean = false,
+    val invertModelDepth: Boolean = false,
 ) {
     fun toParams(): VrGenerationParams = VrGenerationParams(
         depthModel = imageModelId,
@@ -437,6 +443,8 @@ data class AppSettings(
         forceGpuNoFallback = useGpu,
         edgeMode = edgeMode,
         depthUpscale = depthUpscale,
+        matchV10Default = matchV10Default,
+        invertModelDepth = invertModelDepth,
     )
 
     fun toVideoParams(): VideoGenerationParams = VideoGenerationParams(
@@ -649,6 +657,7 @@ data class UiState(
     val hasVideoPermission: Boolean = false,
     val hasNotificationPermission: Boolean = false,
     val photos: List<PhotoItem> = emptyList(),
+    val comparison: ModeComparisonState? = null,
     val selectedIndex: Int? = null,
     val viewerOrigin: ViewerOrigin = ViewerOrigin.NORMAL,
     val manageViewerKeys: Set<String> = emptySet(),
@@ -766,6 +775,8 @@ private data class QueueTag(
     val priority: Int,
     val state: VrState,
     val updatedAt: Long,
+    val params: VrGenerationParams? = null,
+    val writeIntent: ImageWriteIntent? = null,
 )
 
 private data class VideoQueueTag(
@@ -810,6 +821,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val claimedImageJobs = mutableSetOf<QueuedJob>()
     private val currentImageFirst = CurrentImageFirst()
     private var modelWarmupJob: Job? = null
+    private var comparisonJob: Job? = null
+    private val comparisonRevision = java.util.concurrent.atomic.AtomicLong()
 
     private val _uiState = MutableStateFlow(
         UiState(
@@ -857,6 +870,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     override fun onCleared() {
+        comparisonRevision.incrementAndGet()
+        comparisonJob?.cancel()
         val imageJobs = workers.toList() + listOfNotNull(currentWorker, modelWarmupJob)
         imageJobs.forEach { it.cancel() }
         AppWorkScopes.video.launch {
@@ -1559,7 +1574,12 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         context.startActivity(intent)
     }
 
-    fun updateSettings(settings: AppSettings) {
+    fun updateSettings(requested: AppSettings) {
+        val before = _uiState.value.settings
+        val settings = if (requested.edgeMode != before.edgeMode) {
+            settingsStore.save(before)
+            settingsStore.profile(requested.edgeMode).applyTo(requested)
+        } else requested
         settingsStore.save(settings)
         _uiState.update {
             it.copy(
@@ -1571,6 +1591,19 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
         _uiState.value.selectedIndex?.let { refreshWindow(it) }
         startWorker()
+    }
+
+    fun saveModeDefault(): Boolean {
+        val settings = _uiState.value.settings
+        val saved = settingsStore.saveDefault(settings)
+        _uiState.update { it.copy(message = if (saved) "已保存 ${settings.edgeMode.shortLabel()} 的默认视觉参数" else "默认值保存失败，请检查存储空间") }
+        return saved
+    }
+
+    fun resetModeDefault(factory: Boolean = false) {
+        val settings = _uiState.value.settings
+        if (factory) settingsStore.clearDefault(settings.edgeMode)
+        updateSettings(settingsStore.defaultProfile(settings.edgeMode).applyTo(settings))
     }
 
     fun onPagerIndexChanged(index: Int) = synchronized(imageRuns) {
@@ -1687,8 +1720,44 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(debugIndex = index) }
     }
 
+    fun startComparison(index: Int, longEdge: Int = 1280, defaults: Boolean = false) {
+        val photo = _uiState.value.photos.getOrNull(index)?.takeIf { it.kind == MediaKind.IMAGE && !it.generatedVirtual } ?: return
+        val revision = comparisonRevision.incrementAndGet()
+        comparisonJob?.cancel()
+        val base = _uiState.value.settings
+        val profiles = DepthEdgeMode.entries.associateWith { mode ->
+            if (defaults) settingsStore.defaultProfile(mode) else if (mode == base.edgeMode) ModeVisualProfile.capture(base) else settingsStore.profile(mode)
+        }
+        val id = java.util.UUID.randomUUID().toString()
+        _uiState.update { it.copy(comparison = ModeComparisonState(id, photo.cacheKey, photo.displayName, longEdge)) }
+        comparisonJob = viewModelScope.launch(Dispatchers.Default) {
+            try {
+                val images = generator.generateComparison(photo, base, profiles, longEdge,
+                    shouldContinue = { comparisonRevision.get() == revision },
+                    onProgress = { progress, message ->
+                        _uiState.update { state -> if (state.comparison?.id == id) state.copy(comparison = state.comparison.copy(progress = progress, message = message)) else state }
+                    })
+                _uiState.update { state -> if (state.comparison?.id == id) state.copy(comparison = state.comparison.copy(images = images, progress = 1f)) else state }
+            } catch (cancelled: java.util.concurrent.CancellationException) {
+                // Native inference finishes on its owner; obsolete comparison cannot publish anything.
+            } catch (error: Throwable) {
+                _uiState.update { state -> if (state.comparison?.id == id) state.copy(comparison = state.comparison.copy(error = error.shortMessage())) else state }
+            }
+        }
+    }
+
+    fun closeComparison() {
+        comparisonRevision.incrementAndGet()
+        comparisonJob?.cancel()
+        comparisonJob = null
+        _uiState.update { it.copy(comparison = null) }
+        // UI bitmaps are released by GC after Compose drops the last frame, never recycled under a draw.
+    }
+
     fun closeDebug() {
+        closeComparison()
         _uiState.update { it.copy(debugIndex = null) }
+        _uiState.value.selectedIndex?.let(::refreshWindow)
     }
 
     fun openManage() {
@@ -1886,43 +1955,47 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         addLog("cleared all image queues")
     }
 
-    fun regenerateImages(indexes: List<Int>) {
-        val photos = indexes.distinct().mapNotNull { _uiState.value.photos.getOrNull(it) }.filter { it.kind == MediaKind.IMAGE }
-        if (photos.isEmpty()) return
-        val requestedParams = _uiState.value.settings.toParams()
-        val tokens = synchronized(imageRuns) {
+    fun regenerateViewedImage(index: Int) {
+        val state = _uiState.value
+        val photo = state.photos.getOrNull(index) ?: return
+        val entry = state.managedCacheItems.firstOrNull { it.entry.photoKey == photo.cacheKey && it.entry.version == state.selectedGeneratedVersion }?.entry
+            ?: state.entries[photo.cacheKey] ?: return
+        regenerateImages(listOf(ManagedCacheItem(photo, entry)))
+    }
+
+    fun regenerateImages(selected: List<ManagedCacheItem>) {
+        val state = _uiState.value
+        val selectedByKey = selected.filter { it.photoItem.kind == MediaKind.IMAGE && !it.photoItem.generatedVirtual }
+            .groupBy { it.entry.photoKey }
+        submitManualImages(selectedByKey.mapNotNull { (key, _) -> state.photos.firstOrNull { it.cacheKey == key } }, selectedByKey)
+    }
+
+    fun generateAdditionalImages(indexes: List<Int>) {
+        val photos = indexes.distinct().mapNotNull { _uiState.value.photos.getOrNull(it) }
+            .filter { it.kind == MediaKind.IMAGE && !it.generatedVirtual }
+        submitManualImages(photos, emptyMap())
+    }
+
+    private fun submitManualImages(photos: List<PhotoItem>, selected: Map<String, List<ManagedCacheItem>>) {
+        if (photos.isEmpty()) { _uiState.update { it.copy(message = "没有可用原图，未修改旧结果") }; return }
+        val requested = _uiState.value.settings.toParams()
+        synchronized(imageRuns) {
             val keys = photos.mapTo(mutableSetOf()) { it.cacheKey }
             imageRuns.invalidate(keys)
             clearImageQueueForKeys(keys)
-            photos.associate { photo ->
-                photo.cacheKey to imageRuns.token(photo.cacheKey)
+            photos.distinctBy { it.cacheKey }.forEachIndexed { order, photo ->
+                val targets = selected[photo.cacheKey].orEmpty().map { CacheReplacementTarget(it.entry.version, it.entry.createdAt) }.distinct()
+                val existingTarget = cache.findEntry(photo, requested.cacheVersion())
+                // A pre-existing unselected target version is historical too: use a distinct slot.
+                val params = if (existingTarget != null && targets.none { it.version == existingTarget.version })
+                    requested.copy(resultVariant = java.util.UUID.randomUUID().toString().take(8)) else requested
+                val index = _uiState.value.photos.indexOfFirst { it.cacheKey == photo.cacheKey }
+                if (index >= 0) enqueuePhoto(index, order + 1, force = true, context = QueueContext(QueueSource.GENERATED, null),
+                    paramsOverride = params, writeIntent = ImageWriteIntent(targets, forceRender = true))
             }
-        }
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                synchronized(imageRuns) {
-                    val valid = photos.filter { imageRuns.isCurrent(it.cacheKey, tokens.getValue(it.cacheKey)) }
-                    if (valid.isEmpty()) return@synchronized
-                    valid.forEach { photo -> cache.findEntry(photo, requestedParams.cacheVersion())?.let(cache::deleteEntry) }
-                    _uiState.update {
-                        val keys = valid.map { photo -> photo.cacheKey }.toSet()
-                        it.copy(
-                            entries = it.entries - keys,
-                            states = it.states + keys.associateWith { VrState.NORMAL },
-                            cacheVersions = cache.summaries(),
-                            managedCacheItems = cache.allEntries(it.photos),
-                            message = "已加入 ${valid.size} 张图片重新生成队列，其他参数版本保留",
-                        )
-                    }
-                    valid.forEachIndexed { order, photo ->
-                        val index = _uiState.value.photos.indexOfFirst { it.cacheKey == photo.cacheKey }
-                        if (index >= 0) enqueuePhoto(index, priority = order + 1, force = true, current = false, context = QueueContext(QueueSource.GENERATED, null), paramsOverride = requestedParams)
-                    }
-                    startWorker()
-                }
-            } catch (error: Exception) {
-                _uiState.update { it.copy(message = "重新生成失败 / Regenerate failed: ${error.message}") }
-            }
+            _uiState.update { it.copy(message = if (selected.isEmpty()) "已加入 ${photos.size} 张图片：使用新参数生成，旧结果全部保留"
+                else "已加入 ${photos.size} 张图片：成功后仅替换所选旧结果，失败保留；其他版本不动") }
+            startWorker()
         }
     }
 
@@ -1991,7 +2064,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private fun canPrefetch(state: UiState): Boolean = ViewerScope.canPrefetch(
         vrMode = state.vrMode,
         normalOrigin = state.viewerOrigin == ViewerOrigin.NORMAL,
-        viewerOpen = state.selectedIndex != null,
+        viewerOpen = state.selectedIndex != null && state.debugIndex == null && state.comparison == null,
         imageSelected = state.selectedIndex?.let { state.photos.getOrNull(it)?.kind == MediaKind.IMAGE } == true,
         generatedSurface = isGeneratedQueueSurface(state),
         hasSourceScope = state.viewerScopeOrderedKeys.isNotEmpty() && state.viewerQueueSource in setOf(QueueSource.ALL.name, QueueSource.ALBUM.name),
@@ -2140,7 +2213,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         startCurrentWorker()
     }
 
-    private fun enqueuePhoto(index: Int, priority: Int, force: Boolean, current: Boolean = false, context: QueueContext? = null, paramsOverride: VrGenerationParams? = null) = synchronized(imageRuns) {
+    private fun enqueuePhoto(index: Int, priority: Int, force: Boolean, current: Boolean = false, context: QueueContext? = null, paramsOverride: VrGenerationParams? = null, writeIntent: ImageWriteIntent? = null) = synchronized(imageRuns) {
         val state = _uiState.value
         val photo = state.photos.getOrNull(index) ?: return
         if (photo.kind != MediaKind.IMAGE) return
@@ -2169,7 +2242,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
         } else {
             QueuedJob(photo, priority, sequence++, queueContext.source, queueContext.albumId)
-        }).copy(runToken = imageRuns.token(photo.cacheKey), params = paramsOverride ?: _uiState.value.settings.toParams())
+        }).copy(runToken = imageRuns.token(photo.cacheKey), params = paramsOverride ?: _uiState.value.settings.toParams(), writeIntent = writeIntent)
         synchronized(pending) { pending.removeAll { it.photo.cacheKey == photo.cacheKey } }
         if (!resumableAutoPaused) {
             synchronized(paused) {
@@ -2238,6 +2311,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun jobAllowedInCurrentContext(job: QueuedJob, state: UiState): Boolean {
         if (!imageRuns.isCurrent(job.photo.cacheKey, job.runToken)) return false
+        if (job.writeIntent != null) return true // Explicit request only; never admits neighbors.
         if (isGeneratedQueueSurface(state)) {
             return sameQueueSource(job, QueueContext(QueueSource.GENERATED, null)) || synchronized(paused) { job.photo.cacheKey in sourcePausedKeys }
         }
@@ -2348,7 +2422,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val pausedJobs = mutableListOf<QueuedJob>()
         queueTags.load().forEach { tag ->
             val photo = photoByKey[tag.photoKey] ?: return@forEach
-            if (cache.findEntry(photo, state.settings.toParams().cacheVersion()) != null) {
+            if (tag.writeIntent != null && tag.params == null) {
+                restoredStates[tag.photoKey] = VrState.FAILED
+                return@forEach // Missing snapshot cannot retire an old result using different parameters.
+            }
+            if (tag.writeIntent?.forceRender != true && cache.findEntry(photo, (tag.params ?: state.settings.toParams()).cacheVersion()) != null) {
                 queueTags.remove(tag.photoKey)
                 restoredStates[tag.photoKey] = VrState.READY
                 return@forEach
@@ -2364,7 +2442,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             restoredStates[tag.photoKey] = restoredState
             if (restoredState == VrState.FAILED || restoredState == VrState.READY) return@forEach
             val job = QueuedJob(photo, tag.priority, sequence++, tag.source, tag.albumId,
-                runToken = imageRuns.token(photo.cacheKey), params = state.settings.toParams())
+                runToken = imageRuns.token(photo.cacheKey), params = tag.params ?: state.settings.toParams(), writeIntent = tag.writeIntent)
             if (jobAllowedInCurrentContext(job, state) && restoredState != VrState.PAUSED) {
                 pendingJobs += job
             } else {
@@ -2727,13 +2805,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 }
                 runningImageJobs[next.photo.cacheKey] = next
                 val cached = cache.findEntry(next.photo, params.cacheVersion())
-                if (cached != null) {
+                if (cached != null && next.writeIntent?.forceRender != true) {
                     queueTags.remove(next.photo.cacheKey)
                     synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey); sourcePausedKeys.remove(next.photo.cacheKey) }
                     markReady(next.photo.cacheKey, cached)
                     upsertJob(next.photo, next.priority, VrState.READY, 1f, source = next.source, albumId = next.albumId)
                     alreadyReady = true
-                    releaseCurrentPrefetch(next.photo.cacheKey)
+                    if (next.writeIntent == null) releaseCurrentPrefetch(next.photo.cacheKey)
                 } else {
                     queueTags.upsert(next, VrState.GENERATING)
                     markState(next.photo.cacheKey, VrState.GENERATING)
@@ -2749,7 +2827,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     shouldContinue = { coroutineJob?.isActive != false && imageRuns.isCurrent(next.photo.cacheKey, next.runToken) },
                     commit = { entry ->
                         var published: VrCacheEntry? = null
-                        imageRuns.ifCurrent(next.photo.cacheKey, next.runToken) { published = cache.publish(next.photo, entry) }
+                        imageRuns.ifCurrent(next.photo.cacheKey, next.runToken) { published = cache.publish(next.photo, entry, next.writeIntent?.replacements.orEmpty()) }
                         published ?: throw ImageJobObsoleteException()
                     },
                     onModelProgress = { progress ->
@@ -2775,7 +2853,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                             }
                         }
                         upsertJob(next.photo, next.priority, VrState.GENERATING, progress, source = next.source, albumId = next.albumId)
-                        if (progress >= 0.30f) releaseCurrentPrefetch(next.photo.cacheKey)
+                        if (progress >= 0.30f) if (next.writeIntent == null) releaseCurrentPrefetch(next.photo.cacheKey)
                     }
                 }
             }
@@ -2784,7 +2862,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     queueTags.remove(next.photo.cacheKey)
                     synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey); sourcePausedKeys.remove(next.photo.cacheKey) }
                     markReady(next.photo.cacheKey, entry)
-                    releaseCurrentPrefetch(next.photo.cacheKey)
+                    if (next.writeIntent != null) refreshGeneratedLibrary()
+                    if (next.writeIntent == null) releaseCurrentPrefetch(next.photo.cacheKey)
                     upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis(), source = next.source, albumId = next.albumId)
                     addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
                     val currentState = _uiState.value
@@ -2993,7 +3072,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 }
 
-private data class QueuedJob(val photo: PhotoItem, val priority: Int, val sequence: Long, val source: QueueSource, val albumId: String?, val runToken: Long = 0L, val params: VrGenerationParams? = null)
+private data class QueuedJob(val photo: PhotoItem, val priority: Int, val sequence: Long, val source: QueueSource, val albumId: String?, val runToken: Long = 0L, val params: VrGenerationParams? = null, val writeIntent: ImageWriteIntent? = null)
 
 private class ImageJobObsoleteException : java.util.concurrent.CancellationException("Image generation cancelled by deletion or replacement")
 
@@ -3251,7 +3330,7 @@ private class SettingsStore(context: Context) {
             false
         }
         val oldModelId = prefs.getString("modelId", "depth_anything_v2_small_tflite") ?: "depth_anything_v2_small_tflite"
-        return AppSettings(
+        val existing = AppSettings(
             language = runCatching { AppLanguage.valueOf(prefs.getString("language", AppLanguage.ZH.name) ?: AppLanguage.ZH.name) }.getOrDefault(AppLanguage.ZH),
             imageModelId = prefs.getString("imageModelId", oldModelId) ?: oldModelId,
             videoModelId = prefs.getString("videoModelId", oldModelId) ?: oldModelId,
@@ -3271,7 +3350,8 @@ private class SettingsStore(context: Context) {
             videoModelThreads = prefs.getInt("videoModelThreads", 4),
             videoUseGpu = prefs.getBoolean("videoUseGpu", false),
             videoDepthWorkers = prefs.getInt("videoDepthWorkers", 2).coerceIn(1, 2),
-            edgeMode = DepthEdgeMode.forCurrentSettings(prefs.getString("edgeMode", null)),
+            edgeMode = if (prefs.getBoolean("modeProfilesV1", false)) DepthEdgeMode.restore(prefs.getString("edgeMode", null))
+                else DepthEdgeMode.forCurrentSettings(prefs.getString("edgeMode", null)),
             depthUpscale = DepthUpscaleSettings(
                 enabled = prefs.getBoolean("depthUpscaleEnabled", false),
                 maxLongEdge = prefs.getInt("depthUpscaleMaxLongEdge", 0),
@@ -3279,10 +3359,35 @@ private class SettingsStore(context: Context) {
                 order = DepthResizeOrder.restore(prefs.getString("depthResizeOrder", null)),
             ),
         )
+        if (!prefs.contains("edgeMode")) {
+            return ModeVisualProfile.defaults(DepthEdgeMode.COMFY_LEGACY_V10).applyTo(existing.copy(edgeMode = DepthEdgeMode.COMFY_LEGACY_V10))
+        }
+        if (!prefs.getBoolean("modeProfilesV1", false)) {
+            save(existing) // Keep the user's active legacy values; initialize other modes lazily.
+            return existing
+        }
+        return profile(existing.edgeMode).applyTo(existing)
+    }
+
+    fun profile(mode: DepthEdgeMode): ModeVisualProfile =
+        ModeVisualProfile.decode(prefs.getString("modeProfile.${mode.name}", null)) ?: defaultProfile(mode)
+
+    fun defaultProfile(mode: DepthEdgeMode): ModeVisualProfile =
+        ModeVisualProfile.decode(prefs.getString("modeDefault.${mode.name}", null)) ?: ModeVisualProfile.defaults(mode)
+
+    // Explicit Save waits for disk; frequent setting changes still use apply().
+    @android.annotation.SuppressLint("ApplySharedPref")
+    fun saveDefault(settings: AppSettings): Boolean =
+        prefs.edit().putString("modeDefault.${settings.edgeMode.name}", ModeVisualProfile.capture(settings).encode()).commit()
+
+    fun clearDefault(mode: DepthEdgeMode) {
+        prefs.edit().remove("modeDefault.${mode.name}").apply()
     }
 
     fun save(settings: AppSettings) {
         prefs.edit()
+            .putBoolean("modeProfilesV1", true)
+            .putString("modeProfile.${settings.edgeMode.name}", ModeVisualProfile.capture(settings).encode())
             .putString("language", settings.language.name)
             .putString("modelId", settings.imageModelId)
             .putString("imageModelId", settings.imageModelId)
@@ -3508,6 +3613,8 @@ private class QueueTagStore(context: Context) : Closeable {
                 priority = parts[3].toIntOrNull() ?: 99,
                 state = state,
                 updatedAt = parts[5].toLongOrNull() ?: 0L,
+                params = parts.getOrNull(6)?.let { decodeVideoParams(it)?.vr },
+                writeIntent = ImageWriteIntent.decode(parts.getOrNull(7)),
             )
         }.distinctBy { it.photoKey }.toList()
     }
@@ -3524,6 +3631,8 @@ private class QueueTagStore(context: Context) : Closeable {
             priority = job.priority,
             state = state,
             updatedAt = System.currentTimeMillis(),
+            params = job.params,
+            writeIntent = job.writeIntent,
         )
         write(next)
     }
@@ -3553,6 +3662,8 @@ private class QueueTagStore(context: Context) : Closeable {
                     tag.priority.toString(),
                     tag.state.name,
                     tag.updatedAt.toString(),
+                    tag.params?.let { VideoGenerationParams(it, it.modelThreads, it.useGpu).encodeForQueue() }.orEmpty(),
+                    tag.writeIntent?.encode().orEmpty(),
                 ).joinToString("\t")
             },
         )
@@ -3621,6 +3732,9 @@ private class VideoQueueTagStore(context: Context) : Closeable {
 
 private class VrCacheManager(private val context: Context) {
     val root: File = File(context.getExternalFilesDir(null), "vr_cache").also { it.mkdirs() }
+    init {
+        ImageCachePublication.recover(File(root.parentFile, "image_work"), root).forEach { android.util.Log.w("ImageCacheRecovery", it) }
+    }
     private val index = VersionedIndex<VrCacheEntry>({ it.photoKey }, { it.version }, { it.createdAt })
     private val virtualItems = mutableMapOf<String, PhotoItem>()
     private val scanLock = Any()
@@ -3650,10 +3764,15 @@ private class VrCacheManager(private val context: Context) {
         check(it.mkdirs()) { "Cannot create image staging directory" }
     }
 
-    @Synchronized fun publish(photo: PhotoItem, staged: VrCacheEntry): VrCacheEntry {
+    @Synchronized fun publish(photo: PhotoItem, staged: VrCacheEntry, replacing: List<CacheReplacementTarget> = emptyList()): VrCacheEntry {
         val work = File(staged.paramsPath).parentFile!!
         val target = entryDir(photo, staged.version)
-        ImageCachePublication.commit(work, target)
+        val retiring = replacing.mapNotNull { old -> index.get(photo.cacheKey, old.version)?.takeIf { it.createdAt == old.createdAt && it.version != staged.version } }
+        ImageCachePublication.commit(work, target, retiring.flatMap { old ->
+            val dir = File(old.paramsPath).parentFile!!
+            if (old.version == DEFAULT_VERSION) IMAGE_CACHE_FILES.map { File(dir, it) }.filter { it.isFile } else listOf(dir)
+        })
+        retiring.forEach { old -> index.removeWhere { it.photoKey == photo.cacheKey && it.version == old.version && it.createdAt == old.createdAt } }
         fun publishedPath(path: String) = if (path.isBlank()) "" else File(target, File(path).name).absolutePath
         return staged.copy(
             outputPath = publishedPath(staged.outputPath), leftPath = publishedPath(staged.leftPath),
@@ -4192,7 +4311,7 @@ private class VrGenerator(
             mark("model session ready key=${params.depthSessionKey()}")
             onProgress(0.12f)
 
-            val decodeMaxLongEdge = memorySafeMaxLongEdge(photo.width, photo.height, params.maxLongEdge, params.edgeMode)
+            val decodeMaxLongEdge = memorySafeMaxLongEdge(photo.width, photo.height, params.maxLongEdge, if (params.matchV10Default) DepthEdgeMode.COMFY_LEGACY_V10 else params.edgeMode)
             if (decodeMaxLongEdge < params.maxLongEdge) {
                 mark("memory capped maxLongEdge ${params.maxLongEdge} -> $decodeMaxLongEdge")
             }
@@ -4216,7 +4335,10 @@ private class VrGenerator(
             val modelMs = System.currentTimeMillis() - depthStart
             mark("model inference ${modelMs}ms")
             val depthPostStart = System.currentTimeMillis()
-            val depthMap = prepareDepth(rawDepth, params, original.width, original.height)
+            val modelDepthBitmap = depthToBitmap(DepthMap(DepthDirection.modelDepth(rawDepth, params.invertModelDepth), 518, 518))
+            try { FileOutputStream(File(dir, "model_depth.png")).use { modelDepthBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) } }
+            finally { modelDepthBitmap.recycle() }
+            var depthMap = prepareDepth(rawDepth, params, original.width, original.height)
             onProgress(0.55f)
 
             val depthBitmap = depthToBitmap(depthMap).also { ownedBitmaps.add(it) }
@@ -4230,7 +4352,7 @@ private class VrGenerator(
 
             val sbsStart = System.currentTimeMillis()
             val pair = runCatching {
-                makeParallelStereoPair(original, depthMap, params.depthScale, params.fillRadius, params.edgeMode)
+                makeParallelStereoPair(original, depthMap, params.effectiveScale(original.width, depthMap), params.fillRadius, params.edgeMode)
             }.getOrElse { error ->
                 if (error !is OutOfMemoryError || max(original.width, original.height) <= 960) throw error
                 val retryLongEdge = max(960, (max(original.width, original.height) * 0.72f).roundToInt())
@@ -4244,7 +4366,12 @@ private class VrGenerator(
                 )
                 original.recycle()
                 original = reduced.also { ownedBitmaps.add(it) }
-                makeParallelStereoPair(original, depthMap, params.depthScale, params.fillRadius, params.edgeMode)
+                depthMap = prepareDepth(rawDepth, params, original.width, original.height)
+                // Diagnostic depth must describe the geometry actually used by the successful retry.
+                val retryDepthBitmap = depthToBitmap(depthMap)
+                try { FileOutputStream(depthPath).use { retryDepthBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) } }
+                finally { retryDepthBitmap.recycle() }
+                makeParallelStereoPair(original, depthMap, params.effectiveScale(original.width, depthMap), params.fillRadius, params.edgeMode)
             }
             ownedBitmaps.add(pair.left)
             ownedBitmaps.add(pair.right)
@@ -4328,6 +4455,59 @@ private class VrGenerator(
         }
     }
 
+    fun generateComparison(photo: PhotoItem, base: AppSettings,
+        profiles: Map<DepthEdgeMode, ModeVisualProfile>, requestedLongEdge: Int,
+        shouldContinue: () -> Boolean, onProgress: (Float, String) -> Unit): List<ModeComparisonImage> {
+        fun checkCurrent() { if (!shouldContinue()) throw ImageJobObsoleteException() }
+        checkCurrent()
+        val runtime = Runtime.getRuntime()
+        val available = runtime.maxMemory() - (runtime.totalMemory() - runtime.freeMemory())
+        // Seven retained RGB eyes (one shared original), plus worst-case native projection buffers.
+        val budget = minOf(224L * 1024 * 1024, (available * 0.60).toLong()).coerceAtLeast(16L * 1024 * 1024)
+        val ratio = max(photo.width, photo.height).toDouble().coerceAtLeast(1.0) / min(photo.width, photo.height).coerceAtLeast(1)
+        val cap = kotlin.math.sqrt(budget / 120.0 * ratio).toInt().coerceAtLeast(256)
+        val source = decodeScaledBitmap(context, photo.uri, minOf(requestedLongEdge, cap))
+        val result = mutableListOf<ModeComparisonImage>()
+        var success = false
+        try {
+            onProgress(0.05f, "推理当前图片；不创建队列")
+            val raw = sharedImageDepthSession(base.toParams(), {}, { android.util.Log.i("ModeComparison", it) }).use { lease ->
+                lease.value.run(source, 0) { checkCurrent() }
+            }
+            checkCurrent()
+            DepthEdgeMode.entries.forEachIndexed { index, mode ->
+                onProgress(0.15f + index / 6f * 0.8f, "${mode.shortLabel()} · ${source.width}×${source.height}")
+                val params = profiles.getValue(mode).applyTo(base.copy(edgeMode = mode)).toParams()
+                val started = SystemClock.uptimeMillis()
+                val depth = prepareDepth(raw, params, source.width, source.height)
+                checkCurrent()
+                val pair = makeParallelStereoPair(source, depth, params.effectiveScale(source.width, depth), params.fillRadius, mode)
+                // All renderers keep exactly one original eye; share it across the six variants.
+                val left: Bitmap
+                val right: Bitmap
+                if (mode.isReference) { pair.left.recycle(); left = source; right = pair.right }
+                else { pair.right.recycle(); left = pair.left; right = source }
+                fun preview(map: DepthMap): Bitmap {
+                    val factor = minOf(1.0, 512.0 / max(source.width, source.height))
+                    val w = max(1, (source.width * factor).roundToInt())
+                    val h = max(1, (source.height * factor).roundToInt())
+                    return depthToBitmap(DepthResampling.resize(map, w, h, DepthInterpolation.BILINEAR))
+                }
+                val modelPreview = preview(DepthMap(DepthDirection.modelDepth(raw, params.invertModelDepth), 518, 518))
+                val projectionPreview = try { preview(depth) } catch (error: Throwable) { modelPreview.recycle(); throw error }
+                result += ModeComparisonImage(mode, left, right, params, params.effectiveScale(source.width, depth), SystemClock.uptimeMillis() - started, modelPreview, projectionPreview)
+                checkCurrent()
+            }
+            success = true
+            return result
+        } finally {
+            if (!success) {
+                result.flatMap { listOf(it.left, it.right, it.modelDepth, it.projectionDepth) }.filter { it !== source }.distinct().forEach { it.recycle() }
+                source.recycle()
+            }
+        }
+    }
+
     fun generateSbsBitmap(
         source: Bitmap,
         params: VrGenerationParams,
@@ -4335,7 +4515,7 @@ private class VrGenerator(
         onRuntimeInfo: (String) -> Unit = {},
         depthSession: DepthModelSession? = null,
     ): Bitmap {
-        val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge, params.edgeMode)
+        val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge, if (params.matchV10Default) DepthEdgeMode.COMFY_LEGACY_V10 else params.edgeMode)
         val working = if (max(source.width, source.height) > safeMaxLongEdge) {
             val scale = safeMaxLongEdge.toFloat() / max(source.width, source.height).toFloat()
             Bitmap.createScaledBitmap(source, max(1, (source.width * scale).roundToInt()), max(1, (source.height * scale).roundToInt()), true)
@@ -4351,7 +4531,7 @@ private class VrGenerator(
                 }
             }
             val depthMap = prepareDepth(rawDepth, params, working.width, working.height)
-            return makeParallelSbs(working, depthMap, params.depthScale, params.fillRadius, params.edgeMode)
+            return makeParallelSbs(working, depthMap, params.effectiveScale(working.width, depthMap), params.fillRadius, params.edgeMode)
         } finally {
             if (working !== source) working.recycle()
         }
@@ -4372,7 +4552,7 @@ private class VrGenerator(
         params: VrGenerationParams,
         depthSession: DepthModelSession,
     ): VideoDepthResult {
-        val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge, params.edgeMode)
+        val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge, if (params.matchV10Default) DepthEdgeMode.COMFY_LEGACY_V10 else params.edgeMode)
         val working = if (max(source.width, source.height) > safeMaxLongEdge) {
             val scale = safeMaxLongEdge.toFloat() / max(source.width, source.height).toFloat()
             Bitmap.createScaledBitmap(source, max(1, (source.width * scale).roundToInt()), max(1, (source.height * scale).roundToInt()), true)
@@ -4410,7 +4590,7 @@ private class VrGenerator(
         val depthPostMs = SystemClock.uptimeMillis() - depthPostStart
         val sbsStart = SystemClock.uptimeMillis()
         val eyes = try {
-            makeParallelStereoPair(depth.source, depthMap, params.depthScale, params.fillRadius, params.edgeMode)
+            makeParallelStereoPair(depth.source, depthMap, params.effectiveScale(depth.source.width, depthMap), params.fillRadius, params.edgeMode)
         } finally {
             depth.source.recycle()
         }
@@ -4512,12 +4692,15 @@ private class VrGenerator(
     private fun prepareDepth(depth: FloatArray, params: VrGenerationParams, width: Int, height: Int): DepthMap {
         // Reserve space for resize/filter intermediates and the diagnostic bitmap per active job.
         val budget = (Runtime.getRuntime().maxMemory() / 8).coerceAtMost(96L * 1024 * 1024)
-        val prepared = DepthPostProcessing.process(DepthMap(depth, 518, 518), width, height, params, max(1L, budget / 16))
+        val canonical = DepthDirection.modelDepth(depth, params.invertModelDepth)
+        val prepared = DepthPostProcessing.process(DepthMap(canonical, 518, 518), width, height, params, max(1L, budget / 16))
         if (params.edgeMode.isComfyMain) {
             val restored = ComfyLegacyStereoRenderer.prepareDepth(prepared.values, prepared.width, prepared.height, width, height, params.blurRadius, true)
-            return DepthMap(restored, width, height)
+            return DepthMap(restored, width, height, if (params.matchV10Default) 50f else null)
         }
-        return prepared
+        if (!params.matchV10Default) return prepared
+        val baseline = ComfyLegacyStereoRenderer.prepareDepth(canonical, 518, 518, width, height, 3, true)
+        return prepared.copy(projectionScale = DefaultDisparityCalibration.scale(params, width, prepared.values, baseline))
     }
 
     private fun makeParallelStereoPair(source: Bitmap, depth: DepthMap, depthScale: Float, fillRadius: Int, mode: DepthEdgeMode = DepthEdgeMode.LEGACY_V6): StereoBitmapPair {
@@ -5672,6 +5855,7 @@ private class DebugExporter(
             }
             out.addFile("source_preview.jpg", preview)
             out.addFile("depth.png", File(entry.depthPath))
+            File(File(entry.paramsPath).parentFile, "model_depth.png").takeIf { it.isFile }?.let { out.addFile("model_depth.png", it) }
             if (entry.hasSplitEyes) {
                 val left = File(entry.leftPath)
                 val right = File(entry.rightPath)
@@ -5696,6 +5880,7 @@ private sealed class AppScreen {
     data object Manage : AppScreen()
     data object Viewer : AppScreen()
     data object Debug : AppScreen()
+    data object Comparison : AppScreen()
 }
 
 @OptIn(ExperimentalAnimationApi::class)
@@ -5755,12 +5940,14 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
     }
 
     val screen = when {
+        state.comparison != null -> AppScreen.Comparison
         state.manageOpen -> AppScreen.Manage
         state.settingsOpen -> AppScreen.Settings
         state.debugIndex != null -> AppScreen.Debug
         state.selectedIndex != null -> AppScreen.Viewer
         else -> AppScreen.Gallery
     }
+    BackHandler(enabled = screen is AppScreen.Comparison) { viewModel.closeComparison() }
     BackHandler(enabled = screen is AppScreen.Debug) { viewModel.closeDebug() }
     BackHandler(enabled = screen is AppScreen.Viewer) { viewModel.closeViewer() }
     BackHandler(enabled = screen is AppScreen.Manage) { viewModel.closeManage() }
@@ -5780,6 +5967,10 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
         label = "screenTransition",
     ) { target ->
         when (target) {
+            AppScreen.Comparison -> state.comparison?.let { comparison ->
+                StudioTheme(dark = true) { ModeComparisonScreen(comparison, viewModel::closeComparison,
+                    onRestart = { edge, defaults -> viewModel.startComparison(state.debugIndex ?: state.galleryAnchorIndex, edge, defaults) }) }
+            }
             AppScreen.Manage -> ManageScreen(
                 state = state,
                 onBack = viewModel::closeManage,
@@ -5802,6 +5993,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSaveImages = { viewModel.saveGeneratedCopies(context, it) },
                 onDeleteImages = viewModel::deleteGeneratedImageEntries,
                 onRegenerateImages = viewModel::regenerateImages,
+                onGenerateImages = viewModel::generateAdditionalImages,
             )
             AppScreen.Settings -> SettingsScreen(
                 settings = state.settings,
@@ -5814,6 +6006,9 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 updateApkPath = state.updateApkPath,
                 onBack = viewModel::closeSettings,
                 onChange = viewModel::updateSettings,
+                onSaveDefault = viewModel::saveModeDefault,
+                onResetDefault = { viewModel.resetModeDefault() },
+                onFactoryDefault = { viewModel.resetModeDefault(factory = true) },
                 onCheckUpdate = viewModel::checkForUpdates,
                 onDownloadUpdate = viewModel::downloadUpdateApk,
                 onInstallUpdate = { viewModel.installDownloadedUpdate(context) },
@@ -5822,6 +6017,9 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 state = state,
                 index = state.debugIndex ?: state.galleryAnchorIndex,
                 onBack = viewModel::closeDebug,
+                onCompare = { viewModel.startComparison(state.debugIndex ?: state.galleryAnchorIndex) },
+                onGenerate = { viewModel.generateAdditionalImages(listOf(state.debugIndex ?: state.galleryAnchorIndex)) },
+                onRegenerate = { viewModel.regenerateViewedImage(state.debugIndex ?: state.galleryAnchorIndex) },
                 onShare = { viewModel.exportDebug(context, state.debugIndex ?: state.galleryAnchorIndex) },
             )
             AppScreen.Viewer -> StudioTheme(dark = true) { ViewerScreen(
@@ -5876,6 +6074,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSaveImages = { viewModel.saveGeneratedCopies(context, it) },
                 onDeleteImages = viewModel::deleteGeneratedImageEntries,
                 onRegenerateImages = viewModel::regenerateImages,
+                onGenerateImages = viewModel::generateAdditionalImages,
             )
         }
     }
@@ -5897,6 +6096,8 @@ private data class GeneratedSelectionActionsState(
     val onSave: (() -> Unit)?,
     val onRegenerate: (() -> Unit)?,
     val onDelete: () -> Unit,
+    val onGenerate: (() -> Unit)? = null,
+    val imageReplacement: Boolean = false,
 )
 
 @OptIn(ExperimentalFoundationApi::class, ExperimentalLayoutApi::class)
@@ -5931,7 +6132,8 @@ private fun GalleryScreen(
     onRegenerateVideos: (List<Int>) -> Unit,
     onSaveImages: (List<Int>) -> Unit,
     onDeleteImages: (List<ManagedCacheItem>) -> Unit,
-    onRegenerateImages: (List<Int>) -> Unit,
+    onRegenerateImages: (List<ManagedCacheItem>) -> Unit,
+    onGenerateImages: (List<Int>) -> Unit,
 ) {
     val lang = state.settings.language
     val density = LocalDensity.current
@@ -6033,6 +6235,7 @@ private fun GalleryScreen(
                         onSaveImages = onSaveImages,
                         onDeleteImages = onDeleteImages,
                         onRegenerateImages = onRegenerateImages,
+                        onGenerateImages = onGenerateImages,
                         onGeneratedSelectionChange = { generatedSelectionActions = it },
                     )
                 }
@@ -6165,7 +6368,8 @@ private fun GalleryScreen(
             val actions = generatedSelectionActions.takeIf { state.homeTab == "generated" }
             if (actions != null) {
                 ManageSelectionActions(actions.count, lang, actions.onClear, actions.onSelectAll, actions.onSave, actions.onRegenerate, actions.onDelete,
-                    confirmChanges = !(state.generatedTab == "images" && state.selectedGeneratedVersion == null))
+                    confirmChanges = !(state.generatedTab == "images" && state.selectedGeneratedVersion == null),
+                    onGenerate = actions.onGenerate, imageReplacement = actions.imageReplacement)
             } else if (selectedKeys.isNotEmpty()) {
                 Column(Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
                     Text(lang.t("已选 ${selectedKeys.size} 项 · 仅处理已生成图片", "${selectedKeys.size} selected · generated photos only"), style = MaterialTheme.typography.labelMedium)
@@ -6691,7 +6895,8 @@ private fun ManageScreen(
     onRegenerateVideos: (List<Int>) -> Unit,
     onSaveImages: (List<Int>) -> Unit,
     onDeleteImages: (List<ManagedCacheItem>) -> Unit,
-    onRegenerateImages: (List<Int>) -> Unit,
+    onRegenerateImages: (List<ManagedCacheItem>) -> Unit,
+    onGenerateImages: (List<Int>) -> Unit,
     onGeneratedSelectionChange: (GeneratedSelectionActionsState?) -> Unit = {},
 ) {
     val lang = state.settings.language
@@ -6743,9 +6948,9 @@ private fun ManageScreen(
         AlertDialog(
             onDismissRequest = { versionsToRegenerate = null },
             title = { Text(lang.t("重新生成 ${indexes.size} 张图片？", "Regenerate ${indexes.size} images?")) },
-            text = { Text(lang.t("使用当前设置；同一原图只入队一次。覆盖当前参数版本，其他版本保留，不开启邻图预加载。", "Use current settings, once per source image. Replace the current parameter version and keep other versions. No neighbor prefetch.")) },
+            text = { Text(lang.t("使用当前设置；同一原图只入队一次。完整成功后仅替换选中的旧结果，失败保留。其他历史版本和原图保留，不开启邻图预加载。", "Use current settings once per source. Replace only selected old results after success; keep them on failure. Other versions and originals stay. No neighbor prefetch.")) },
             confirmButton = { Button(enabled = indexes.isNotEmpty(), onClick = {
-                onRegenerateImages(indexes)
+                onRegenerateImages(state.managedCacheItems.filter { it.entry.version in versions })
                 selectedVersions = emptySet()
                 versionsToRegenerate = null
             }) { Text(lang.t("重新生成", "Regenerate")) } },
@@ -6822,6 +7027,7 @@ private fun ManageScreen(
                     onSelectAll = { selectedVideoKeys = videos.mapTo(linkedSetOf()) { it.cacheKey } },
                     onSave = { onSaveVideos(selectedIndexes); selectedVideoKeys = emptySet() },
                     onRegenerate = { onRegenerateVideos(selectedIndexes); selectedVideoKeys = emptySet() },
+                    imageReplacement = false,
                     onDelete = { onDeleteVideos(selectedIndexes); selectedVideoKeys = emptySet() },
                 )
                 Spacer(Modifier.height(8.dp))
@@ -6912,6 +7118,8 @@ private fun ManageScreen(
                                     onSelectAll = { selectedVersions = state.cacheVersions.mapTo(linkedSetOf()) { it.version } },
                                     onSave = null,
                                     onRegenerate = { versionsToRegenerate = versions },
+                                    onGenerate = { onGenerateImages(GeneratedSelectionScope.regenerationIndexes(state.photos.map { it.cacheKey }, state.managedCacheItems.map { it.entry.photoKey to it.entry.version }, versions)); selectedVersions = emptySet() },
+                                    imageReplacement = true,
                                     onDelete = { versionsToDelete = versions },
                                 )
                             },
@@ -6922,7 +7130,8 @@ private fun ManageScreen(
                             onClear = { selectedVersions = emptySet() },
                             onSelectAll = { selectedVersions = state.cacheVersions.mapTo(linkedSetOf()) { it.version } },
                             onSave = null, onRegenerate = { versionsToRegenerate = selectedVersions },
-                            onDelete = { versionsToDelete = selectedVersions }, confirmChanges = false)
+                            onDelete = { versionsToDelete = selectedVersions }, confirmChanges = false,
+                            onGenerate = { onGenerateImages(GeneratedSelectionScope.regenerationIndexes(state.photos.map { it.cacheKey }, state.managedCacheItems.map { it.entry.photoKey to it.entry.version }, selectedVersions)); selectedVersions = emptySet() })
                     }
                     val versionGridState = rememberLazyGridState(
                         initialFirstVisibleItemIndex = state.generatedImageScrollIndex.coerceAtLeast(0),
@@ -7015,7 +7224,9 @@ private fun ManageScreen(
                                         onClear = { selectedImageKeys = emptySet() },
                                         onSelectAll = { selectedImageKeys = itemsInVersion.mapTo(linkedSetOf()) { "${it.entry.photoKey}|${it.entry.version}" } },
                                         onSave = { onSaveImages(selectedImageIndexes); selectedImageKeys = emptySet() },
-                                        onRegenerate = { onRegenerateImages(selectedImageIndexes); selectedImageKeys = emptySet() },
+                                        onRegenerate = { onRegenerateImages(selectedItems); selectedImageKeys = emptySet() },
+                                        onGenerate = { onGenerateImages(selectedImageIndexes); selectedImageKeys = emptySet() },
+                                        imageReplacement = true,
                                         onDelete = { onDeleteImages(selectedItems); selectedImageKeys = emptySet() },
                                     ),
                                 )
@@ -7030,7 +7241,9 @@ private fun ManageScreen(
                                 onClear = { selectedImageKeys = emptySet() },
                                 onSelectAll = { selectedImageKeys = itemsInVersion.mapTo(linkedSetOf()) { "${it.entry.photoKey}|${it.entry.version}" } },
                                 onSave = { onSaveImages(selectedImageIndexes); selectedImageKeys = emptySet() },
-                                onRegenerate = { onRegenerateImages(selectedImageIndexes); selectedImageKeys = emptySet() },
+                                onRegenerate = { onRegenerateImages(selectedItems); selectedImageKeys = emptySet() },
+                                        onGenerate = { onGenerateImages(selectedImageIndexes); selectedImageKeys = emptySet() },
+                                        imageReplacement = true,
                                 onDelete = { onDeleteImages(selectedItems); selectedImageKeys = emptySet() },
                             )
                             Spacer(Modifier.height(8.dp))
@@ -7106,10 +7319,12 @@ private fun cacheVersionTitle(version: String, lang: AppLanguage): String {
         version.contains("_depthV7_") -> lang.t("居中平滑", "Centered")
         else -> lang.t("旧版兼容", "Legacy")
     }
-    val scale = Regex("_s([0-9]+)_").find(version)?.groupValues?.get(1) ?: "—"
+    val scale = Regex("_s([0-9.]+)_").find(version)?.groupValues?.get(1) ?: "—"
     val edge = Regex("_m([0-9]+)_").find(version)?.groupValues?.get(1) ?: "—"
     val upscale = if (version.contains("_du1_")) lang.t(" · 深度放大", " · Upsampled depth") else ""
-    return lang.t("$mode · 强度 $scale\n${edge}px$upscale", "$mode · Scale $scale\n${edge}px$upscale")
+    val strength = if (version.contains("_eq1050")) lang.t("默认 · V10 50", "Default · V10 50") else lang.t("强度 $scale", "Scale $scale")
+    val take = Regex("_take([A-Za-z0-9-]+)_").find(version)?.groupValues?.get(1)?.take(4)?.let { lang.t(" · 副本 $it", " · Copy $it") }.orEmpty()
+    return "$mode · $strength\n${edge}px$upscale$take"
 }
 @Composable
 private fun GeneratedVersionTile(
@@ -7203,6 +7418,8 @@ private fun ManageSelectionActions(
     onRegenerate: (() -> Unit)?,
     onDelete: () -> Unit,
     confirmChanges: Boolean = true,
+    onGenerate: (() -> Unit)? = null,
+    imageReplacement: Boolean = true,
 ) {
     var pending by remember { mutableStateOf<String?>(null) }
     Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)) {
@@ -7213,16 +7430,18 @@ private fun ManageSelectionActions(
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = onSelectAll) { Text(lang.t("全选", "Select all")) }
             onSave?.let { TextButton(onClick = it) { Text(lang.t("保存副本", "Save copies")) } }
+            onGenerate?.let { action -> TextButton(onClick = { pending = "additional" }) { Text(lang.t("使用新参数生成", "Generate with new parameters")) } }
             onRegenerate?.let { action -> TextButton(onClick = { if (confirmChanges) pending = "regenerate" else action() }) { Text(lang.t("重新生成", "Regenerate")) } }
             TextButton(onClick = { if (confirmChanges) pending = "delete" else onDelete() }) { Text(lang.t("删除结果", "Delete results"), color = MaterialTheme.colorScheme.error) }
         }
     }
     pending?.let { action ->
         val deleting = action == "delete"
+        val additional = action == "additional"
         AlertDialog(onDismissRequest = { pending = null },
-            title = { Text(if (deleting) lang.t("删除所选 $count 项结果？", "Delete $count selected results?") else lang.t("重新生成所选 $count 项？", "Regenerate $count selected items?")) },
-            text = { Text(if (deleting) lang.t("仅删除所选生成结果并取消相关任务，不删除系统原图。", "Only selected generated results and related jobs are removed. Original media is kept.") else lang.t("使用当前设置重做所选项，可能覆盖目标参数版本；不启动邻图预加载，不改写系统原图。", "Regenerate the selection with current settings; the target parameter version may be replaced. No neighbor prefetch or original-media writes.")) },
-            confirmButton = { Button(onClick = { pending = null; if (deleting) onDelete() else onRegenerate?.invoke() }) { Text(lang.t("确认", "Confirm")) } },
+            title = { Text(if (deleting) lang.t("删除所选 $count 项结果？", "Delete $count selected results?") else if (additional) lang.t("使用新参数生成所选 $count 项？", "Generate $count selected items with new parameters?") else lang.t("重新生成所选 $count 项？", "Regenerate $count selected items?")) },
+            text = { Text(if (deleting) lang.t("仅删除所选生成结果并取消相关任务，不删除系统原图。", "Only selected generated results and related jobs are removed. Original media is kept.") else if (additional) lang.t("按当前设置另存新结果，全部旧结果和原图保留。同一原图只入队一次，不开启邻图预加载。", "Create separate results with current settings. Keep all old results and originals; once per source, without neighbor prefetch.") else if (!imageReplacement) lang.t("按当前设置清理并重新生成所选视频缓存；失败需重试。系统原视频不修改。", "Clear and regenerate selected video cache with current settings; retry on failure. Original videos are unchanged.") else lang.t("使用当前设置生成成功后，仅替换选中的旧结果；失败保留。其他历史版本和原图保留，不启动邻图预加载。", "Replace only the selected old results after success. Keep them on failure. Other historical versions and originals stay; no neighbor prefetch.")) },
+            confirmButton = { Button(onClick = { pending = null; if (deleting) onDelete() else if (additional) onGenerate?.invoke() else onRegenerate?.invoke() }) { Text(lang.t("确认", "Confirm")) } },
             dismissButton = { TextButton(onClick = { pending = null }) { Text(lang.t("取消", "Cancel")) } },
         )
     }
@@ -7262,6 +7481,9 @@ private fun SettingsScreen(
     updateApkPath: String?,
     onBack: () -> Unit,
     onChange: (AppSettings) -> Unit,
+    onSaveDefault: () -> Boolean,
+    onResetDefault: () -> Unit,
+    onFactoryDefault: () -> Unit,
     onCheckUpdate: () -> Unit,
     onDownloadUpdate: () -> Unit,
     onInstallUpdate: () -> Unit,
@@ -7269,6 +7491,9 @@ private fun SettingsScreen(
     val lang = settings.language
     val context = LocalContext.current
     var section by rememberSaveable { mutableStateOf("general") }
+    var defaultSaved by remember(settings.edgeMode) { mutableStateOf(false) }
+    var defaultSaveFailed by remember(settings.edgeMode) { mutableStateOf(false) }
+    LaunchedEffect(settings) { defaultSaved = false; defaultSaveFailed = false }
     StudioPage {
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, lang.t("返回", "Back")) }
@@ -7311,19 +7536,31 @@ private fun SettingsScreen(
             }
             "depth" -> {
                 StudioCard(lang.t("边缘与视差", "Edges & disparity")) {
-                    SettingChoice(lang.t("投影与边缘模式", "Projection & edge mode"), settings.edgeMode, listOf(DepthEdgeMode.COMFY_SUBPIXEL_V11, DepthEdgeMode.COMFY_LEGACY_V10, DepthEdgeMode.REFERENCE_V9, DepthEdgeMode.LEGACY_V6, DepthEdgeMode.CENTERED_V7, DepthEdgeMode.REFERENCE_V8), { when (it) { DepthEdgeMode.LEGACY_V6 -> lang.t("旧版兼容 · depthV6", "Legacy · depthV6"); DepthEdgeMode.CENTERED_V7 -> lang.t("居中平滑 · depthV7", "Centered · depthV7"); DepthEdgeMode.REFERENCE_V8 -> lang.t("参考旧结果 · 1.3.00", "Reference · 1.3.00"); DepthEdgeMode.REFERENCE_V9 -> lang.t("参考新版 · 平滑轮廓", "Reference · smooth contours"); DepthEdgeMode.COMFY_LEGACY_V10 -> lang.t("ComfyUI 主节点 · 原样兼容", "ComfyUI main · compatible"); DepthEdgeMode.COMFY_SUBPIXEL_V11 -> lang.t("ComfyUI 主节点 · 亚像素", "ComfyUI main · subpixel") } }) { onChange(settings.copy(edgeMode = it)) }
+                    SettingChoice(lang.t("投影与边缘模式", "Projection & edge mode"), settings.edgeMode, listOf(DepthEdgeMode.COMFY_LEGACY_V10, DepthEdgeMode.LEGACY_V6, DepthEdgeMode.COMFY_SUBPIXEL_V11, DepthEdgeMode.REFERENCE_V9, DepthEdgeMode.CENTERED_V7, DepthEdgeMode.REFERENCE_V8), { when (it) { DepthEdgeMode.LEGACY_V6 -> lang.t("旧版兼容 · depthV6", "Legacy · depthV6"); DepthEdgeMode.CENTERED_V7 -> lang.t("居中平滑 · depthV7", "Centered · depthV7"); DepthEdgeMode.REFERENCE_V8 -> lang.t("参考旧结果 · 1.3.00", "Reference · 1.3.00"); DepthEdgeMode.REFERENCE_V9 -> lang.t("参考新版 · 平滑轮廓", "Reference · smooth contours"); DepthEdgeMode.COMFY_LEGACY_V10 -> lang.t("ComfyUI 主节点 · 原样兼容", "ComfyUI main · compatible"); DepthEdgeMode.COMFY_SUBPIXEL_V11 -> lang.t("ComfyUI 主节点 · 亚像素", "ComfyUI main · subpixel") } }) { onChange(settings.copy(edgeMode = it)) }
+                    SettingHelp(lang.t("各模式独立保存视觉参数，切换自动恢复。默认以 V10 深度 50 为基准，按每张图的深度跨度和实际眼宽自动换算强度；轮廓、遮挡和会聚位置仍有差异。GPU 与队列设置共用。", "Each mode remembers its visual controls. Defaults automatically match the per-image disparity span of V10 scale 50 at the decoded eye width. Occlusion and convergence still differ. GPU and queue controls stay shared."))
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { defaultSaved = onSaveDefault(); defaultSaveFailed = !defaultSaved }) { Text(lang.t("保存为默认值", "Save as default")) }
+                        OutlinedButton(onClick = onResetDefault) { Text(lang.t("恢复此模式默认值", "Restore this mode's defaults")) }
+                        TextButton(onClick = onFactoryDefault) { Text(lang.t("恢复内置默认", "Restore built-in defaults")) }
+                    }
+                    if (defaultSaved) SettingHelp(lang.t("已保存当前模式的视觉参数；其他模式、GPU 和队列设置不变。", "Saved this mode's visual controls. Other modes, GPU and queue controls stay."))
+                    if (defaultSaveFailed) Text(lang.t("默认值保存失败，请检查存储空间", "Could not save defaults; check device storage"), color = MaterialTheme.colorScheme.error)
+                    if (settings.matchV10Default) {
+                        SettingHelp(lang.t("默认强度：自动匹配 V10 · 50。按 P90−P10 深度跨度换算，实际原生强度见单图调试和对比页。它是默认行为，不需要应用对照参数；不会改写旧结果。", "Default strength: automatically match V10 · 50 using the P90−P10 depth span. Actual native strength is shown in diagnostics/comparison. No comparison preset is required; existing results stay."))
+                        TextButton(onClick = { onChange(settings.copy(matchV10Default = false)) }) { Text(lang.t("改为自定此模式强度", "Set native strength manually")) }
+                    }
+
                     if (!settings.edgeMode.isReference && !settings.edgeMode.isComfyMain) SettingHelp(lang.t("旧版保留历史非对称取样与位移幅度；居中模式相同强度下可能产生更大视差。两种缓存独立保存，切换不会重做已有结果。", "Legacy keeps historical asymmetric sampling and gain. Centered may produce more disparity at the same strength. Both caches remain separate; switching does not regenerate results."))
                     if (settings.edgeMode.isComfyMain) {
-                        SettingHelp(lang.t("对照 ComfyUI 主节点 Legacy（Fast 关闭）：左眼投影、右眼原图，最终眼图深度使用双三次恢复与 Gaussian。建议强度 40/60、窗口 3、反转开启；单位与外部深度参考模式不同。切换不会重做旧结果。", "Matches the ComfyUI main Legacy path (Fast off): projected left eye, original right eye, cubic depth restoration and Gaussian at eye size. Try scale 40/60, window 3, invert on. Units differ from External mode; old results are retained."))
+                        SettingHelp(lang.t("对照 ComfyUI 主节点 Legacy（Fast 关闭）：左眼投影、右眼原图，最终眼图深度使用双三次恢复与 Gaussian。默认基准强度 50、窗口 3、反转开启；单位与外部深度参考模式不同。切换不会重做旧结果。", "Matches the ComfyUI main Legacy path (Fast off): projected left eye, original right eye, cubic depth restoration and Gaussian at eye size. Defaults use scale 50, window 3 and invert on. Units differ from External mode; old results are retained."))
                         if (settings.edgeMode == DepthEdgeMode.COMFY_SUBPIXEL_V11) SettingHelp(lang.t("亚像素保留浮点位移，按深度和覆盖率处理轮廓及补洞，不使用 Telea。边缘更平滑但计算较慢，复杂遮挡仍可能异常；不保证所有素材更优。", "Subpixel retains floating shifts and uses depth/coverage for edges and filling, without Telea. It costs more CPU time and can still fail at complex occlusions."))
                         else SettingHelp(lang.t("原样兼容保留整数位移、从左到右覆盖及位移 + 10 像素填充；与 PC 使用同一深度时输出一致，但仍可能有台阶或拉伸。", "Compatible keeps integer shifts, forward overwrite order and shift + 10 fill. It matches the PC given the same depth, including possible steps/stretching."))
-                        OutlinedButton(onClick = { onChange(settings.copy(depthScale = 60f, blurRadius = 3, invertDepth = true, depthUpscale = settings.depthUpscale.copy(enabled = false))) }) { Text(lang.t("使用对照参数：60 / 3 / 反转", "Comparison preset: 60 / 3 / invert")) }
-                        SettingHelp(lang.t("上方预设还会关闭额外深度放大；GPU、输出尺寸及其他设置保留。先明确选择，再生成所需图片，不会自动重算整库。", "This preset also disables additional depth upsampling. GPU, output size and other settings stay. It does not regenerate the library."))
+
                     }
                     if (settings.edgeMode == DepthEdgeMode.REFERENCE_V9) SettingHelp(lang.t("修正轮廓采样：先连续恢复浮点深度，再投影并用 Telea 3px 补洞。强度 5 约为图宽 1%。旧结果保留；遮挡区域仍可能模糊。", "Restores continuous float depth before projection and Telea 3px filling. Scale 5 is about 1% width. Existing results stay available; occluded regions can remain soft."))
-                    else if (settings.edgeMode.isReference) SettingHelp(lang.t("参考当前上游外部深度 V2.2：左眼原图，右眼按图宽比例右移，遮挡洞使用 Telea 3px 修补。强度 5 约为图宽 1%，建议从 5 开始；不是旧版强度单位。此模式不使用旧滤波窗口和边缘填充，模型仍为原稳定模型。", "Current upstream external-depth V2.2: static left eye, width-relative right-eye projection and Telea 3px hole filling. Scale 5 means about 1% width; start at 5. These are not legacy units. Legacy filter/fill controls do not apply; the stable depth model is unchanged."))
-                    SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, (if (settings.edgeMode.isReference) listOf(1f, 2f, 5f, 10f, 20f, 30f, 50f) else listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f))) { onChange(settings.copy(depthScale = it)) }
-                    if (!settings.edgeMode.isReference) SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。强度 40/60 用于当前工作流对照；较大位移仍会放大遮挡缺陷。", "Main-node units: depth × 255 × scale / eye width, not a fixed percentage. Scales 40/60 match the comparison workflow; larger shifts expose more occlusion defects.") else lang.t("控制水平位移，不是清晰度；越大立体感越强，也越容易拉伸轮廓。旧版单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。", "Controls disparity, not sharpness. Higher values increase depth and edge stretching. Legacy units: depth × 255 × scale / eye width; not a fixed percentage."))
+                    else if (settings.edgeMode.isReference) SettingHelp(lang.t("参考当前上游外部深度 V2.2：左眼原图，右眼按图宽比例右移，遮挡洞使用 Telea 3px 修补。原生强度 5 约为图宽 1%；默认根据 V10 的 50 自动换算，不是旧版强度单位。此模式不使用旧滤波窗口和边缘填充，模型仍为原稳定模型。", "Current upstream external-depth V2.2: static left eye, width-relative right-eye projection and Telea 3px hole filling. Scale 5 means about 1% width; defaults convert from V10 scale 50. These are not legacy units. Legacy filter/fill controls do not apply; the stable depth model is unchanged."))
+                    if (!settings.matchV10Default) SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, (if (settings.edgeMode.isReference) listOf(1f, 2f, 5f, 10f, 20f, 30f, 50f) else if (settings.edgeMode.isComfyMain) listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f, 100f) else listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f, 100f, 112.5f, 150f))) { onChange(settings.copy(depthScale = it, matchV10Default = false)) }
+                    if (!settings.edgeMode.isReference) SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。默认基准为 50；较大位移仍会放大遮挡缺陷。", "Main-node units: depth × 255 × scale / eye width, not a fixed percentage. The default baseline is 50; larger shifts expose more occlusion defects.") else lang.t("控制水平位移，不是清晰度；越大立体感越强，也越容易拉伸轮廓。旧版单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。", "Controls disparity, not sharpness. Higher values increase depth and edge stretching. Legacy units: depth × 255 × scale / eye width; not a fixed percentage."))
                     if (!settings.edgeMode.isReference) {
                     SettingInt(if (settings.edgeMode.isComfyMain) lang.t("最终深度平滑窗口", "Final depth Gaussian window") else lang.t("深度图滤波窗口", "Depth filter window"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) { onChange(settings.copy(blurRadius = it)) }
                     SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点在实际单眼尺寸上执行 Gaussian，3 表示 3×3；0/1 不滤波。额外深度放大先执行，与旧模式滤波顺序不同。", "Main applies Gaussian at actual eye size: 3 means 3×3, 0/1 bypass. Optional upsampling runs first, separately from legacy filter order.") else lang.t("3 表示 3×3 窗口，不是插值次数；0/1 不滤波。默认在 518×518 深度图处理，先放大后平滑则作用于放大图。大窗口可能混合前后景。", "3 means a 3×3 window, not interpolation passes. 0/1 bypass. Filtering normally uses the 518×518 map; resize-first filters the larger map. Large windows can blend foreground and background."))
@@ -7332,7 +7569,9 @@ private fun SettingsScreen(
                     SettingHelp(lang.t("水平填充，不是 AI 补画。0 按 1 像素写入，较大值可能拉宽人物边缘。", "Horizontal fill, not AI inpainting. 0 writes one pixel. Wider fill can stretch silhouettes."))
                     }
                     }
-                    StudioSwitch(lang.t("反转深度", "Invert depth"), if (settings.edgeMode.isComfyMain) lang.t("沿用主节点复选框含义；本次对照为开启", "Uses the main-node checkbox convention; comparison uses on") else lang.t("将 d 改为 1-d；不交换左右眼", "Uses 1-d; does not swap eyes"), settings.invertDepth) { onChange(settings.copy(invertDepth = it)) }
+                    StudioSwitch(lang.t("反转模型输入深度", "Invert model input depth"), lang.t("模型深度预览应近白远黑；确认近处为黑时才开启。稳定模型在本轮三张人像和官方示例中原始方向均为近白。", "Model preview should be near-white/far-black. Enable only when near regions are black. The stable model was near-white in the four checked samples."), settings.invertModelDepth) { onChange(settings.copy(invertModelDepth = it)) }
+                    StudioSwitch(lang.t("投影深度反转", "Projection depth inversion"), lang.t("与模型输入方向分开。V6/V7 默认关；V10/V11 默认开；External 默认开以配合右眼投影，投影图近黑仍可产生正确的相对远近。查看调试深度图确认。", "Separate from model polarity. V6/V7 default off, V10/V11 on; External on compensates for its opposite projected eye. Its near-black projection can still give correct relative stereo depth."), settings.invertDepth) { onChange(settings.copy(invertDepth = it)) }
+
                 }
                 StudioCard(lang.t("深度放大", "Depth upsampling")) {
                     DepthUpscaleControls(settings.depthUpscale, lang, settings.edgeMode.isComfyMain) { onChange(settings.copy(depthUpscale = it)) }
@@ -7521,10 +7760,10 @@ private fun SettingInt(title: String, value: Int, options: List<Int>, onChange: 
 
 @Composable
 private fun SettingFloat(title: String, value: Float, options: List<Float>, onChange: (Float) -> Unit) {
-    SettingChoice(title, value, options, { it.roundToInt().toString() }, onChange)
+    SettingChoice(title, value, options, { if (it == it.roundToInt().toFloat()) it.roundToInt().toString() else "%.3f".format(Locale.US, it).trimEnd('0').trimEnd('.') }, onChange)
 }
 
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 private fun ViewerScreen(
     state: UiState,
@@ -7618,8 +7857,9 @@ private fun ViewerScreen(
         viewerItems.getOrNull(pagerState.settledPage)?.first?.let(onIndexChanged)
     }
     var controlsVisible by remember { mutableStateOf(true) }
-    LaunchedEffect(controlsVisible, state.vrMode, pagerState.currentPage) {
-        if (state.vrMode && controlsVisible) {
+    var controlsHeld by remember { mutableStateOf(false) }
+    LaunchedEffect(controlsVisible, state.vrMode, pagerState.currentPage, controlsHeld) {
+        if (state.vrMode && controlsVisible && !controlsHeld) {
             delay(3000)
             controlsVisible = false
         }
@@ -7683,21 +7923,29 @@ private fun ViewerScreen(
             }
         }
         if (controlsVisible) {
-            FlowRow(
-                modifier = Modifier.align(Alignment.TopStart).fillMaxWidth().background(MaterialTheme.colorScheme.surface.copy(alpha = 0.94f)).safeDrawingPadding().padding(horizontal = 12.dp, vertical = 6.dp),
-                verticalArrangement = Arrangement.Center,
+            Row(
+                modifier = Modifier.align(Alignment.TopStart).fillMaxWidth().background(MaterialTheme.colorScheme.surface.copy(alpha = 0.94f)).safeDrawingPadding().padding(horizontal = 12.dp, vertical = 6.dp)
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                            controlsHeld = true
+                            try { while (awaitPointerEvent(PointerEventPass.Final).changes.any { it.pressed }) { /* children handle the action */ } }
+                            finally { controlsHeld = false }
+                        }
+                    },
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                IconButton(onClick = onClose) { Icon(Icons.Default.Close, lang.t("返回", "Back")) }
+                IconButton(onClick = onClose) { Icon(Icons.Default.Close, lang.t("返回", "Back"), tint = MaterialTheme.colorScheme.onSurface) }
                 Spacer(Modifier.width(8.dp))
                 val currentPair = viewerItems.getOrNull(pagerState.currentPage)
                 val currentIndex = currentPair?.first ?: startIndex
                 val currentItem = currentPair?.second
                 Text(
                     text = currentItem?.displayName.orEmpty(),
-                    color = androidx.compose.ui.graphics.Color.White,
+                    color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.weight(1f).combinedClickable(onClick = {}, onLongClick = { onOpenDebug(currentIndex) }),
                 )
                 val currentVideoState = currentItem?.takeIf { it.kind == MediaKind.VIDEO }?.let { state.videoStates[it.cacheKey] ?: VideoVrState.NORMAL }
                 val vrButtonEnabled = if (currentVideoState != null) {
@@ -7726,7 +7974,9 @@ private fun ViewerScreen(
                     )
                 }
                 Spacer(Modifier.width(8.dp))
-                SelectionActionIcon(Icons.Default.ListAlt, lang.t("诊断", "Diagnostics")) { onOpenDebug(currentIndex) }
+                OutlinedButton(onClick = { onOpenDebug(currentIndex) }, contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp)) {
+                    Text(lang.t("调试", "Debug"), maxLines = 1)
+                }
             }
             val current = viewerItems.getOrNull(pagerState.currentPage)?.second
             if (!generatedViewer && state.vrMode && current?.kind != MediaKind.VIDEO) Column(
@@ -7782,11 +8032,14 @@ private fun DebugScreen(
     state: UiState,
     index: Int,
     onBack: () -> Unit,
+    onCompare: () -> Unit,
+    onGenerate: () -> Unit,
+    onRegenerate: () -> Unit,
     onShare: () -> Unit,
 ) {
     val lang = state.settings.language
     val photo = state.photos.getOrNull(index)
-    val entry = photo?.let { state.entries[it.cacheKey] }
+    val entry = photo?.let { p -> state.managedCacheItems.firstOrNull { it.entry.photoKey == p.cacheKey && it.entry.version == state.selectedGeneratedVersion }?.entry ?: state.entries[p.cacheKey] }
     val vrState = photo?.let { state.states[it.cacheKey] } ?: VrState.NORMAL
     val job = photo?.let { p -> state.jobs.firstOrNull { it.photoItem.cacheKey == p.cacheKey } }
     val isVideo = photo?.kind == MediaKind.VIDEO
@@ -7795,6 +8048,8 @@ private fun DebugScreen(
     val imageLogLines = remember(entry?.logPath, entry?.createdAt) { entry?.logPath?.let { readLastLines(File(it), 16) } ?: emptyList() }
     val imageParamsLines = remember(entry?.paramsPath, entry?.createdAt) { entry?.paramsPath?.let { readLastLines(File(it), 16) } ?: emptyList() }
     val imageTimings = remember(entry?.paramsPath, entry?.createdAt) { entry?.paramsPath?.let { readImageTimings(File(it)) } }
+    val recordedParams = remember(entry?.paramsPath, entry?.createdAt) { entry?.paramsPath?.let { runCatching { org.json.JSONObject(File(it).readText(Charsets.UTF_8)) }.getOrNull() } }
+
     val videoLogLines = remember(videoEntry?.logPath, videoEntry?.createdAt) { videoEntry?.logPath?.let { readLastLines(File(it), 18) } ?: emptyList() }
 
     Column(
@@ -7815,6 +8070,25 @@ private fun DebugScreen(
                 modifier = Modifier.weight(1f),
             )
             if (!isVideo && entry != null) SelectionActionIcon(Icons.Default.Share, lang.t("分享调试包（包含媒体）", "Share diagnostics (includes media)"), onShare)
+        }
+        if (!isVideo && recordedParams != null) {
+            DebugSection(lang.t("当前结果的实际参数", "Actual parameters of this result")) {
+                DebugLine(lang.t("模式", "Mode"), recordedParams.optString("edgeMode", "历史版本"))
+                DebugLine(lang.t("实际原生强度", "Actual native strength"), recordedParams.optDouble("effectiveDepthScale", recordedParams.optDouble("depthScale", 0.0)).toString())
+                DebugLine(lang.t("自动默认匹配", "Automatic defaults"), if (recordedParams.optBoolean("matchV10Default", false)) "V10 · 50 / P90−P10" else lang.t("自定或历史参数", "Custom or historical parameters"))
+            }
+        }
+        if (!isVideo && photo != null && !photo.generatedVirtual) {
+            Button(onClick = onCompare, modifier = Modifier.fillMaxWidth()) { Text(lang.t("六模式临时对比", "Compare six modes temporarily")) }
+            Text(lang.t("仅这张图，不写成品库、不改参数；快速切换保留双眼缩放与位置。", "Only this image. No library/settings changes; switching preserves both-eye zoom and pan."), style = MaterialTheme.typography.bodySmall)
+            var confirmReplace by remember { mutableStateOf(false) }
+            OutlinedButton(onClick = onGenerate, modifier = Modifier.fillMaxWidth()) { Text(lang.t("使用新参数生成（保留旧结果）", "Generate with new parameters (keep old results)")) }
+            if (entry != null) OutlinedButton(onClick = { confirmReplace = true }, modifier = Modifier.fillMaxWidth()) { Text(lang.t("重新生成（替换当前旧结果）", "Regenerate (replace this result)")) }
+            if (confirmReplace) AlertDialog(onDismissRequest = { confirmReplace = false },
+                title = { Text("重新生成当前结果？") },
+                text = { Text("按当前设置生成成功后，仅替换当前查看的这一个旧结果。失败保留旧结果；其他历史版本和原图保留。") },
+                confirmButton = { Button(onClick = { confirmReplace = false; onRegenerate() }) { Text("重新生成") } },
+                dismissButton = { TextButton(onClick = { confirmReplace = false }) { Text("取消") } })
         }
         Spacer(Modifier.height(8.dp))
         Text(
@@ -7902,9 +8176,14 @@ private fun DebugScreen(
                     DebugLine("Log", imageTimings?.writeLogMs?.let { "${it}ms" } ?: "-")
                     DebugLine(lang.t("总耗时", "Total"), imageTimings?.totalMs?.let { "${it}ms" } ?: "-")
                 }
+                val modelDepthFile = entry?.let { File(File(it.paramsPath).parentFile, "model_depth.png") }?.takeIf { it.isFile }
+                SettingHelp(lang.t("模型深度以近白远黑检查；投影深度包含该模式的眼序/反转约定。历史结果没有模型深度文件时显示暂无，不自动重算。", "Check model depth as near-white/far-black. Projection depth includes mode/eye-order inversion. Missing historical model maps stay unavailable without automatic regeneration."))
                 Row(Modifier.fillMaxWidth().height(260.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     DebugImagePanel(lang.t("原图", "Source"), photo?.uri, Modifier.weight(1f), lang)
-                    DebugImagePanel(lang.t("深度图", "Depth"), entry?.let { Uri.fromFile(File(it.depthPath)) }, Modifier.weight(1f), lang)
+                    DebugImagePanel(lang.t("模型深度 · 近白远黑", "Model · near white"), modelDepthFile?.let { Uri.fromFile(it) }, Modifier.weight(1f), lang)
+                }
+                Row(Modifier.fillMaxWidth().height(260.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    DebugImagePanel(lang.t("投影深度 · 含模式反转", "Projection · mode inversion"), entry?.let { Uri.fromFile(File(it.depthPath)) }, Modifier.weight(1f), lang)
                     DebugImagePanel("Left/VR", entry?.let { Uri.fromFile(File(if (it.hasSplitEyes) it.leftPath else it.outputPath)) }, Modifier.weight(1f), lang)
                 }
                 Spacer(Modifier.height(8.dp))
@@ -7994,7 +8273,7 @@ private fun readImageTimings(file: File): GenerationTimings? {
 @Composable
 private fun DebugImagePanel(title: String, uri: Uri?, modifier: Modifier = Modifier, lang: AppLanguage = AppLanguage.ZH) {
     Column(modifier) {
-        Text(title, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelMedium)
+        Text(title, color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.labelMedium)
         Spacer(Modifier.height(4.dp))
         if (uri == null) {
             Box(
@@ -8143,17 +8422,19 @@ private fun SyncSplitZoomImage(
 }
 
 @Composable
-private fun SyncStereoZoomContent(
+internal fun SyncStereoZoomContent(
     left: ImageBitmap,
     right: ImageBitmap,
     gestureKey: Any,
     modifier: Modifier = Modifier,
     onTap: () -> Unit,
     onZoomChanged: (Float) -> Unit = {},
+    onTransformChanged: (Float, Offset) -> Unit = { _, _ -> },
 ) {
     var scale by remember(gestureKey) { mutableStateOf(1f) }
     LaunchedEffect(scale) { onZoomChanged(scale) }
     var offset by remember(gestureKey) { mutableStateOf(Offset.Zero) }
+    LaunchedEffect(scale, offset) { onTransformChanged(scale, offset) }
     var viewportSize by remember(gestureKey) { mutableStateOf(IntSize.Zero) }
     var lastTapAt by remember(gestureKey) { mutableStateOf(0L) }
     val imageModifier = Modifier
@@ -9441,7 +9722,9 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, outputWi
         .put("sourceWidth", source.width).put("sourceHeight", source.height)
         .put("outputWidth", outputWidth).put("outputHeight", outputHeight)
         .put("depthModel", depthModel).put("outputMode", "SPLIT_EYES_JPEG_Q$IMAGE_EYE_JPEG_QUALITY")
-        .put("depthScale", depthScale.toDouble()).put("blurRadius", blurRadius).put("edgeMode", edgeMode.name)
+        .put("invertModelDepth", invertModelDepth).put("expectedModelDepthConvention", "near-white / far-black; explicit input polarity")
+        .put("projectionNearWhiteForCanonicalInput", DepthDirection.projectionNearWhite(edgeMode, invertDepth))
+        .put("depthScale", depthScale.toDouble()).put("effectiveDepthScale", effectiveScale(source.width, depth).toDouble()).put("matchV10Default", matchV10Default).put("blurRadius", blurRadius).put("edgeMode", edgeMode.name)
         .put("fillRadius", fillRadius).put("invertDepth", invertDepth).put("maxLongEdge", maxLongEdge)
         .put("modelThreads", modelThreads).put("useGpu", useGpu).put("gpuTestMode", gpuTestMode.name)
         .put("forceGpuNoFallback", forceGpuNoFallback).put("inpaintMode", inpaintMode).put("quality", quality)
@@ -9464,11 +9747,11 @@ internal fun VrGenerationParams.depthSessionKey(): String =
     "$depthModel|threads=${modelThreads.coerceIn(1, 8)}|gpu=$useGpu|gpuMode=$gpuTestMode|force=$forceGpuNoFallback"
 
 internal fun VrGenerationParams.visualGenerationVersion(): String {
-    val scale = depthScale.roundToInt()
+    val scale = if (depthScale == depthScale.roundToInt().toFloat()) depthScale.roundToInt().toString() else depthScale.toString()
     val invert = if (invertDepth) "inv1" else "inv0"
     val gpu = if (useGpu) "gpu1" else "gpu0"
     val force = if (forceGpuNoFallback) "force1" else "force0"
-    return "${depthModel}_${edgeMode.cacheVersion}_s${scale}_b${blurRadius}_f${fillRadius}_${invert}_m${maxLongEdge}_t${modelThreads}_${gpu}_${gpuTestMode}_$force${depthUpscale.cacheSuffix()}"
+    return "${depthModel}_${edgeMode.cacheVersion}_s${scale}_b${blurRadius}_f${fillRadius}_${invert}_m${maxLongEdge}_t${modelThreads}_${gpu}_${gpuTestMode}_$force${depthUpscale.cacheSuffix()}${if (matchV10Default) "_eq1050" else ""}${if (invertModelDepth) "_di1" else ""}${if (resultVariant.isNotEmpty()) "_take${resultVariant}" else ""}"
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
 }
 

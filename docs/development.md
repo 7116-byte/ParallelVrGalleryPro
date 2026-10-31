@@ -1,8 +1,8 @@
 # 本机开发与交接
 
-正式项目：`E:\AI-Programme\ParallelVrGalleryPro`。恢复日期：2026-10-31（Asia/Shanghai）。历史恢复基线为 **1.2.00 / 10200**；当前版本为 **1.4.00 / 10400**，详见 [comfy-main-v1.4.00.md](comfy-main-v1.4.00.md)。恢复历史来自离线 bundle，origin 为 `https://github.com/7116-byte/ParallelVrGalleryPro.git`。
+正式项目：`E:\AI-Programme\ParallelVrGalleryPro`。恢复日期：2026-10-31（Asia/Shanghai）。历史恢复基线为 **1.2.00 / 10200**；当前版本为 **1.5.00 / 10500**，详见 [mode-profiles-v1.5.00.md](mode-profiles-v1.5.00.md)。恢复历史来自离线 bundle，origin 为 `https://github.com/7116-byte/ParallelVrGalleryPro.git`。
 
-1.3.00 / 1.3.01 发布验收保留在历史记录；当前 **1.4.00 / 10400**，先读 [主节点技术记录](comfy-main-v1.4.00.md) 及 [发布验收](releases/v1.4.00.md)。原有恢复资料保留；私密资产仍只在 `.local/`。
+先读 [模式参数与默认值](mode-profiles-v1.5.00.md) 及 [本版发布验收](releases/v1.5.00.md)，再读 [主节点技术记录](comfy-main-v1.4.00.md)。历史发布与恢复资料保留；私密资产仍只在 `.local/`。
 
 模式含义与画质证据需同时阅读 [六模式完整对比](mode-comparison-v1.4.00.md)。V6–V11 是内部算法/缓存标识，分属三组路线；同深度投影一致不代表整条桌面工作流或 JPEG 成品等效，更不构成六模式画质排名。
 
@@ -55,6 +55,10 @@ java -version
 恢复阶段已复用本机 GitHub 登录验证账号 7116-byte，未读取或打印 Token，当时未推送或发布。正式迭代的提交与发布另见 v1.3.00 验收记录。`.local/`、密钥、模型和缓存不入 Git。凭证由本机既有登录管理，归档不含账号登录态。Git 换行处理为仓库级 core.autocrlf=true，原快照字节保存在归档；不要将换行噪音误报为业务变更。
 
 ## 下一次继续开发
+
+v1.5.00 当前有 18 类、116 项 JVM 测试。模式档案与个人默认只保存视觉参数，共用模型/GPU/队列偏好。旧缓存标识在新选项关闭时不变；自动匹配、模型输入反转和独立副本分别追加 `_eq1050`、`_di1`、`_take…`。图片队列保存明确参数和替换目标，启动先恢复 `image_work` 的发布事务，再扫描成品。不得把替换改回“先删后生成”。
+
+Debug 的 `kind=modeProfiles` 对指定私密 QA 目录直接做六模式强制 GPU 对照，不启动图库；`kind=comparison` 只在指定 QA 相册检查实际加载完成后的缩放/位置及画面哈希；`kind=imageWrites` 只在合成 S1 副本验证新增、定向替换及实际读取失败。所有入口需要显式 `album/sample`，正式包不含测试入口。对比页必须等待可访问的“对比视口”出现后才注入手势，不能拿加载动画的哈希变化当验收通过。
 
 先检查 AGENTS.md、实际 git diff/status、本次恢复验收记录，再读四份版本文档。`edge-and-queue-v1.1.00.md` 中删除预加载黑名单已被 v1.1.01 撤销，以较新的说明及代码为准。队列、暂停原因、GenerationGuard、GPU 线程归属、强制 GPU、单源 SBS、滤波模式及深度放大缓存规则不得因恢复而改变。
 

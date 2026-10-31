@@ -30,6 +30,11 @@ public final class StudioGestureInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if(kind.equals("modeProfiles")) {
+                ModeProfilesQa.run(getTargetContext());
+                result.putString("qa", "PASS: isolated settings migration/cold restores; six real GPU modes and resolution cases; no gallery/queue writes");
+                finish(0,result);return;
+            }
             if(kind.equals("comfyPipeline")) {
                 File root=new File(getTargetContext().getExternalFilesDir(null),"PVG_QA_comfy_1400");
                 if(!root.isDirectory())throw new AssertionError("Explicit private QA directory missing");
@@ -190,6 +195,100 @@ public final class StudioGestureInstrumentation extends Instrumentation {
             }
             if (kind.equals("videoResume")) { click("生成"); click("视频"); click(sample); }
             else { click("相册"); click(album); click(sample); }
+            if(kind.equals("imageWrites")) {
+                if(!album.equals("PVG_QA_profiles_1500")||!sample.equals("PVG_QA_S1.jpg"))throw new AssertionError("Synthetic S1 fixture only");
+                click("调试");
+                long id=sampleId();long deadline=SystemClock.uptimeMillis()+40000;
+                java.util.Map<String,String> before;
+                do {before=qaImageHashes(id);if(!before.isEmpty())break;SystemClock.sleep(100);}while(SystemClock.uptimeMillis()<deadline);
+                if(before.isEmpty())throw new AssertionError("Synthetic base result missing");
+                click("使用新参数生成（保留旧结果）");
+                java.util.Map<String,String> added=waitQaImageChange(id,before,null,true);
+                assertQaHistory(before,added);
+                java.util.Set<String> newKeys=new java.util.HashSet<>(added.keySet());newKeys.removeAll(before.keySet());
+                if(newKeys.size()!=1)throw new AssertionError("Additive action did not create exactly one slot");
+                click("重新生成（替换当前旧结果）");click("重新生成");
+                java.util.Map<String,String> replaced=waitQaImageChange(id,added,newKeys.iterator().next(),false);
+                assertQaHistory(before,replaced);
+                String source="/sdcard/Pictures/PVG_QA_profiles_1500/PVG_QA_S1.jpg",held=source+".PVG_QA_hold";
+                shell("mv "+source+" "+held);
+                try {
+                    click("重新生成（替换当前旧结果）");click("重新生成");
+                    deadline=SystemClock.uptimeMillis()+40000;boolean failed=false;
+                    File queue=new File(getTargetContext().getExternalFilesDir(null),"queue_index/image_queue.tsv");
+                    while(SystemClock.uptimeMillis()<deadline) {
+                        String text=new String(java.nio.file.Files.readAllBytes(queue.toPath()),java.nio.charset.StandardCharsets.UTF_8);
+                        for(String line:text.split("\\n"))if(line.startsWith(id+"_")&&line.contains("\tFAILED\t"))failed=true;
+                        if(failed)break;SystemClock.sleep(100);
+                    }
+                    if(!failed)throw new AssertionError("Explicit missing-fixture decode did not fail");
+                    if(!replaced.equals(qaImageHashes(id)))throw new AssertionError("Failure modified old results");
+                    saveComparisonScreenshot("image-regeneration-failed-preserved");
+                } finally {shell("mv "+held+" "+source);}
+                org.json.JSONObject evidence=new org.json.JSONObject().put("syntheticId",id).put("before",new org.json.JSONObject(before))
+                    .put("additive",new org.json.JSONObject(added)).put("replacement",new org.json.JSONObject(replaced))
+                    .put("allOldHashesKeptByAdditive",true).put("onlyCurrentRetiredByReplacement",true).put("allOldHashesKeptOnActualFailure",true);
+                try(java.io.FileOutputStream out=new java.io.FileOutputStream(new File(getTargetContext().getExternalFilesDir(null),"PVG_QA_profiles_1500/image-write-report.json"))) {
+                    out.write(evidence.toString(2).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                }
+                result.putString("result","PASS: real synthetic UI additive keeps all history hashes; replacement retires only current result; actual missing-input failure preserves all old bytes");
+                finish(-1,result);return;
+            }
+            if (kind.equals("comparison")) {
+                Rect title = new Rect(), debug = new Rect();
+                find(sample).getBoundsInScreen(title);find("调试").getBoundsInScreen(debug);
+                if(title.right>debug.left || Math.abs(title.centerY()-debug.centerY())>debug.height())
+                    throw new AssertionError("Long filename displaced viewer actions");
+                saveComparisonScreenshot("viewer-long-title");
+                // Screenshot compression may outlast the viewer's idle timeout; refresh live bounds.
+                if(find(sample)==null){Rect screen=new Rect();requireRoot().getBoundsInScreen(screen);tap(screen.width()*.25f,screen.height()*.5f);}
+                find(sample).getBoundsInScreen(title);
+                shell("input swipe "+title.centerX()+" "+title.centerY()+" "+title.centerX()+" "+title.centerY()+" 800");
+                if(!waitFor("六模式临时对比"))throw new AssertionError("Long title did not open debug");
+                click("六模式临时对比");
+                long deadline=SystemClock.uptimeMillis()+120000;
+                while(SystemClock.uptimeMillis()<deadline) {
+                    AccessibilityNodeInfo ready=find("V10 · ComfyUI");
+                    // The disabled chip's text node can report enabled. Wait for the actual image viewport.
+                    if(ready!=null && comparisonTransform(requireRoot())!=null)break;
+                    SystemClock.sleep(200);
+                }
+                if(find("V10 · ComfyUI")==null || comparisonTransform(requireRoot())==null) {
+                    saveComparisonScreenshot("comparison-not-ready");
+                    throw new AssertionError("Comparison never became ready: "+visibleText(requireRoot()));
+                }
+                getUiAutomation().waitForIdle(100,3000);SystemClock.sleep(200);
+                Rect bounds=new Rect();requireRoot().getBoundsInScreen(bounds);
+                long plain=imageHash();pinch(bounds,false);drag(bounds,true);SystemClock.sleep(300);
+                long zoomed=imageHash();if(plain==zoomed)throw new AssertionError("Comparison pinch/pan did not change view");
+                String transform=comparisonTransform(requireRoot());
+                if(transform==null || Float.parseFloat(transform.split(" ")[1])<=1.2f)throw new AssertionError("Comparison did not actually zoom: "+transform+" bounds="+bounds);
+                saveComparisonScreenshot("comparison-zoomed-v10");
+                String[] labels={"V6 · 旧版","V7 · 居中","V8 · External","V9 · 平滑","V11 · 亚像素"};
+                for(String label:labels) {
+                    click(label);saveComparisonScreenshot("comparison-"+label.substring(0,label.indexOf(' ')));
+                    click("V10 · ComfyUI");SystemClock.sleep(100);
+                    if(imageHash()!=zoomed)throw new AssertionError("Mode switch changed zoom/pan: "+label);
+                    if(!transform.equals(comparisonTransform(requireRoot())))throw new AssertionError("Exact transform changed: "+label);
+                }
+                click("模型深度");SystemClock.sleep(200);long modelHash=imageHash();
+                saveComparisonScreenshot("comparison-model-depth");
+                for(String label:labels){click(label);if(imageHash()!=modelHash)throw new AssertionError("Shared model depth changed by projection mode");}
+                click("投影深度");click("V8 · External");saveComparisonScreenshot("comparison-projection-v8");
+                click("V10 · ComfyUI");saveComparisonScreenshot("comparison-projection-v10");click("SBS");
+                pinch(bounds,true);drag(bounds,false);
+                getUiAutomation().setRotation(UiAutomation.ROTATION_FREEZE_90);SystemClock.sleep(700);
+                if(find("V10 · ComfyUI")==null)throw new AssertionError("Landscape hid mode controls");
+                saveComparisonScreenshot("comparison-landscape");
+                getUiAutomation().setRotation(UiAutomation.ROTATION_FREEZE_0);SystemClock.sleep(700);
+                long beforeHome=imageHash();shell("input keyevent KEYCODE_HOME");SystemClock.sleep(700);
+                shell("am start -W -n com.local.parallelvrgallerypro/.MainActivity");SystemClock.sleep(700);
+                if(imageHash()!=beforeHome)throw new AssertionError("Background return reset comparison view");
+                saveComparisonScreenshot("comparison-returned");
+                click("返回调试");
+                result.putString("result","PASS: long title single-row + long-press debug; real six-mode UI; five exact zoomed/panned V10 round-trip hashes; cross-center/held gestures; rotation; Home return; no comparison catalog writes");
+                finish(-1,result);return;
+            }
             if (kind.startsWith("video")) {
                 if (!kind.equals("videoResume")) {
                     if(find("继续生成") != null) click("继续生成");
@@ -280,6 +379,7 @@ public final class StudioGestureInstrumentation extends Instrumentation {
         return root;
     }
     private AccessibilityNodeInfo find(String value) {
+        if(android.os.Build.VERSION.SDK_INT>=36)getUiAutomation().clearCache();
         return findNode(getUiAutomation().getRootInActiveWindow(), value);
     }
     private boolean waitFor(String value) {
@@ -352,7 +452,7 @@ public final class StudioGestureInstrumentation extends Instrumentation {
         MotionEvent.PointerProperties[] props=new MotionEvent.PointerProperties[xs.length];MotionEvent.PointerCoords[] coords=new MotionEvent.PointerCoords[xs.length];
         for(int i=0;i<xs.length;i++){props[i]=new MotionEvent.PointerProperties();props[i].id=i;props[i].toolType=MotionEvent.TOOL_TYPE_FINGER;coords[i]=new MotionEvent.PointerCoords();coords[i].x=xs[i];coords[i].y=ys[i];coords[i].pressure=1;coords[i].size=1;}
         MotionEvent event=MotionEvent.obtain(down,now,action,xs.length,props,coords,0,0,1,1,0,0,InputDevice.SOURCE_TOUCHSCREEN,0);
-        try {if(!getUiAutomation().injectInputEvent(event,true))throw new AssertionError("Input injection failed; action="+action);} finally{event.recycle();}
+        try {sendPointerSync(event);} finally{event.recycle();}
     }
     private void shell(String command) throws java.io.IOException {
         try(java.io.InputStream stream=new android.os.ParcelFileDescriptor.AutoCloseInputStream(getUiAutomation().executeShellCommand(command))) {
@@ -362,5 +462,52 @@ public final class StudioGestureInstrumentation extends Instrumentation {
     private long imageHash() {
         Bitmap image=getUiAutomation().takeScreenshot();if(image==null)throw new AssertionError("Screenshot unavailable");
         long hash=0;for(int y=image.getHeight()/3;y<image.getHeight()*2/3;y+=17)for(int x=0;x<image.getWidth();x+=17)hash=hash*31+image.getPixel(x,y);image.recycle();return hash;
+    }
+    private void saveComparisonScreenshot(String label) throws java.io.IOException {
+        File root=new File(getTargetContext().getExternalFilesDir(null),"PVG_QA_profiles_1500");
+        Bitmap image=getUiAutomation().takeScreenshot();
+        try(java.io.FileOutputStream out=new java.io.FileOutputStream(new File(root,label+".png"))){image.compress(Bitmap.CompressFormat.PNG,100,out);}
+        finally{image.recycle();}
+    }
+    private String comparisonTransform(AccessibilityNodeInfo node) {
+        node.refresh();
+        CharSequence d=node.getContentDescription();if(d!=null&&d.toString().startsWith("对比视口 "))return d.toString();
+        for(int i=0;i<node.getChildCount();i++){AccessibilityNodeInfo child=node.getChild(i);if(child!=null){String found=comparisonTransform(child);if(found!=null)return found;}}
+        return null;
+    }
+    private String visibleText(AccessibilityNodeInfo node) {
+        StringBuilder out=new StringBuilder();if(node.getText()!=null)out.append(node.getText()).append(" | ");
+        for(int i=0;i<node.getChildCount();i++){AccessibilityNodeInfo child=node.getChild(i);if(child!=null)out.append(visibleText(child));}
+        return out.toString();
+    }
+    private java.util.Map<String,String> qaImageHashes(long id) throws Exception {
+        java.util.Map<String,String> result=new java.util.TreeMap<>();
+        File cache=new File(getTargetContext().getExternalFilesDir(null),"vr_cache");File[] photos=cache.listFiles();
+        if(photos==null)return result;
+        for(File photo:photos)if(photo.getName().startsWith(id+"_")) {
+            File[] versions=photo.listFiles();if(versions==null)continue;
+            for(File version:versions)if(new File(version,"params.json").isFile()&&new File(version,"left.jpg").isFile()&&new File(version,"right.jpg").isFile()) {
+                java.security.MessageDigest digest=java.security.MessageDigest.getInstance("SHA-256");
+                for(String name:new String[]{"params.json","left.jpg","right.jpg","model_depth.png"}) {
+                    File file=new File(version,name);if(!file.isFile())continue;digest.update(name.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    try(java.io.FileInputStream in=new java.io.FileInputStream(file)){byte[] buffer=new byte[8192];int n;while((n=in.read(buffer))!=-1)digest.update(buffer,0,n);}
+                }
+                StringBuilder hash=new StringBuilder();for(byte b:digest.digest())hash.append(String.format(java.util.Locale.US,"%02x",b));
+                result.put(photo.getName()+"/"+version.getName(),hash.toString());
+            }
+        }
+        return result;
+    }
+    private void assertQaHistory(java.util.Map<String,String> old,java.util.Map<String,String> current) {
+        for(java.util.Map.Entry<String,String> entry:old.entrySet())if(!entry.getValue().equals(current.get(entry.getKey())))throw new AssertionError("Unselected history changed");
+    }
+    private java.util.Map<String,String> waitQaImageChange(long id,java.util.Map<String,String> before,String retired,boolean additive) throws Exception {
+        long deadline=SystemClock.uptimeMillis()+40000;
+        while(SystemClock.uptimeMillis()<deadline) {
+            java.util.Map<String,String> now=qaImageHashes(id);
+            if(additive ? now.size()==before.size()+1 : now.size()==before.size()&&!now.containsKey(retired))return now;
+            SystemClock.sleep(100);
+        }
+        throw new AssertionError("Synthetic explicit request did not complete");
     }
 }

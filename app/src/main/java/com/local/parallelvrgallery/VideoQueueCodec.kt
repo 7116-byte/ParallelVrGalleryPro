@@ -22,6 +22,9 @@ internal fun VideoGenerationParams.encodeForQueue(): String {
         vr.depthUpscale.boundedLongEdge.toString(),
         vr.depthUpscale.interpolation.name,
         vr.depthUpscale.order.name,
+        vr.matchV10Default.toString(),
+        vr.resultVariant,
+        vr.invertModelDepth.toString(),
     ).joinToString(",") { it.replace(",", "_").replace('\t', '_').replace('\n', '_').replace('\r', '_') }
 }
 
@@ -45,6 +48,9 @@ internal fun decodeVideoParams(text: String): VideoGenerationParams? {
                 inpaintMode = parts[7],
                 quality = parts[8].toInt(),
                 edgeMode = DepthEdgeMode.restore(parts.getOrNull(15), parts.getOrNull(13)),
+                invertModelDepth = parts.getOrNull(22)?.toBooleanStrictOrNull() ?: false,
+                resultVariant = parts.getOrNull(21)?.takeIf { it.matches(Regex("[A-Za-z0-9-]{0,40}")) } ?: "",
+                matchV10Default = parts.getOrNull(20)?.toBooleanStrictOrNull() ?: false,
                 depthUpscale = DepthUpscaleSettings(
                     enabled = parts.getOrNull(16)?.toBooleanStrictOrNull() ?: false,
                     maxLongEdge = parts.getOrNull(17)?.toIntOrNull() ?: 0,
