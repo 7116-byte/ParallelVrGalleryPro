@@ -31,6 +31,8 @@
 
 ## v1.3.00 UI 与参考模式
 
+当前还需先读 `docs/comfy-main-v1.4.00.md` 与 `docs/releases/v1.4.00.md`。COMFY_LEGACY_V10 / COMFY_SUBPIXEL_V11 对应 depthSSSMainV10 / depthSSSMainV11，均不自动迁移旧偏好、缓存或队列。主节点与 External 的眼序、强度单位、反转约定不同；测试预设为 60 / 3 / 反转开启、额外放大关闭。亚像素为本项目改良，不冒充官方版本或保证所有素材更优；CPU 投影更慢。原 58 项基线仍保留，当前新增测试以实际构建报告为准。Debug `kind=comfyRaster/comfyPipeline` 仅直接读写 `PVG_QA_comfy_1400`，不启动 Activity/ViewModel/MediaStore；使用缓冲流写浮点证据，PNG 对照导出标准 sRGB 像素，不能将色彩配置差异当作投影误差。
+
 当前修正及证据还应先读 docs/studio-v1.3.01.md、docs/releases/v1.3.01.md。REFERENCE_V9 独立缓存 depthSSS22V9；当前参考设置从 V8 转 V9，旧缓存及已持久化的视频队列仍按原版本。不要把旧队列恢复改为偏好迁移入口。最终眼图浮点恢复/3×3 Gaussian 在量化前执行；V6/V7/V8 不变。参考 QA 可用 Debug kind=referenceRaster，只读写 PVG_QA_reference_1301 专属目录，不经过 MediaStore；所有私人素材及 .codex-attachments 均禁止提交。
 
 - 深浅跟随系统，统一 StudioTheme；手机/平板按可用宽度和字体缩放计算显示列数，不改用户保存的列数偏好。列表标题/提示整体随滚动移出，浮动操作槽以实测高度给内容留底部空间。

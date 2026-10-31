@@ -30,6 +30,92 @@ public final class StudioGestureInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if(kind.equals("comfyPipeline")) {
+                File root=new File(getTargetContext().getExternalFilesDir(null),"PVG_QA_comfy_1400");
+                if(!root.isDirectory())throw new AssertionError("Explicit private QA directory missing");
+                StringBuilder runtime=new StringBuilder();
+                org.json.JSONArray checks=new org.json.JSONArray();
+                VrGenerator generator=new VrGenerator(getTargetContext(),new VrCacheManager(getTargetContext()),new ModelManager(getTargetContext()));
+                DepthModelSession session=new DepthModelSession(new File(getTargetContext().getExternalFilesDir(null),"models/depth_anything_v2.tflite"),4,true,GpuTestMode.ACCURATE_UNSET,true,value->{runtime.append(value).append('\n');return kotlin.Unit.INSTANCE;});
+                try {
+                    for(DepthEdgeMode mode:new DepthEdgeMode[]{DepthEdgeMode.COMFY_LEGACY_V10,DepthEdgeMode.COMFY_SUBPIXEL_V11}) {
+                        VrGenerationParams params=new VrGenerationParams("depth_anything_v2.tflite","SBS_PARALLEL",60f,3,10,true,1280,4,true,GpuTestMode.ACCURATE_UNSET,true,"FOREGROUND_FILL",94,mode,new DepthUpscaleSettings(false,0,DepthInterpolation.BILINEAR,DepthResizeOrder.SMOOTH_THEN_RESIZE));
+                        Bitmap bitmap=android.graphics.BitmapFactory.decodeFile(new File(root,"PVG_QA_P3.jpg").getPath());
+                        Bitmap sbs;
+                        try {sbs=generator.generateSbsBitmap(bitmap,params,value->kotlin.Unit.INSTANCE,value->kotlin.Unit.INSTANCE,session);}
+                        finally {bitmap.recycle();}
+                        Bitmap expected=android.graphics.BitmapFactory.decodeFile(new File(root,mode==DepthEdgeMode.COMFY_LEGACY_V10?"PVG_QA_P3.jpg.main-s60.png":"PVG_QA_P3.jpg.smooth-s60.png").getPath());
+                        try {
+                            if(sbs.getWidth()!=expected.getWidth()*2||sbs.getHeight()!=expected.getHeight())throw new AssertionError("Actual pipeline changed QA output size");
+                            int[] row=new int[expected.getWidth()],reference=new int[expected.getWidth()];long differing=0;
+                            for(int y=0;y<expected.getHeight();y++) {sbs.getPixels(row,0,row.length,0,y,row.length,1);expected.getPixels(reference,0,reference.length,0,y,reference.length,1);for(int x=0;x<row.length;x++)if(row[x]!=reference[x])differing++;}
+                            if(differing!=0)throw new AssertionError("Actual image pipeline differs from direct tested renderer: "+differing);
+                            checks.put(new org.json.JSONObject().put("mode",mode.name()).put("imagePipelineMatchesDirect",true).put("differingPixels",differing));
+                        } finally {sbs.recycle();expected.recycle();}
+                        DepthTemporalSmoother smoother=new DepthTemporalSmoother();
+                        for(int frame=0;frame<3;frame++) {
+                            Bitmap synthetic=Bitmap.createBitmap(320,180,Bitmap.Config.ARGB_8888);
+                            android.graphics.Canvas canvas=new android.graphics.Canvas(synthetic);canvas.drawColor(android.graphics.Color.rgb(30,70,100));
+                            android.graphics.Paint paint=new android.graphics.Paint();paint.setColor(android.graphics.Color.rgb(200,140,60));canvas.drawCircle(120+frame*10,90,45,paint);
+                            VideoSbsResult rendered=generator.generateVideoSbsBitmap(synthetic,params,session,smoother);
+                            StereoBitmapPair eyes=rendered.getEyes();
+                            try {if(eyes.getLeft().getWidth()!=320||eyes.getRight().getHeight()!=180)throw new AssertionError("Video eye geometry");}
+                            finally {eyes.getLeft().recycle();eyes.getRight().recycle();}
+                        }
+                        checks.put(new org.json.JSONObject().put("mode",mode.name()).put("threeSyntheticVideoFrames",true));
+                    }
+                } finally {session.close();generator.close();}
+                try(java.io.FileOutputStream out=new java.io.FileOutputStream(new File(root,"pipeline-report.json"))){out.write(checks.toString(2).getBytes(java.nio.charset.StandardCharsets.UTF_8));}
+                result.putString("qa","PASS: actual image pipeline equals tested raster; both modes process temporal synthetic video frames; no gallery writes");finish(0,result);return;
+            }
+            if(kind.equals("comfyRaster")) {
+                // Runs without Activity/ViewModel/MediaStore; never admits gallery jobs.
+                File root=new File(getTargetContext().getExternalFilesDir(null),"PVG_QA_comfy_1400");
+                if(!root.isDirectory())throw new AssertionError("Explicit private QA directory missing");
+                StringBuilder runtime=new StringBuilder();
+                org.json.JSONArray report=new org.json.JSONArray();
+                DepthModelSession session=new DepthModelSession(new File(getTargetContext().getExternalFilesDir(null),"models/depth_anything_v2.tflite"),4,true,GpuTestMode.ACCURATE_UNSET,true,value->{runtime.append(value).append('\n');return kotlin.Unit.INSTANCE;});
+                try {
+                    for(String name:new String[]{"PVG_QA_O1.png","PVG_QA_P1.jpg","PVG_QA_P2.jpg","PVG_QA_P3.jpg"}) {
+                        Bitmap bitmap=android.graphics.BitmapFactory.decodeFile(new File(root,name).getPath());
+                        if(bitmap==null)throw new AssertionError("Missing explicit QA input: "+name);
+                        try {
+                            try(java.io.FileOutputStream out=new java.io.FileOutputStream(new File(root,name+".decoded.png"))){bitmap.compress(Bitmap.CompressFormat.PNG,100,out);}
+                            long start=SystemClock.elapsedRealtime();
+                            float[] raw=session.run(bitmap,0,()->kotlin.Unit.INSTANCE);
+                            org.json.JSONObject item=new org.json.JSONObject().put("sample",name).put("width",bitmap.getWidth()).put("height",bitmap.getHeight()).put("gpuMs",SystemClock.elapsedRealtime()-start);
+                            try(java.io.DataOutputStream out=new java.io.DataOutputStream(new java.io.BufferedOutputStream(new java.io.FileOutputStream(new File(root,name+".raw-f32-be")),262144))){for(float value:raw)out.writeFloat(value);}
+                            start=SystemClock.elapsedRealtime();
+                            float[] prepared=ComfyLegacyStereoRenderer.INSTANCE.prepareDepth(raw,518,518,bitmap.getWidth(),bitmap.getHeight(),3,true);
+                            item.put("prepareMs",SystemClock.elapsedRealtime()-start);
+                            try(java.io.DataOutputStream out=new java.io.DataOutputStream(new java.io.BufferedOutputStream(new java.io.FileOutputStream(new File(root,name+".main-depth-f32-be")),262144))){for(float value:prepared)out.writeFloat(value);}
+                            for(float scale:new float[]{40f,60f}) {
+                                start=SystemClock.elapsedRealtime();
+                                kotlin.Pair<Bitmap,Bitmap> eyes=ComfyLegacyStereoRenderer.INSTANCE.renderPrepared(bitmap,prepared,scale,false);
+                                item.put("render"+(int)scale+"Ms",SystemClock.elapsedRealtime()-start);
+                                if(scale==40f)try(java.io.FileOutputStream out=new java.io.FileOutputStream(new File(root,name+".decoded.png"))){eyes.getSecond().compress(Bitmap.CompressFormat.PNG,100,out);}
+                                try(java.io.FileOutputStream out=new java.io.FileOutputStream(new File(root,name+".main-s"+(int)scale+".png"))){eyes.getFirst().compress(Bitmap.CompressFormat.PNG,100,out);}
+                                finally {eyes.getFirst().recycle();eyes.getSecond().recycle();}
+                                start=SystemClock.elapsedRealtime();
+                                eyes=ComfyLegacyStereoRenderer.INSTANCE.renderPrepared(bitmap,prepared,scale,true);
+                                item.put("subpixel"+(int)scale+"Ms",SystemClock.elapsedRealtime()-start);
+                                try(java.io.FileOutputStream out=new java.io.FileOutputStream(new File(root,name+".smooth-s"+(int)scale+".png"))){eyes.getFirst().compress(Bitmap.CompressFormat.PNG,100,out);}
+                                finally {eyes.getFirst().recycle();eyes.getSecond().recycle();}
+                            }
+                            for(boolean matched:new boolean[]{false,true}) {
+                                float scale=matched?(float)(255.0*60*500/bitmap.getWidth()/bitmap.getWidth()):5f;
+                                kotlin.Pair<Bitmap,Bitmap> eyes=ReferenceStereoRenderer.INSTANCE.render(bitmap,raw,518,518,scale,true);
+                                try(java.io.FileOutputStream out=new java.io.FileOutputStream(new File(root,name+(matched?".v9-matched60.png":".v9-s5.png")))){eyes.getSecond().compress(Bitmap.CompressFormat.PNG,100,out);}
+                                finally {eyes.getFirst().recycle();eyes.getSecond().recycle();}
+                            }
+                            report.put(item);
+                        } finally {bitmap.recycle();}
+                    }
+                } finally {session.close();}
+                try(java.io.FileOutputStream out=new java.io.FileOutputStream(new File(root,"runtime.txt"))){out.write(runtime.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));}
+                try(java.io.FileOutputStream out=new java.io.FileOutputStream(new File(root,"report.json"))){out.write(report.toString(2).getBytes(java.nio.charset.StandardCharsets.UTF_8));}
+                result.putString("qa","PASS: four explicit inputs, forced GPU, main Legacy 40/60 and matched-disparity reference; private output only");finish(0,result);return;
+            }
             if(kind.equals("referenceRaster")) {
                 File root=new File(getTargetContext().getExternalFilesDir(null),"PVG_QA_reference_1301");
                 if(!root.isDirectory())throw new AssertionError("Explicit private QA directory missing");

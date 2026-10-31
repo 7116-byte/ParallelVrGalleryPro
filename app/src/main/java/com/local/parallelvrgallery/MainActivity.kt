@@ -4467,7 +4467,7 @@ private class VrGenerator(
         val heap = Runtime.getRuntime()
         val heapAvailable = heap.maxMemory() - (heap.totalMemory() - heap.freeMemory())
         val budget = min(160L * 1024L * 1024L, max(48L * 1024L * 1024L, (heapAvailable * 55L) / 100L))
-        val bytesPerSourcePixel = when (mode) { DepthEdgeMode.REFERENCE_V9 -> 64f; DepthEdgeMode.REFERENCE_V8 -> 48f; else -> 18f }
+        val bytesPerSourcePixel = when { mode.isComfyMain || mode == DepthEdgeMode.REFERENCE_V9 -> 64f; mode == DepthEdgeMode.REFERENCE_V8 -> 48f; else -> 18f }
         val requestedPixels = requested.toFloat() * requested.toFloat() * ratio
         val requestedBytes = requestedPixels * bytesPerSourcePixel
         if (requestedBytes <= budget) return requested
@@ -4512,10 +4512,19 @@ private class VrGenerator(
     private fun prepareDepth(depth: FloatArray, params: VrGenerationParams, width: Int, height: Int): DepthMap {
         // Reserve space for resize/filter intermediates and the diagnostic bitmap per active job.
         val budget = (Runtime.getRuntime().maxMemory() / 8).coerceAtMost(96L * 1024 * 1024)
-        return DepthPostProcessing.process(DepthMap(depth, 518, 518), width, height, params, max(1L, budget / 16))
+        val prepared = DepthPostProcessing.process(DepthMap(depth, 518, 518), width, height, params, max(1L, budget / 16))
+        if (params.edgeMode.isComfyMain) {
+            val restored = ComfyLegacyStereoRenderer.prepareDepth(prepared.values, prepared.width, prepared.height, width, height, params.blurRadius, true)
+            return DepthMap(restored, width, height)
+        }
+        return prepared
     }
 
     private fun makeParallelStereoPair(source: Bitmap, depth: DepthMap, depthScale: Float, fillRadius: Int, mode: DepthEdgeMode = DepthEdgeMode.LEGACY_V6): StereoBitmapPair {
+        if (mode.isComfyMain) {
+            val (left, right) = ComfyLegacyStereoRenderer.renderPrepared(source, depth.values, depthScale, mode == DepthEdgeMode.COMFY_SUBPIXEL_V11)
+            return StereoBitmapPair(left, right)
+        }
         if (mode.isReference) {
             val (left, right) = ReferenceStereoRenderer.render(source, depth.values, depth.width, depth.height, depthScale, mode == DepthEdgeMode.REFERENCE_V9)
             return StereoBitmapPair(left, right)
@@ -7090,6 +7099,8 @@ private fun ManageScreen(
 
 private fun cacheVersionTitle(version: String, lang: AppLanguage): String {
     val mode = when {
+        version.contains("_depthSSSMainV11_") -> lang.t("ComfyUI · 亚像素", "ComfyUI · subpixel")
+        version.contains("_depthSSSMainV10_") -> lang.t("ComfyUI · 原样兼容", "ComfyUI · compatible")
         version.contains("_depthSSS22V9_") -> lang.t("参考 · 平滑轮廓", "Reference · smooth contours")
         version.contains("_depthSSS22V8_") -> lang.t("参考 · 1.3.00", "Reference · 1.3.00")
         version.contains("_depthV7_") -> lang.t("居中平滑", "Centered")
@@ -7300,22 +7311,31 @@ private fun SettingsScreen(
             }
             "depth" -> {
                 StudioCard(lang.t("边缘与视差", "Edges & disparity")) {
-                    SettingChoice(lang.t("投影与边缘模式", "Projection & edge mode"), settings.edgeMode, listOf(DepthEdgeMode.REFERENCE_V9, DepthEdgeMode.LEGACY_V6, DepthEdgeMode.CENTERED_V7, DepthEdgeMode.REFERENCE_V8), { when (it) { DepthEdgeMode.LEGACY_V6 -> lang.t("旧版兼容 · depthV6", "Legacy · depthV6"); DepthEdgeMode.CENTERED_V7 -> lang.t("居中平滑 · depthV7", "Centered · depthV7"); DepthEdgeMode.REFERENCE_V8 -> lang.t("参考旧结果 · 1.3.00", "Reference · 1.3.00"); DepthEdgeMode.REFERENCE_V9 -> lang.t("参考新版 · 平滑轮廓", "Reference · smooth contours") } }) { onChange(settings.copy(edgeMode = it)) }
-                    if (!settings.edgeMode.isReference) SettingHelp(lang.t("旧版保留历史非对称取样与位移幅度；居中模式相同强度下可能产生更大视差。两种缓存独立保存，切换不会重做已有结果。", "Legacy keeps historical asymmetric sampling and gain. Centered may produce more disparity at the same strength. Both caches remain separate; switching does not regenerate results."))
+                    SettingChoice(lang.t("投影与边缘模式", "Projection & edge mode"), settings.edgeMode, listOf(DepthEdgeMode.COMFY_SUBPIXEL_V11, DepthEdgeMode.COMFY_LEGACY_V10, DepthEdgeMode.REFERENCE_V9, DepthEdgeMode.LEGACY_V6, DepthEdgeMode.CENTERED_V7, DepthEdgeMode.REFERENCE_V8), { when (it) { DepthEdgeMode.LEGACY_V6 -> lang.t("旧版兼容 · depthV6", "Legacy · depthV6"); DepthEdgeMode.CENTERED_V7 -> lang.t("居中平滑 · depthV7", "Centered · depthV7"); DepthEdgeMode.REFERENCE_V8 -> lang.t("参考旧结果 · 1.3.00", "Reference · 1.3.00"); DepthEdgeMode.REFERENCE_V9 -> lang.t("参考新版 · 平滑轮廓", "Reference · smooth contours"); DepthEdgeMode.COMFY_LEGACY_V10 -> lang.t("ComfyUI 主节点 · 原样兼容", "ComfyUI main · compatible"); DepthEdgeMode.COMFY_SUBPIXEL_V11 -> lang.t("ComfyUI 主节点 · 亚像素", "ComfyUI main · subpixel") } }) { onChange(settings.copy(edgeMode = it)) }
+                    if (!settings.edgeMode.isReference && !settings.edgeMode.isComfyMain) SettingHelp(lang.t("旧版保留历史非对称取样与位移幅度；居中模式相同强度下可能产生更大视差。两种缓存独立保存，切换不会重做已有结果。", "Legacy keeps historical asymmetric sampling and gain. Centered may produce more disparity at the same strength. Both caches remain separate; switching does not regenerate results."))
+                    if (settings.edgeMode.isComfyMain) {
+                        SettingHelp(lang.t("对照 ComfyUI 主节点 Legacy（Fast 关闭）：左眼投影、右眼原图，最终眼图深度使用双三次恢复与 Gaussian。建议强度 40/60、窗口 3、反转开启；单位与外部深度参考模式不同。切换不会重做旧结果。", "Matches the ComfyUI main Legacy path (Fast off): projected left eye, original right eye, cubic depth restoration and Gaussian at eye size. Try scale 40/60, window 3, invert on. Units differ from External mode; old results are retained."))
+                        if (settings.edgeMode == DepthEdgeMode.COMFY_SUBPIXEL_V11) SettingHelp(lang.t("亚像素保留浮点位移，按深度和覆盖率处理轮廓及补洞，不使用 Telea。边缘更平滑但计算较慢，复杂遮挡仍可能异常；不保证所有素材更优。", "Subpixel retains floating shifts and uses depth/coverage for edges and filling, without Telea. It costs more CPU time and can still fail at complex occlusions."))
+                        else SettingHelp(lang.t("原样兼容保留整数位移、从左到右覆盖及位移 + 10 像素填充；与 PC 使用同一深度时输出一致，但仍可能有台阶或拉伸。", "Compatible keeps integer shifts, forward overwrite order and shift + 10 fill. It matches the PC given the same depth, including possible steps/stretching."))
+                        OutlinedButton(onClick = { onChange(settings.copy(depthScale = 60f, blurRadius = 3, invertDepth = true, depthUpscale = settings.depthUpscale.copy(enabled = false))) }) { Text(lang.t("使用对照参数：60 / 3 / 反转", "Comparison preset: 60 / 3 / invert")) }
+                        SettingHelp(lang.t("上方预设还会关闭额外深度放大；GPU、输出尺寸及其他设置保留。先明确选择，再生成所需图片，不会自动重算整库。", "This preset also disables additional depth upsampling. GPU, output size and other settings stay. It does not regenerate the library."))
+                    }
                     if (settings.edgeMode == DepthEdgeMode.REFERENCE_V9) SettingHelp(lang.t("修正轮廓采样：先连续恢复浮点深度，再投影并用 Telea 3px 补洞。强度 5 约为图宽 1%。旧结果保留；遮挡区域仍可能模糊。", "Restores continuous float depth before projection and Telea 3px filling. Scale 5 is about 1% width. Existing results stay available; occluded regions can remain soft."))
                     else if (settings.edgeMode.isReference) SettingHelp(lang.t("参考当前上游外部深度 V2.2：左眼原图，右眼按图宽比例右移，遮挡洞使用 Telea 3px 修补。强度 5 约为图宽 1%，建议从 5 开始；不是旧版强度单位。此模式不使用旧滤波窗口和边缘填充，模型仍为原稳定模型。", "Current upstream external-depth V2.2: static left eye, width-relative right-eye projection and Telea 3px hole filling. Scale 5 means about 1% width; start at 5. These are not legacy units. Legacy filter/fill controls do not apply; the stable depth model is unchanged."))
                     SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, (if (settings.edgeMode.isReference) listOf(1f, 2f, 5f, 10f, 20f, 30f, 50f) else listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f))) { onChange(settings.copy(depthScale = it)) }
-                    if (!settings.edgeMode.isReference) SettingHelp(lang.t("控制水平位移，不是清晰度；越大立体感越强，也越容易拉伸轮廓。旧版单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。", "Controls disparity, not sharpness. Higher values increase depth and edge stretching. Legacy units: depth × 255 × scale / eye width; not a fixed percentage."))
+                    if (!settings.edgeMode.isReference) SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。强度 40/60 用于当前工作流对照；较大位移仍会放大遮挡缺陷。", "Main-node units: depth × 255 × scale / eye width, not a fixed percentage. Scales 40/60 match the comparison workflow; larger shifts expose more occlusion defects.") else lang.t("控制水平位移，不是清晰度；越大立体感越强，也越容易拉伸轮廓。旧版单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。", "Controls disparity, not sharpness. Higher values increase depth and edge stretching. Legacy units: depth × 255 × scale / eye width; not a fixed percentage."))
                     if (!settings.edgeMode.isReference) {
-                    SettingInt(lang.t("深度图滤波窗口", "Depth filter window"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) { onChange(settings.copy(blurRadius = it)) }
-                    SettingHelp(lang.t("3 表示 3×3 窗口，不是插值次数；0/1 不滤波。默认在 518×518 深度图处理，先放大后平滑则作用于放大图。大窗口可能混合前后景。", "3 means a 3×3 window, not interpolation passes. 0/1 bypass. Filtering normally uses the 518×518 map; resize-first filters the larger map. Large windows can blend foreground and background."))
+                    SettingInt(if (settings.edgeMode.isComfyMain) lang.t("最终深度平滑窗口", "Final depth Gaussian window") else lang.t("深度图滤波窗口", "Depth filter window"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) { onChange(settings.copy(blurRadius = it)) }
+                    SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点在实际单眼尺寸上执行 Gaussian，3 表示 3×3；0/1 不滤波。额外深度放大先执行，与旧模式滤波顺序不同。", "Main applies Gaussian at actual eye size: 3 means 3×3, 0/1 bypass. Optional upsampling runs first, separately from legacy filter order.") else lang.t("3 表示 3×3 窗口，不是插值次数；0/1 不滤波。默认在 518×518 深度图处理，先放大后平滑则作用于放大图。大窗口可能混合前后景。", "3 means a 3×3 window, not interpolation passes. 0/1 bypass. Filtering normally uses the 518×518 map; resize-first filters the larger map. Large windows can blend foreground and background."))
+                    if (!settings.edgeMode.isComfyMain) {
                     SettingInt(lang.t("边缘填充（输出像素）", "Edge fill (output pixels)"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) { onChange(settings.copy(fillRadius = it)) }
                     SettingHelp(lang.t("水平填充，不是 AI 补画。0 按 1 像素写入，较大值可能拉宽人物边缘。", "Horizontal fill, not AI inpainting. 0 writes one pixel. Wider fill can stretch silhouettes."))
                     }
-                    StudioSwitch(lang.t("反转深度", "Invert depth"), lang.t("将 d 改为 1-d；不交换左右眼", "Uses 1-d; does not swap eyes"), settings.invertDepth) { onChange(settings.copy(invertDepth = it)) }
+                    }
+                    StudioSwitch(lang.t("反转深度", "Invert depth"), if (settings.edgeMode.isComfyMain) lang.t("沿用主节点复选框含义；本次对照为开启", "Uses the main-node checkbox convention; comparison uses on") else lang.t("将 d 改为 1-d；不交换左右眼", "Uses 1-d; does not swap eyes"), settings.invertDepth) { onChange(settings.copy(invertDepth = it)) }
                 }
                 StudioCard(lang.t("深度放大", "Depth upsampling")) {
-                    DepthUpscaleControls(settings.depthUpscale, lang) { onChange(settings.copy(depthUpscale = it)) }
+                    DepthUpscaleControls(settings.depthUpscale, lang, settings.edgeMode.isComfyMain) { onChange(settings.copy(depthUpscale = it)) }
                 }
                 StudioCard(lang.t("输出尺寸", "Output size")) {
                     SettingInt(lang.t("单眼最大长边", "Maximum eye long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) { onChange(settings.copy(maxLongEdge = it)) }
@@ -7437,7 +7457,7 @@ private fun ModelPicker(
 }
 
 @Composable
-private fun DepthUpscaleControls(settings: DepthUpscaleSettings, lang: AppLanguage, onChange: (DepthUpscaleSettings) -> Unit) {
+private fun DepthUpscaleControls(settings: DepthUpscaleSettings, lang: AppLanguage, fixedFinalGaussian: Boolean = false, onChange: (DepthUpscaleSettings) -> Unit) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text(lang.t("深度图放大", "Depth upsampling"), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
         Switch(checked = settings.enabled, onCheckedChange = { onChange(settings.copy(enabled = it)) })
@@ -7470,13 +7490,14 @@ private fun DepthUpscaleControls(settings: DepthUpscaleSettings, lang: AppLangua
             DepthInterpolation.BICUBIC -> lang.t("双三次", "Bicubic")
         }
     }) { onChange(settings.copy(interpolation = it)) }
-    SettingChoice(lang.t("处理顺序", "Processing order"), settings.order, DepthResizeOrder.entries.toList(), { order ->
+    if (!fixedFinalGaussian) SettingChoice(lang.t("处理顺序", "Processing order"), settings.order, DepthResizeOrder.entries.toList(), { order ->
         when (order) {
             DepthResizeOrder.SMOOTH_THEN_RESIZE -> lang.t("先平滑，再放大（默认）", "Smooth then resize (default)")
             DepthResizeOrder.RESIZE_THEN_SMOOTH -> lang.t("先放大，再平滑", "Resize then smooth")
         }
     }) { onChange(settings.copy(order = it)) }
-    SettingHelp(lang.t("图片与视频共用。原图尺寸以实际解码图/视频帧为准，仍受输出上限及内存预算限制；自定上限保持宽高比，不超过源图。最近邻保留阶梯；双线性过渡更连续；双三次计算更多，过冲会截断到有效深度。默认先平滑保留原窗口尺度且计算较少。放大不增加模型推理分辨率，也不恢复真实细节；开启可能增加生成耗时。实际尺寸见生成参数与日志。", "Applies to images and videos. Source size follows the decoded image/frame and remains subject to output and memory limits. Custom limits preserve aspect ratio. Nearest retains steps; bilinear blends; bicubic costs more and is clamped to valid depth. Smooth first preserves the original filter scale with less work. Upsampling does not increase model resolution or recover real detail and can slow generation. Actual dimensions are recorded in params/logs."))
+    if (fixedFinalGaussian) SettingHelp(lang.t("主节点先执行额外重采样，再恢复到实际单眼尺寸并做最终 Gaussian。旧模式的滤波顺序偏好保留，切回旧模式时继续生效。此选项不增加模型推理分辨率；关闭额外放大即可使用对照流程。", "Main does optional resampling before final eye-size reconstruction/Gaussian. Legacy filter-order preferences remain saved for other modes. This does not increase inference resolution; disable additional upsampling for the comparison workflow."))
+    else SettingHelp(lang.t("图片与视频共用。原图尺寸以实际解码图/视频帧为准，仍受输出上限及内存预算限制；自定上限保持宽高比，不超过源图。最近邻保留阶梯；双线性过渡更连续；双三次计算更多，过冲会截断到有效深度。默认先平滑保留原窗口尺度且计算较少。放大不增加模型推理分辨率，也不恢复真实细节；开启可能增加生成耗时。实际尺寸见生成参数与日志。", "Applies to images and videos. Source size follows the decoded image/frame and remains subject to output and memory limits. Custom limits preserve aspect ratio. Nearest retains steps; bilinear blends; bicubic costs more and is clamped to valid depth. Smooth first preserves the original filter scale with less work. Upsampling does not increase model resolution or recover real detail and can slow generation. Actual dimensions are recorded in params/logs."))
 }
 
 @Composable
@@ -9413,10 +9434,10 @@ private fun loadModelFile(file: File): ByteBuffer {
 private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, outputWidth: Int, outputHeight: Int, timings: GenerationTimings, depth: DepthMap): String {
     val existing = org.json.JSONObject()
         .put("photoKey", photo.cacheKey).put("cacheVersion", cacheVersion()).put("displayName", photo.displayName)
-        .put("projection", if (edgeMode.isReference) "SSS_EXTERNAL_V2_2_30372fec" else "LEGACY_PHONE")
-        .put("projectionDepthPreparation", if (edgeMode == DepthEdgeMode.REFERENCE_V9) "FLOAT_LINEAR_EYE_SIZE_GAUSSIAN_3_BEFORE_QUANTIZE" else "HISTORICAL")
-        .put("inpaint", if (edgeMode.isReference) "OpenCV_4_12_TELEA_radius_3" else "HORIZONTAL_FILL")
-        .put("legacyFilterAndFillApplied", !edgeMode.isReference)
+        .put("projection", when { edgeMode == DepthEdgeMode.COMFY_SUBPIXEL_V11 -> "SSS_MAIN_SUBPIXEL_COVERAGE_V11"; edgeMode.isComfyMain -> "SSS_MAIN_LEGACY_30372fec"; edgeMode.isReference -> "SSS_EXTERNAL_V2_2_30372fec"; else -> "LEGACY_PHONE" })
+        .put("projectionDepthPreparation", when { edgeMode.isComfyMain -> "FLOAT_CUBIC_EYE_SIZE_RENORMALIZE_GAUSSIAN"; edgeMode == DepthEdgeMode.REFERENCE_V9 -> "FLOAT_LINEAR_EYE_SIZE_GAUSSIAN_3_BEFORE_QUANTIZE"; else -> "HISTORICAL" })
+        .put("inpaint", when { edgeMode == DepthEdgeMode.COMFY_SUBPIXEL_V11 -> "DEPTH_AWARE_SUBPIXEL_COVERAGE"; edgeMode.isComfyMain -> "FORWARD_OVERWRITE_SHIFT_PLUS_10"; edgeMode.isReference -> "OpenCV_4_12_TELEA_radius_3"; else -> "HORIZONTAL_FILL" })
+        .put("legacyFilterAndFillApplied", !edgeMode.isReference && !edgeMode.isComfyMain)
         .put("sourceWidth", source.width).put("sourceHeight", source.height)
         .put("outputWidth", outputWidth).put("outputHeight", outputHeight)
         .put("depthModel", depthModel).put("outputMode", "SPLIT_EYES_JPEG_Q$IMAGE_EYE_JPEG_QUALITY")
