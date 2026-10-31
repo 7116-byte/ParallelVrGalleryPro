@@ -33,6 +33,8 @@
 
 当前还需先读 `docs/comfy-main-v1.4.00.md` 与 `docs/releases/v1.4.00.md`。COMFY_LEGACY_V10 / COMFY_SUBPIXEL_V11 对应 depthSSSMainV10 / depthSSSMainV11，均不自动迁移旧偏好、缓存或队列。主节点与 External 的眼序、强度单位、反转约定不同；测试预设为 60 / 3 / 反转开启、额外放大关闭。亚像素为本项目改良，不冒充官方版本或保证所有素材更优；CPU 投影更慢。原 58 项基线仍保留，当前新增测试以实际构建报告为准。Debug `kind=comfyRaster/comfyPipeline` 仅直接读写 `PVG_QA_comfy_1400`，不启动 Activity/ViewModel/MediaStore；使用缓冲流写浮点证据，PNG 对照导出标准 sRGB 像素，不能将色彩配置差异当作投影误差。
 
+还需读 `docs/mode-comparison-v1.4.00.md`：六项是三组算法路线，不是六个深度模型或官方版本序列。现有证据没有完成统一条件下的六模式画质排名。用户实际 ComfyUI 流程含 UltraSharp 与 denoise 0.35 的二次采样；不可把整条流程的细节都归功于 SBS。八组同手机深度 RGB 一致仅验证投影实现，深度相关系数不是清晰度分数；局部台阶减少也不等于恢复纹理或全面更好。
+
 设备验收可能与用户正常操作重叠。v1.4.00 收尾的平板新增 85 项已由用户确认是其主动查看效果产生，全部保留；不要误删或用旧队列覆盖新操作。旧/新队列按 key 合并，同 key 以当前记录为准，保留双方原字节快照。GUI 坐标必须在稳定的目标页面核验，安装器/设置确认与图库操作分开；不要在同一设备同时运行多个 uiautomator 控制器，也不要仅凭页面跳转和缓存增量推断是脚本触发。来源结论与实际用户反馈一起记录。
 
 当前修正及证据还应先读 docs/studio-v1.3.01.md、docs/releases/v1.3.01.md。REFERENCE_V9 独立缓存 depthSSS22V9；当前参考设置从 V8 转 V9，旧缓存及已持久化的视频队列仍按原版本。不要把旧队列恢复改为偏好迁移入口。最终眼图浮点恢复/3×3 Gaussian 在量化前执行；V6/V7/V8 不变。参考 QA 可用 Debug kind=referenceRaster，只读写 PVG_QA_reference_1301 专属目录，不经过 MediaStore；所有私人素材及 .codex-attachments 均禁止提交。
