@@ -22,15 +22,19 @@ data class ModeVisualProfile(
 
     companion object {
         const val REFERENCE_WIDTH = 1280
-        // Interior gain of the historical 3x3 V6 filter is 4/9. Do not change that filter.
+        // Fixed native-unit defaults, calibrated against V10/50 at 1280 eye width.
+        // Do not silently recalculate these values for each image.
         fun defaults(mode: DepthEdgeMode): ModeVisualProfile = when (mode) {
-            DepthEdgeMode.LEGACY_V6 -> ModeVisualProfile(50f * 9f / 4f, matchV10Default = true)
-            DepthEdgeMode.CENTERED_V7 -> ModeVisualProfile(50f, matchV10Default = true)
+            DepthEdgeMode.LEGACY_V6 -> ModeVisualProfile(100f)
+            DepthEdgeMode.CENTERED_V7 -> ModeVisualProfile(45f)
             DepthEdgeMode.REFERENCE_V8, DepthEdgeMode.REFERENCE_V9 -> ModeVisualProfile(
-                255f * 50f * 500f / (REFERENCE_WIDTH.toFloat() * REFERENCE_WIDTH), invert = true, matchV10Default = true,
+                3.5f, invert = true,
             )
-            DepthEdgeMode.COMFY_LEGACY_V10, DepthEdgeMode.COMFY_SUBPIXEL_V11 -> ModeVisualProfile(50f, invert = true, matchV10Default = true)
+            DepthEdgeMode.COMFY_LEGACY_V10, DepthEdgeMode.COMFY_SUBPIXEL_V11 -> ModeVisualProfile(50f, invert = true)
         }
+
+        fun editable(profile: ModeVisualProfile, mode: DepthEdgeMode): ModeVisualProfile =
+            if (profile.matchV10Default) profile.copy(scale = defaults(mode).scale, matchV10Default = false) else profile
 
         fun capture(settings: AppSettings) = ModeVisualProfile(settings.depthScale, settings.blurRadius,
             settings.fillRadius, settings.invertDepth, settings.maxLongEdge, settings.depthUpscale, settings.matchV10Default, settings.invertModelDepth)

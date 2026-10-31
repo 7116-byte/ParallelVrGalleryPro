@@ -1720,14 +1720,15 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(debugIndex = index) }
     }
 
-    fun startComparison(index: Int, longEdge: Int = 1280, defaults: Boolean = false) {
+    fun startComparison(index: Int) {
         val photo = _uiState.value.photos.getOrNull(index)?.takeIf { it.kind == MediaKind.IMAGE && !it.generatedVirtual } ?: return
         val revision = comparisonRevision.incrementAndGet()
         comparisonJob?.cancel()
         val base = _uiState.value.settings
         val profiles = DepthEdgeMode.entries.associateWith { mode ->
-            if (defaults) settingsStore.defaultProfile(mode) else if (mode == base.edgeMode) ModeVisualProfile.capture(base) else settingsStore.profile(mode)
+            if (mode == base.edgeMode) ModeVisualProfile.capture(base) else settingsStore.profile(mode)
         }
+        val longEdge = profiles.values.maxOf { it.maxLongEdge }
         val id = java.util.UUID.randomUUID().toString()
         _uiState.update { it.copy(comparison = ModeComparisonState(id, photo.cacheKey, photo.displayName, longEdge)) }
         comparisonJob = viewModelScope.launch(Dispatchers.Default) {
@@ -3370,10 +3371,10 @@ private class SettingsStore(context: Context) {
     }
 
     fun profile(mode: DepthEdgeMode): ModeVisualProfile =
-        ModeVisualProfile.decode(prefs.getString("modeProfile.${mode.name}", null)) ?: defaultProfile(mode)
+        ModeVisualProfile.editable(ModeVisualProfile.decode(prefs.getString("modeProfile.${mode.name}", null)) ?: defaultProfile(mode), mode)
 
     fun defaultProfile(mode: DepthEdgeMode): ModeVisualProfile =
-        ModeVisualProfile.decode(prefs.getString("modeDefault.${mode.name}", null)) ?: ModeVisualProfile.defaults(mode)
+        ModeVisualProfile.editable(ModeVisualProfile.decode(prefs.getString("modeDefault.${mode.name}", null)) ?: ModeVisualProfile.defaults(mode), mode)
 
     // Explicit Save waits for disk; frequent setting changes still use apply().
     @android.annotation.SuppressLint("ApplySharedPref")
@@ -4335,7 +4336,8 @@ private class VrGenerator(
             val modelMs = System.currentTimeMillis() - depthStart
             mark("model inference ${modelMs}ms")
             val depthPostStart = System.currentTimeMillis()
-            val modelDepthBitmap = depthToBitmap(DepthMap(DepthDirection.modelDepth(rawDepth, params.invertModelDepth), 518, 518))
+            val modelDepthBitmap = depthToBitmap(DepthMap(DepthDirection.modelDepth(rawDepth,
+                DepthDirection.reversed(params.edgeMode, params.invertModelDepth, params.invertDepth)), 518, 518))
             try { FileOutputStream(File(dir, "model_depth.png")).use { modelDepthBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) } }
             finally { modelDepthBitmap.recycle() }
             var depthMap = prepareDepth(rawDepth, params, original.width, original.height)
@@ -4468,6 +4470,7 @@ private class VrGenerator(
         val cap = kotlin.math.sqrt(budget / 120.0 * ratio).toInt().coerceAtLeast(256)
         val source = decodeScaledBitmap(context, photo.uri, minOf(requestedLongEdge, cap))
         val result = mutableListOf<ModeComparisonImage>()
+        val owned = mutableListOf(source)
         var success = false
         try {
             onProgress(0.05f, "推理当前图片；不创建队列")
@@ -4478,32 +4481,38 @@ private class VrGenerator(
             DepthEdgeMode.entries.forEachIndexed { index, mode ->
                 onProgress(0.15f + index / 6f * 0.8f, "${mode.shortLabel()} · ${source.width}×${source.height}")
                 val params = profiles.getValue(mode).applyTo(base.copy(edgeMode = mode)).toParams()
+                val limit = params.maxLongEdge.coerceAtMost(max(source.width, source.height))
+                val factor = limit.toFloat() / max(source.width, source.height)
+                val modeSource = if (factor < 1f) Bitmap.createScaledBitmap(source,
+                    max(1, (source.width * factor).roundToInt()), max(1, (source.height * factor).roundToInt()), true) else source
+                if (modeSource !== source) owned += modeSource
                 val started = SystemClock.uptimeMillis()
-                val depth = prepareDepth(raw, params, source.width, source.height)
+                val depth = prepareDepth(raw, params, modeSource.width, modeSource.height)
                 checkCurrent()
-                val pair = makeParallelStereoPair(source, depth, params.effectiveScale(source.width, depth), params.fillRadius, mode)
+                val pair = makeParallelStereoPair(modeSource, depth, params.effectiveScale(modeSource.width, depth), params.fillRadius, mode)
                 // All renderers keep exactly one original eye; share it across the six variants.
                 val left: Bitmap
                 val right: Bitmap
-                if (mode.isReference) { pair.left.recycle(); left = source; right = pair.right }
-                else { pair.right.recycle(); left = pair.left; right = source }
+                if (mode.isReference) { pair.left.recycle(); left = modeSource; right = pair.right }
+                else { pair.right.recycle(); left = pair.left; right = modeSource }
+                owned += if (mode.isReference) right else left
                 fun preview(map: DepthMap): Bitmap {
                     val factor = minOf(1.0, 512.0 / max(source.width, source.height))
                     val w = max(1, (source.width * factor).roundToInt())
                     val h = max(1, (source.height * factor).roundToInt())
                     return depthToBitmap(DepthResampling.resize(map, w, h, DepthInterpolation.BILINEAR))
                 }
-                val modelPreview = preview(DepthMap(DepthDirection.modelDepth(raw, params.invertModelDepth), 518, 518))
-                val projectionPreview = try { preview(depth) } catch (error: Throwable) { modelPreview.recycle(); throw error }
-                result += ModeComparisonImage(mode, left, right, params, params.effectiveScale(source.width, depth), SystemClock.uptimeMillis() - started, modelPreview, projectionPreview)
+                val modelPreview = preview(DepthMap(DepthDirection.modelDepth(raw,
+                    DepthDirection.reversed(mode, params.invertModelDepth, params.invertDepth)), 518, 518)).also { owned += it }
+                val projectionPreview = preview(depth).also { owned += it }
+                result += ModeComparisonImage(mode, left, right, params, params.effectiveScale(modeSource.width, depth), SystemClock.uptimeMillis() - started, modelPreview, projectionPreview)
                 checkCurrent()
             }
             success = true
             return result
         } finally {
             if (!success) {
-                result.flatMap { listOf(it.left, it.right, it.modelDepth, it.projectionDepth) }.filter { it !== source }.distinct().forEach { it.recycle() }
-                source.recycle()
+                owned.distinct().forEach { if (!it.isRecycled) it.recycle() }
             }
         }
     }
@@ -5968,8 +5977,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
     ) { target ->
         when (target) {
             AppScreen.Comparison -> state.comparison?.let { comparison ->
-                StudioTheme(dark = true) { ModeComparisonScreen(comparison, viewModel::closeComparison,
-                    onRestart = { edge, defaults -> viewModel.startComparison(state.debugIndex ?: state.galleryAnchorIndex, edge, defaults) }) }
+                StudioTheme(dark = true) { ModeComparisonScreen(comparison, viewModel::closeComparison) }
             }
             AppScreen.Manage -> ManageScreen(
                 state = state,
@@ -7537,7 +7545,7 @@ private fun SettingsScreen(
             "depth" -> {
                 StudioCard(lang.t("边缘与视差", "Edges & disparity")) {
                     SettingChoice(lang.t("投影与边缘模式", "Projection & edge mode"), settings.edgeMode, listOf(DepthEdgeMode.COMFY_LEGACY_V10, DepthEdgeMode.LEGACY_V6, DepthEdgeMode.COMFY_SUBPIXEL_V11, DepthEdgeMode.REFERENCE_V9, DepthEdgeMode.CENTERED_V7, DepthEdgeMode.REFERENCE_V8), { when (it) { DepthEdgeMode.LEGACY_V6 -> lang.t("旧版兼容 · depthV6", "Legacy · depthV6"); DepthEdgeMode.CENTERED_V7 -> lang.t("居中平滑 · depthV7", "Centered · depthV7"); DepthEdgeMode.REFERENCE_V8 -> lang.t("参考旧结果 · 1.3.00", "Reference · 1.3.00"); DepthEdgeMode.REFERENCE_V9 -> lang.t("参考新版 · 平滑轮廓", "Reference · smooth contours"); DepthEdgeMode.COMFY_LEGACY_V10 -> lang.t("ComfyUI 主节点 · 原样兼容", "ComfyUI main · compatible"); DepthEdgeMode.COMFY_SUBPIXEL_V11 -> lang.t("ComfyUI 主节点 · 亚像素", "ComfyUI main · subpixel") } }) { onChange(settings.copy(edgeMode = it)) }
-                    SettingHelp(lang.t("各模式独立保存视觉参数，切换自动恢复。默认以 V10 深度 50 为基准，按每张图的深度跨度和实际眼宽自动换算强度；轮廓、遮挡和会聚位置仍有差异。GPU 与队列设置共用。", "Each mode remembers its visual controls. Defaults automatically match the per-image disparity span of V10 scale 50 at the decoded eye width. Occlusion and convergence still differ. GPU and queue controls stay shared."))
+                    SettingHelp(lang.t("各模式独立保存视觉参数，切换自动恢复。默认强度为固定数值：V6 100、V7 45、V8/V9 3.5、V10/V11 50。按单眼宽 1280 对齐 V10 50 的近似视差；不同路线的单位、轮廓和遮挡仍有区别。点击数值可输入修改。GPU 与队列设置共用。", "Each mode remembers its visual controls. Fixed native defaults approximate V10/50 at 1280 eye width; tap the numeric value to edit. Occlusion and convergence still differ. GPU and queue controls stay shared."))
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(onClick = { defaultSaved = onSaveDefault(); defaultSaveFailed = !defaultSaved }) { Text(lang.t("保存为默认值", "Save as default")) }
                         OutlinedButton(onClick = onResetDefault) { Text(lang.t("恢复此模式默认值", "Restore this mode's defaults")) }
@@ -7545,10 +7553,7 @@ private fun SettingsScreen(
                     }
                     if (defaultSaved) SettingHelp(lang.t("已保存当前模式的视觉参数；其他模式、GPU 和队列设置不变。", "Saved this mode's visual controls. Other modes, GPU and queue controls stay."))
                     if (defaultSaveFailed) Text(lang.t("默认值保存失败，请检查存储空间", "Could not save defaults; check device storage"), color = MaterialTheme.colorScheme.error)
-                    if (settings.matchV10Default) {
-                        SettingHelp(lang.t("默认强度：自动匹配 V10 · 50。按 P90−P10 深度跨度换算，实际原生强度见单图调试和对比页。它是默认行为，不需要应用对照参数；不会改写旧结果。", "Default strength: automatically match V10 · 50 using the P90−P10 depth span. Actual native strength is shown in diagnostics/comparison. No comparison preset is required; existing results stay."))
-                        TextButton(onClick = { onChange(settings.copy(matchV10Default = false)) }) { Text(lang.t("改为自定此模式强度", "Set native strength manually")) }
-                    }
+
 
                     if (!settings.edgeMode.isReference && !settings.edgeMode.isComfyMain) SettingHelp(lang.t("旧版保留历史非对称取样与位移幅度；居中模式相同强度下可能产生更大视差。两种缓存独立保存，切换不会重做已有结果。", "Legacy keeps historical asymmetric sampling and gain. Centered may produce more disparity at the same strength. Both caches remain separate; switching does not regenerate results."))
                     if (settings.edgeMode.isComfyMain) {
@@ -7558,8 +7563,8 @@ private fun SettingsScreen(
 
                     }
                     if (settings.edgeMode == DepthEdgeMode.REFERENCE_V9) SettingHelp(lang.t("修正轮廓采样：先连续恢复浮点深度，再投影并用 Telea 3px 补洞。强度 5 约为图宽 1%。旧结果保留；遮挡区域仍可能模糊。", "Restores continuous float depth before projection and Telea 3px filling. Scale 5 is about 1% width. Existing results stay available; occluded regions can remain soft."))
-                    else if (settings.edgeMode.isReference) SettingHelp(lang.t("参考当前上游外部深度 V2.2：左眼原图，右眼按图宽比例右移，遮挡洞使用 Telea 3px 修补。原生强度 5 约为图宽 1%；默认根据 V10 的 50 自动换算，不是旧版强度单位。此模式不使用旧滤波窗口和边缘填充，模型仍为原稳定模型。", "Current upstream external-depth V2.2: static left eye, width-relative right-eye projection and Telea 3px hole filling. Scale 5 means about 1% width; defaults convert from V10 scale 50. These are not legacy units. Legacy filter/fill controls do not apply; the stable depth model is unchanged."))
-                    if (!settings.matchV10Default) SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, (if (settings.edgeMode.isReference) listOf(1f, 2f, 5f, 10f, 20f, 30f, 50f) else if (settings.edgeMode.isComfyMain) listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f, 100f) else listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f, 100f, 112.5f, 150f))) { onChange(settings.copy(depthScale = it, matchV10Default = false)) }
+                    else if (settings.edgeMode.isReference) SettingHelp(lang.t("参考当前上游外部深度 V2.2：左眼原图，右眼按图宽比例右移，遮挡洞使用 Telea 3px 修补。原生强度 5 约为图宽 1%；固定默认 3.5 是按 V10 50 换算的近似值，单位与主节点不同。此模式不使用旧滤波窗口和边缘填充，模型仍为原稳定模型。", "Current upstream external-depth V2.2: static left eye, width-relative right-eye projection and Telea 3px hole filling. Scale 5 means about 1% width; the fixed default 3.5 approximates V10 scale 50 at 1280 eye width. These are not legacy units. Legacy filter/fill controls do not apply; the stable depth model is unchanged."))
+                    SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, if (settings.edgeMode.isReference) 100f else 500f) { onChange(settings.copy(depthScale = it, matchV10Default = false)) }
                     if (!settings.edgeMode.isReference) SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。默认基准为 50；较大位移仍会放大遮挡缺陷。", "Main-node units: depth × 255 × scale / eye width, not a fixed percentage. The default baseline is 50; larger shifts expose more occlusion defects.") else lang.t("控制水平位移，不是清晰度；越大立体感越强，也越容易拉伸轮廓。旧版单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。", "Controls disparity, not sharpness. Higher values increase depth and edge stretching. Legacy units: depth × 255 × scale / eye width; not a fixed percentage."))
                     if (!settings.edgeMode.isReference) {
                     SettingInt(if (settings.edgeMode.isComfyMain) lang.t("最终深度平滑窗口", "Final depth Gaussian window") else lang.t("深度图滤波窗口", "Depth filter window"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) { onChange(settings.copy(blurRadius = it)) }
@@ -7569,11 +7574,14 @@ private fun SettingsScreen(
                     SettingHelp(lang.t("水平填充，不是 AI 补画。0 按 1 像素写入，较大值可能拉宽人物边缘。", "Horizontal fill, not AI inpainting. 0 writes one pixel. Wider fill can stretch silhouettes."))
                     }
                     }
-                    StudioSwitch(lang.t("反转模型输入深度", "Invert model input depth"), lang.t("模型深度预览应近白远黑；确认近处为黑时才开启。稳定模型在本轮三张人像和官方示例中原始方向均为近白。", "Model preview should be near-white/far-black. Enable only when near regions are black. The stable model was near-white in the four checked samples."), settings.invertModelDepth) { onChange(settings.copy(invertModelDepth = it)) }
-                    StudioSwitch(lang.t("投影深度反转", "Projection depth inversion"), lang.t("与模型输入方向分开。V6/V7 默认关；V10/V11 默认开；External 默认开以配合右眼投影，投影图近黑仍可产生正确的相对远近。查看调试深度图确认。", "Separate from model polarity. V6/V7 default off, V10/V11 on; External on compensates for its opposite projected eye. Its near-black projection can still give correct relative stereo depth."), settings.invertDepth) { onChange(settings.copy(invertDepth = it)) }
+                    val depthReversed = DepthDirection.reversed(settings.edgeMode, settings.invertModelDepth, settings.invertDepth)
+                    StudioSwitch(lang.t("反转深度", "Invert depth"), lang.t("黑白互换，同时交换前后景。深度图与生成结果一起改变。", "Swaps black/white and foreground/background in both depth preview and stereo output."), depthReversed) {
+                        onChange(settings.copy(invertModelDepth = it, invertDepth = ModeVisualProfile.defaults(settings.edgeMode).invert))
+                    }
 
                 }
                 StudioCard(lang.t("深度放大", "Depth upsampling")) {
+                    SettingHelp(lang.t("当前模型实际输入为 518×518。下方仅对模型输出做插值，不会改变推理分辨率。", "Actual model input is 518×518. These controls resize its output, not the inference input."))
                     DepthUpscaleControls(settings.depthUpscale, lang, settings.edgeMode.isComfyMain) { onChange(settings.copy(depthUpscale = it)) }
                 }
                 StudioCard(lang.t("输出尺寸", "Output size")) {
@@ -7759,8 +7767,20 @@ private fun SettingInt(title: String, value: Int, options: List<Int>, onChange: 
 }
 
 @Composable
-private fun SettingFloat(title: String, value: Float, options: List<Float>, onChange: (Float) -> Unit) {
-    SettingChoice(title, value, options, { if (it == it.roundToInt().toFloat()) it.roundToInt().toString() else "%.3f".format(Locale.US, it).trimEnd('0').trimEnd('.') }, onChange)
+private fun SettingFloat(title: String, value: Float, maximum: Float, onChange: (Float) -> Unit) {
+    var editing by remember { mutableStateOf(false) }
+    var input by remember(value) { mutableStateOf(value.toString()) }
+    OutlinedButton(onClick = { input = value.toString(); editing = true }, modifier = Modifier.fillMaxWidth()) {
+        Text("$title：${String.format(Locale.US, "%.3f", value).trimEnd('0').trimEnd('.')}")
+    }
+    if (editing) {
+        val parsed = input.toFloatOrNull()?.takeIf { it.isFinite() && it in 0f..maximum }
+        AlertDialog(onDismissRequest = { editing = false }, title = { Text(title) },
+            text = { OutlinedTextField(value = input, onValueChange = { input = it }, singleLine = true,
+                label = { Text("0–${maximum.toInt()}，可输入小数") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), isError = parsed == null) },
+            confirmButton = { TextButton(enabled = parsed != null, onClick = { parsed?.let(onChange); editing = false }) { Text("确定") } },
+            dismissButton = { TextButton(onClick = { editing = false }) { Text("取消") } })
+    }
 }
 
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
@@ -8177,13 +8197,12 @@ private fun DebugScreen(
                     DebugLine(lang.t("总耗时", "Total"), imageTimings?.totalMs?.let { "${it}ms" } ?: "-")
                 }
                 val modelDepthFile = entry?.let { File(File(it.paramsPath).parentFile, "model_depth.png") }?.takeIf { it.isFile }
-                SettingHelp(lang.t("模型深度以近白远黑检查；投影深度包含该模式的眼序/反转约定。历史结果没有模型深度文件时显示暂无，不自动重算。", "Check model depth as near-white/far-black. Projection depth includes mode/eye-order inversion. Missing historical model maps stay unavailable without automatic regeneration."))
+                SettingHelp(lang.t("深度图随“反转深度”开关黑白互换，生成结果也随之交换前后景。历史结果没有这份深度图时显示暂无，不自动重算。", "Invert depth swaps black/white in this map and reverses foreground/background in the generated result. Historical maps may be unavailable without regeneration."))
                 Row(Modifier.fillMaxWidth().height(260.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     DebugImagePanel(lang.t("原图", "Source"), photo?.uri, Modifier.weight(1f), lang)
-                    DebugImagePanel(lang.t("模型深度 · 近白远黑", "Model · near white"), modelDepthFile?.let { Uri.fromFile(it) }, Modifier.weight(1f), lang)
+                    DebugImagePanel(lang.t("深度图", "Depth map"), modelDepthFile?.let { Uri.fromFile(it) }, Modifier.weight(1f), lang)
                 }
                 Row(Modifier.fillMaxWidth().height(260.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    DebugImagePanel(lang.t("投影深度 · 含模式反转", "Projection · mode inversion"), entry?.let { Uri.fromFile(File(it.depthPath)) }, Modifier.weight(1f), lang)
                     DebugImagePanel("Left/VR", entry?.let { Uri.fromFile(File(if (it.hasSplitEyes) it.leftPath else it.outputPath)) }, Modifier.weight(1f), lang)
                 }
                 Spacer(Modifier.height(8.dp))

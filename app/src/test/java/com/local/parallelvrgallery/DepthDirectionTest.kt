@@ -4,6 +4,29 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DepthDirectionTest {
+    @Test fun singleControlAndPreviewCombineHistoricalDirectionFieldsWithoutChangingThem() {
+        for (mode in DepthEdgeMode.entries) {
+            val base = ModeVisualProfile.defaults(mode).invert
+            assertFalse(DepthDirection.reversed(mode, false, base))
+            assertTrue(DepthDirection.reversed(mode, true, base))
+            assertTrue(DepthDirection.reversed(mode, false, !base))
+            assertFalse(DepthDirection.reversed(mode, true, !base))
+        }
+    }
+    @Test fun referenceRasterInversionReversesActualNearFarPixelDisparity() {
+        val width = 1000
+        val near = 0xff00ff00.toInt(); val far = 0xffff0000.toInt()
+        val pixels = IntArray(width) { 0xff303030.toInt() }.apply { this[200] = near; this[700] = far }
+        val raw = FloatArray(width) { if (it < 500) 0.9f else 0.1f }
+        for (reverse in listOf(false, true)) {
+            val canonical = DepthDirection.modelDepth(raw, reverse)
+            val processed = FloatArray(width) { 1f - canonical[it] }
+            val projected = ReferenceProjection.project(pixels,width,1,processed,width,1,5f).pixels
+            val nearDisparity = 200 - projected.indexOf(near)
+            val farDisparity = 700 - projected.indexOf(far)
+            assertEquals(!reverse, nearDisparity > farDisparity)
+        }
+    }
     @Test fun inputPolarityIsExplicitAndDoesNotMutateInferenceOutput() {
         val raw = floatArrayOf(0.1f, 0.3f, 0.9f)
         assertSame(raw, DepthDirection.modelDepth(raw, false))

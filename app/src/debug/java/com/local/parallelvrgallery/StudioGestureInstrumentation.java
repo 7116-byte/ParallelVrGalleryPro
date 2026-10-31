@@ -30,6 +30,18 @@ public final class StudioGestureInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if(kind.equals("referenceDirection")) {
+                FixedCalibrationQa.run(getTargetContext(),true);
+                result.putString("qa","PASS: V8/V9 reversed-depth candidate eye images rendered from fixed QA inputs; no new inference");finish(0,result);return;
+            }
+            if(kind.equals("modelInputProbe")) {
+                ModelInputProbeQa.run(getTargetContext());
+                result.putString("qa","DONE: isolated GPU model input allocation/inference probe; inspect per-size report, failures are retained");finish(0,result);return;
+            }
+            if(kind.equals("fixedCalibration")) {
+                FixedCalibrationQa.run(getTargetContext());
+                result.putString("qa","PASS: fixed-strength real renderer candidates; previously captured QA depth; no new inference/gallery/queue writes");finish(0,result);return;
+            }
             if(kind.equals("modeProfiles")) {
                 ModeProfilesQa.run(getTargetContext());
                 result.putString("qa", "PASS: isolated settings migration/cold restores; six real GPU modes and resolution cases; no gallery/queue writes");
@@ -248,12 +260,12 @@ public final class StudioGestureInstrumentation extends Instrumentation {
                 click("六模式临时对比");
                 long deadline=SystemClock.uptimeMillis()+120000;
                 while(SystemClock.uptimeMillis()<deadline) {
-                    AccessibilityNodeInfo ready=find("V10 · ComfyUI");
+                    AccessibilityNodeInfo ready=find("切换对比模式");
                     // The disabled chip's text node can report enabled. Wait for the actual image viewport.
                     if(ready!=null && comparisonTransform(requireRoot())!=null)break;
                     SystemClock.sleep(200);
                 }
-                if(find("V10 · ComfyUI")==null || comparisonTransform(requireRoot())==null) {
+                if(find("切换对比模式")==null || comparisonTransform(requireRoot())==null) {
                     saveComparisonScreenshot("comparison-not-ready");
                     throw new AssertionError("Comparison never became ready: "+visibleText(requireRoot()));
                 }
@@ -264,21 +276,18 @@ public final class StudioGestureInstrumentation extends Instrumentation {
                 String transform=comparisonTransform(requireRoot());
                 if(transform==null || Float.parseFloat(transform.split(" ")[1])<=1.2f)throw new AssertionError("Comparison did not actually zoom: "+transform+" bounds="+bounds);
                 saveComparisonScreenshot("comparison-zoomed-v10");
-                String[] labels={"V6 · 旧版","V7 · 居中","V8 · External","V9 · 平滑","V11 · 亚像素"};
-                for(String label:labels) {
-                    click(label);saveComparisonScreenshot("comparison-"+label.substring(0,label.indexOf(' ')));
-                    click("V10 · ComfyUI");SystemClock.sleep(100);
-                    if(imageHash()!=zoomed)throw new AssertionError("Mode switch changed zoom/pan: "+label);
-                    if(!transform.equals(comparisonTransform(requireRoot())))throw new AssertionError("Exact transform changed: "+label);
+                java.util.Set<Long> frames=new java.util.HashSet<>();frames.add(zoomed);
+                for(int step=1;step<=6;step++) {
+                    click("切换对比模式");SystemClock.sleep(100);
+                    frames.add(imageHash());
+                    if(!transform.equals(comparisonTransform(requireRoot())))throw new AssertionError("Cycle changed exact transform: "+step);
                 }
-                click("模型深度");SystemClock.sleep(200);long modelHash=imageHash();
-                saveComparisonScreenshot("comparison-model-depth");
-                for(String label:labels){click(label);if(imageHash()!=modelHash)throw new AssertionError("Shared model depth changed by projection mode");}
-                click("投影深度");click("V8 · External");saveComparisonScreenshot("comparison-projection-v8");
-                click("V10 · ComfyUI");saveComparisonScreenshot("comparison-projection-v10");click("SBS");
+                if(imageHash()!=zoomed)throw new AssertionError("Six clicks did not restore exact V10 frame");
+                if(frames.size()<2)throw new AssertionError("Mode button did not change image");
+                if(find("按默认参数生成")!=null || find("1280px")!=null)throw new AssertionError("Obsolete comparison controls remain");
                 pinch(bounds,true);drag(bounds,false);
                 getUiAutomation().setRotation(UiAutomation.ROTATION_FREEZE_90);SystemClock.sleep(700);
-                if(find("V10 · ComfyUI")==null)throw new AssertionError("Landscape hid mode controls");
+                if(find("切换对比模式")==null)throw new AssertionError("Landscape hid mode controls");
                 saveComparisonScreenshot("comparison-landscape");
                 getUiAutomation().setRotation(UiAutomation.ROTATION_FREEZE_0);SystemClock.sleep(700);
                 long beforeHome=imageHash();shell("input keyevent KEYCODE_HOME");SystemClock.sleep(700);
@@ -286,7 +295,7 @@ public final class StudioGestureInstrumentation extends Instrumentation {
                 if(imageHash()!=beforeHome)throw new AssertionError("Background return reset comparison view");
                 saveComparisonScreenshot("comparison-returned");
                 click("返回调试");
-                result.putString("result","PASS: long title single-row + long-press debug; real six-mode UI; five exact zoomed/panned V10 round-trip hashes; cross-center/held gestures; rotation; Home return; no comparison catalog writes");
+                result.putString("result","PASS: long title single-row + long-press debug; real six-mode UI; single-button six-mode cycle with exact zoom/pan and return-frame hash; cross-center/held gestures; rotation; Home return; no comparison catalog writes");
                 finish(-1,result);return;
             }
             if (kind.startsWith("video")) {

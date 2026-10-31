@@ -28,33 +28,29 @@ class ModeProfilesTest {
         assertEquals(3, restored.generationWorkers)
     }
 
-    @Test fun v6DefaultCompensatesHistoricalThreeByThreeInteriorGain() {
-        val d = FloatArray(51 * 51) { 0.7f }
-        val processed = DepthFilters.process(d, 51, 51, 3, false, DepthEdgeMode.LEGACY_V6)
-        val actual = processed[25 * 51 + 25] * ModeVisualProfile.defaults(DepthEdgeMode.LEGACY_V6).scale
-        assertEquals(0.7f * 50f, actual, 0.0001f)
-        assertEquals(50f, ModeVisualProfile.defaults(DepthEdgeMode.COMFY_LEGACY_V10).scale, 0f)
-        assertTrue(ModeVisualProfile.defaults(DepthEdgeMode.COMFY_LEGACY_V10).invert)
-    }
-
-    @Test fun externalDefaultMatchesV10DisparitySlopeAtActualEyeWidths() {
-        for (mode in listOf(DepthEdgeMode.REFERENCE_V8, DepthEdgeMode.REFERENCE_V9)) {
-            val params = ModeVisualProfile.defaults(mode).applyTo(AppSettings(edgeMode = mode)).toParams()
-            for (width in listOf(560, 960, 1280, 1536, 1920, 4096)) {
-                val externalSlope = width * params.effectiveScale(width) / 500f
-                val comfySlope = 255f * 50f / width
-                assertEquals(comfySlope, externalSlope, 0.00001f)
-            }
-            assertTrue(params.invertDepth) // Opposite static eye requires opposite depth direction.
+    @Test fun fixedDefaultsStayVisibleAndIndependentOfImageWidth() {
+        val expected = listOf(100f,45f,3.5f,3.5f,50f,50f)
+        DepthEdgeMode.entries.forEachIndexed { index, mode ->
+            val profile = ModeVisualProfile.defaults(mode)
+            assertEquals(expected[index], profile.scale, 0f)
+            assertFalse(profile.matchV10Default)
+            val params = profile.applyTo(AppSettings(edgeMode = mode)).toParams()
+            for (width in listOf(560,1280,4096)) assertEquals(profile.scale, params.effectiveScale(width), 0f)
         }
     }
 
-    @Test fun changingOutputWidthCannotSilentlyUseAFixedExternalDefaultUnit() {
-        val settings = ModeVisualProfile.defaults(DepthEdgeMode.REFERENCE_V9).applyTo(AppSettings(edgeMode = DepthEdgeMode.REFERENCE_V9))
-        assertEquals(settings.toParams().effectiveScale(1280) / 4f, settings.toParams().effectiveScale(2560), 0.00001f)
-        val custom = settings.copy(depthScale = 5f, matchV10Default = false).toParams()
-        assertEquals(5f, custom.effectiveScale(1280), 0f)
-        assertEquals(5f, custom.effectiveScale(2560), 0f)
+    @Test fun migratingAutoProfilesPreservesOtherVisualControls() {
+        val old = ModeVisualProfile(112.5f, blur=9, maxLongEdge=1920, matchV10Default=true)
+        val converted = ModeVisualProfile.editable(old, DepthEdgeMode.LEGACY_V6)
+        assertEquals(100f, converted.scale, 0f)
+        assertEquals(9, converted.blur)
+        assertEquals(1920, converted.maxLongEdge)
+        assertFalse(converted.matchV10Default)
+    }
+
+    @Test fun explicitUserValuesNeverMigrateToTheBuiltInDefault() {
+        val custom = ModeVisualProfile(27.25f, invertModelDepth=true)
+        assertSame(custom, ModeVisualProfile.editable(custom, DepthEdgeMode.LEGACY_V6))
     }
 
     @Test fun fractionalScalesAndCalibratedUnitsCannotCollideWithHistoricalCaches() {
