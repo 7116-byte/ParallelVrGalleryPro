@@ -1,6 +1,6 @@
 # 本机开发与交接
 
-正式项目：`E:\AI-Programme\ParallelVrGalleryPro`。恢复日期：2026-10-31（Asia/Shanghai）。历史恢复基线为 **1.2.00 / 10200**；当前正式迭代为 **1.3.00 / 10300**，详见 [studio-v1.3.00.md](studio-v1.3.00.md)。恢复历史来自离线 bundle，origin 为 `https://github.com/7116-byte/ParallelVrGalleryPro.git`。
+正式项目：`E:\AI-Programme\ParallelVrGalleryPro`。恢复日期：2026-10-31（Asia/Shanghai）。历史恢复基线为 **1.2.00 / 10200**；当前版本为 **1.3.01 / 10301**，详见 [studio-v1.3.01.md](studio-v1.3.01.md)。恢复历史来自离线 bundle，origin 为 `https://github.com/7116-byte/ParallelVrGalleryPro.git`。
 
 1.3.00 发布验收保留在 [历史记录](releases/v1.3.00.md)；当前修正为 **1.3.01 / 10301**，先读 [修复记录](studio-v1.3.01.md) 及 [发布验收](releases/v1.3.01.md)。原有恢复资料保留；私密资产仍只在 `.local/`。
 

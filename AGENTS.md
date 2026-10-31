@@ -34,7 +34,7 @@
 当前修正及证据还应先读 docs/studio-v1.3.01.md、docs/releases/v1.3.01.md。REFERENCE_V9 独立缓存 depthSSS22V9；当前参考设置从 V8 转 V9，旧缓存及已持久化的视频队列仍按原版本。不要把旧队列恢复改为偏好迁移入口。最终眼图浮点恢复/3×3 Gaussian 在量化前执行；V6/V7/V8 不变。参考 QA 可用 Debug kind=referenceRaster，只读写 PVG_QA_reference_1301 专属目录，不经过 MediaStore；所有私人素材及 .codex-attachments 均禁止提交。
 
 - 深浅跟随系统，统一 StudioTheme；手机/平板按可用宽度和字体缩放计算显示列数，不改用户保存的列数偏好。列表标题/提示整体随滚动移出，浮动操作槽以实测高度给内容留底部空间。
-- REFERENCE_V8 是显式可选的当前上游外部深度 V2.2 参考模式，cacheVersion 为 depthSSS22V8。保留 V6/V7 算法与原缓存键。它采用左眼原图、右眼相对图宽投影及 Telea 3px 补洞；强度单位不同，建议 5。不开旧滤波与旧水平填充，保留原模型和可选深度放大。不要暗中迁移既有模式或覆盖旧结果。
+- v1.3.00 引入的 REFERENCE_V8 仍可显式选择，cacheVersion 为 depthSSS22V8；当前参考设置使用上文 V9 修正。两者均采用左眼原图、右眼相对图宽投影及 Telea 3px 补洞；强度单位不同，建议 5。不开旧滤波与旧水平填充，保留原模型和可选深度放大。V6/V7 的当前选择、旧结果及已持久化任务不迁移。
 - 参考模式的额外原生缓冲计入自身内存预算，并串行限制作补洞分配；不能改变 GPU 拥有者线程或强制 GPU。
 - 正式发布使用 Build.ps1 -Variant Release，仍显式签原 debug 证书，但 APK 不可调试、无 Debug instrumentation。外部资产名继续 app-debug.apk，兼容所有历史更新器。不得用 CI 临时密钥发布。
 - Debug 专用 StudioGestureInstrumentation 只接受明确的 PVG_QA_ 测试相册/素材；正式包不含该入口。私人验收素材与截图仅存 .local/，不能提交。
