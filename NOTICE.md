@@ -48,4 +48,26 @@
 
 ## License Notes
 
+### v1.3.00 reference projection and inpainting
+
+The optional `REFERENCE_V8` mode independently implements the mathematical
+projection rules of SamSeenX/ComfyUI_SSStereoscope's external-depth V2.2 node
+at commit `30372fec69a1929ce6eb5fded8d23ba2604fd68f`:
+static left eye, width-relative right-eye shift, right-to-left splatting,
+an explicit hole mask and Telea inpainting with radius 3. It is distinct from
+the unchanged historical phone V6/V7 modes. The upstream README identifies MIT
+licensing; no upstream Python source is bundled in this App.
+
+OpenCV Android `org.opencv:opencv:4.12.0` supplies `Photo.inpaint` and is
+licensed under Apache-2.0. Its license is bundled in
+`assets/licenses/OpenCV-Apache-2.0.txt`. No PyTorch, ComfyUI server or new depth
+model is installed or required by this mode. Model inference and GPU ownership
+remain in the existing TFLite pipeline. This is not a claim of pixel identity
+with an entire ComfyUI workflow using different models or input depth.
+
+References:
+- https://github.com/SamSeenX/ComfyUI_SSStereoscope/blob/30372fec69a1929ce6eb5fded8d23ba2604fd68f/sbs_v2_with_external_depth.py
+- https://docs.opencv.org/4.12.0/d7/d8b/group__photo__inpaint.html
+- https://github.com/opencv/opencv/blob/4.12.0/LICENSE
+
 分发 APK、模型或派生版本时，请同时遵守 Android SDK、TensorFlow Lite、Depth Anything V2、Video Depth Anything、模型权重以及参考项目各自的许可证条款。

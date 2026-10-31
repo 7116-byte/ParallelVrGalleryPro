@@ -1,4 +1,4 @@
-﻿package com.local.parallelvrgallerypro
+package com.local.parallelvrgallerypro
 
 import android.Manifest
 import android.app.NotificationChannel
@@ -58,6 +58,33 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.TextButton
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.HelpOutline
+import androidx.compose.material.icons.filled.ListAlt
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
@@ -230,7 +257,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            MaterialTheme {
+            StudioTheme {
                 Surface(Modifier.fillMaxSize()) {
                     GalleryApp()
                 }
@@ -490,7 +517,7 @@ private val CURRENT_VERSION_TAG: String get() = "v${BuildConfig.VERSION_NAME}"
 private val CURRENT_VERSION_CODE: Long get() = BuildConfig.VERSION_CODE.toLong()
 private const val GITHUB_REPO = "7116-byte/ParallelVrGalleryPro"
 private const val MODEL_ASSET_REPO = "7116-byte/ParallelVrGallery"
-private const val UPDATE_APK_NAME = "app-debug.apk"
+private const val UPDATE_APK_NAME = UpdatePolicy.APK_NAME
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -1364,7 +1391,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun downloadFileWithProgress(urls: List<String>, output: File, lang: AppLanguage) {
         val errors = mutableListOf<String>()
-        urls.forEachIndexed { sourceIndex, sourceUrl ->
+        urls.forEach { sourceUrl ->
             if (output.exists()) output.delete()
             runCatching {
                 val connection = (URL(sourceUrl).openConnection() as HttpURLConnection).apply {
@@ -1378,7 +1405,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 }
                 connection.connect()
                 if (connection.responseCode !in 200..299) error("HTTP ${connection.responseCode}")
-                val total = connection.contentLengthLong.coerceAtLeast(1L)
+                val total = connection.contentLengthLong
                 var readTotal = 0L
                 connection.inputStream.use { input ->
                     FileOutputStream(output).use { fileOut ->
@@ -1388,13 +1415,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                             if (read <= 0) break
                             fileOut.write(buffer, 0, read)
                             readTotal += read
-                            val sourceBase = sourceIndex.toFloat() / urls.size.toFloat()
-                            val sourceSpan = 1f / urls.size.toFloat()
-                            val progress = (sourceBase + (readTotal.toFloat() / total.toFloat()) * sourceSpan).coerceIn(0f, 1f)
+                            val progress = UpdatePolicy.downloadFraction(readTotal, total)
                             _uiState.update {
                                 it.copy(
                                     updateDownloadProgress = progress,
-                                    updateStatus = lang.t(
+                                    updateStatus = if (progress < 0) lang.t("已下载 ${readTotal / 1024 / 1024} MB（${sourceUrl.hostLabel()}）", "Downloaded ${readTotal / 1024 / 1024} MB (${sourceUrl.hostLabel()})") else lang.t(
                                         "正在下载更新 ${(progress * 100f).roundToInt()}%（${sourceUrl.hostLabel()}）",
                                         "Downloading update ${(progress * 100f).roundToInt()}% (${sourceUrl.hostLabel()})",
                                     ),
@@ -1431,6 +1456,12 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun validateDownloadedUpdate(file: File, expectedTag: String?, lang: AppLanguage) {
         val (downloadedTag, downloadedCode) = downloadedApkVersion(file)
+        val archive = app.packageManager.getPackageArchiveInfo(file.absolutePath, PackageManager.GET_SIGNING_CERTIFICATES)
+            ?: error("Cannot inspect update signing certificate")
+        val digests = archive.signingInfo?.apkContentsSigners?.map { signature ->
+            MessageDigest.getInstance("SHA-256").digest(signature.toByteArray()).joinToString("") { "%02x".format(it.toInt() and 255) }
+        }.orEmpty()
+        UpdatePolicy.validate(archive.packageName, app.packageName, downloadedTag, downloadedCode, CURRENT_VERSION_TAG, CURRENT_VERSION_CODE, expectedTag, digests)
         if (compareVersionTags(downloadedTag, CURRENT_VERSION_TAG) <= 0 || downloadedCode <= CURRENT_VERSION_CODE) {
             error(
                 lang.t(
@@ -4160,7 +4191,7 @@ private class VrGenerator(
             mark("model session ready key=${params.depthSessionKey()}")
             onProgress(0.12f)
 
-            val decodeMaxLongEdge = memorySafeMaxLongEdge(photo.width, photo.height, params.maxLongEdge)
+            val decodeMaxLongEdge = memorySafeMaxLongEdge(photo.width, photo.height, params.maxLongEdge, params.edgeMode)
             if (decodeMaxLongEdge < params.maxLongEdge) {
                 mark("memory capped maxLongEdge ${params.maxLongEdge} -> $decodeMaxLongEdge")
             }
@@ -4198,7 +4229,7 @@ private class VrGenerator(
 
             val sbsStart = System.currentTimeMillis()
             val pair = runCatching {
-                makeParallelStereoPair(original, depthMap, params.depthScale, params.fillRadius)
+                makeParallelStereoPair(original, depthMap, params.depthScale, params.fillRadius, params.edgeMode)
             }.getOrElse { error ->
                 if (error !is OutOfMemoryError || max(original.width, original.height) <= 960) throw error
                 val retryLongEdge = max(960, (max(original.width, original.height) * 0.72f).roundToInt())
@@ -4212,7 +4243,7 @@ private class VrGenerator(
                 )
                 original.recycle()
                 original = reduced.also { ownedBitmaps.add(it) }
-                makeParallelStereoPair(original, depthMap, params.depthScale, params.fillRadius)
+                makeParallelStereoPair(original, depthMap, params.depthScale, params.fillRadius, params.edgeMode)
             }
             ownedBitmaps.add(pair.left)
             ownedBitmaps.add(pair.right)
@@ -4303,7 +4334,7 @@ private class VrGenerator(
         onRuntimeInfo: (String) -> Unit = {},
         depthSession: DepthModelSession? = null,
     ): Bitmap {
-        val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge)
+        val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge, params.edgeMode)
         val working = if (max(source.width, source.height) > safeMaxLongEdge) {
             val scale = safeMaxLongEdge.toFloat() / max(source.width, source.height).toFloat()
             Bitmap.createScaledBitmap(source, max(1, (source.width * scale).roundToInt()), max(1, (source.height * scale).roundToInt()), true)
@@ -4319,7 +4350,7 @@ private class VrGenerator(
                 }
             }
             val depthMap = prepareDepth(rawDepth, params, working.width, working.height)
-            return makeParallelSbs(working, depthMap, params.depthScale, params.fillRadius)
+            return makeParallelSbs(working, depthMap, params.depthScale, params.fillRadius, params.edgeMode)
         } finally {
             if (working !== source) working.recycle()
         }
@@ -4340,7 +4371,7 @@ private class VrGenerator(
         params: VrGenerationParams,
         depthSession: DepthModelSession,
     ): VideoDepthResult {
-        val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge)
+        val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge, params.edgeMode)
         val working = if (max(source.width, source.height) > safeMaxLongEdge) {
             val scale = safeMaxLongEdge.toFloat() / max(source.width, source.height).toFloat()
             Bitmap.createScaledBitmap(source, max(1, (source.width * scale).roundToInt()), max(1, (source.height * scale).roundToInt()), true)
@@ -4378,7 +4409,7 @@ private class VrGenerator(
         val depthPostMs = SystemClock.uptimeMillis() - depthPostStart
         val sbsStart = SystemClock.uptimeMillis()
         val eyes = try {
-            makeParallelStereoPair(depth.source, depthMap, params.depthScale, params.fillRadius)
+            makeParallelStereoPair(depth.source, depthMap, params.depthScale, params.fillRadius, params.edgeMode)
         } finally {
             depth.source.recycle()
         }
@@ -4428,14 +4459,14 @@ private class VrGenerator(
         return DepthModelSession(modelFile, params.modelThreads, params.useGpu, params.gpuTestMode, params.forceGpuNoFallback, onRuntimeInfo)
     }
 
-    private fun memorySafeMaxLongEdge(width: Int, height: Int, requested: Int): Int {
+    private fun memorySafeMaxLongEdge(width: Int, height: Int, requested: Int, mode: DepthEdgeMode): Int {
         val longEdge = max(width, height).takeIf { it > 0 } ?: requested
         val shortEdge = min(width, height).takeIf { it > 0 } ?: longEdge
         val ratio = shortEdge.toFloat() / longEdge.toFloat()
         val heap = Runtime.getRuntime()
         val heapAvailable = heap.maxMemory() - (heap.totalMemory() - heap.freeMemory())
         val budget = min(160L * 1024L * 1024L, max(48L * 1024L * 1024L, (heapAvailable * 55L) / 100L))
-        val bytesPerSourcePixel = 18f
+        val bytesPerSourcePixel = if (mode == DepthEdgeMode.REFERENCE_V8) 48f else 18f
         val requestedPixels = requested.toFloat() * requested.toFloat() * ratio
         val requestedBytes = requestedPixels * bytesPerSourcePixel
         if (requestedBytes <= budget) return requested
@@ -4483,7 +4514,11 @@ private class VrGenerator(
         return DepthPostProcessing.process(DepthMap(depth, 518, 518), width, height, params, max(1L, budget / 16))
     }
 
-    private fun makeParallelStereoPair(source: Bitmap, depth: DepthMap, depthScale: Float, fillRadius: Int): StereoBitmapPair {
+    private fun makeParallelStereoPair(source: Bitmap, depth: DepthMap, depthScale: Float, fillRadius: Int, mode: DepthEdgeMode = DepthEdgeMode.LEGACY_V6): StereoBitmapPair {
+        if (mode == DepthEdgeMode.REFERENCE_V8) {
+            val (left, right) = ReferenceStereoRenderer.render(source, depth.values, depth.width, depth.height, depthScale)
+            return StereoBitmapPair(left, right)
+        }
         val w = source.width
         val h = source.height
         val fill = fillRadius.coerceIn(1, 32)
@@ -4520,8 +4555,8 @@ private class VrGenerator(
         }
     }
 
-    private fun makeParallelSbs(source: Bitmap, depth: DepthMap, depthScale: Float, fillRadius: Int): Bitmap {
-        val pair = makeParallelStereoPair(source, depth, depthScale, fillRadius)
+    private fun makeParallelSbs(source: Bitmap, depth: DepthMap, depthScale: Float, fillRadius: Int, mode: DepthEdgeMode = DepthEdgeMode.LEGACY_V6): Bitmap {
+        val pair = makeParallelStereoPair(source, depth, depthScale, fillRadius, mode)
         return try {
             composeSbsBitmap(pair.left, pair.right)
         } finally {
@@ -5673,14 +5708,20 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
         pendingReplaceIndexes = emptyList()
     }
 
-    LaunchedEffect(state.hasPermission, state.hasVideoPermission, state.hasNotificationPermission) {
-        if (!state.hasPermission) {
-            launcher.launch(mediaPermissions())
-        } else if (!state.hasVideoPermission && Build.VERSION.SDK_INT >= 33) {
-            launcher.launch(arrayOf(Manifest.permission.READ_MEDIA_VIDEO))
-        } else if (!state.hasNotificationPermission && Build.VERSION.SDK_INT >= 33) {
-            launcher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val latestState by rememberUpdatedState(state)
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val images = hasImagePermission(context)
+                val videos = hasVideoPermission(context)
+                val notifications = hasNotificationPermission(context)
+                val current = latestState
+                if (images != current.hasPermission || videos != current.hasVideoPermission || notifications != current.hasNotificationPermission) viewModel.onPermissionChanged(images, videos, notifications)
+            }
         }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
     }
 
     if (!state.hasPermission) {
@@ -5773,7 +5814,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onBack = viewModel::closeDebug,
                 onShare = { viewModel.exportDebug(context, state.debugIndex ?: state.galleryAnchorIndex) },
             )
-            AppScreen.Viewer -> ViewerScreen(
+            AppScreen.Viewer -> StudioTheme(dark = true) { ViewerScreen(
                 state = state,
                 startIndex = state.selectedIndex ?: state.galleryAnchorIndex,
                 onClose = viewModel::closeViewer,
@@ -5782,6 +5823,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onRetry = viewModel::retry,
                 onOpenDebug = viewModel::openDebug,
             )
+            }
             AppScreen.Gallery -> GalleryScreen(
                 state = state,
                 onRefresh = viewModel::loadPhotos,
@@ -5831,16 +5873,10 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
 
 @Composable
 private fun PermissionScreen(lang: AppLanguage, onGrant: () -> Unit) {
-    Column(
-        modifier = Modifier.fillMaxSize().padding(24.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Text(lang.t("平行眼 VR 图库", "Parallel VR Gallery"), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(12.dp))
-        Text(lang.t("授权读取图片和视频后，可以浏览系统相册，并在本地生成平行眼 SBS VR 缓存。", "Allow image and video access to browse your gallery and build local parallel-eye VR cache."))
-        Spacer(Modifier.height(20.dp))
-        Button(onClick = onGrant) { Text(lang.t("授权图片和视频访问", "Grant access")) }
+    val context = LocalContext.current
+    StudioEmptyState(lang.t("让素材进入创作空间", "Bring media into your studio"), lang.t("允许访问图片和视频后，可在设备本地生成平行眼 VR。原图不会因浏览或生成缓存而被修改。通知仅用于后台任务进度。", "Allow photos and videos to generate parallel-eye VR on this device. Browsing and generating cache do not change originals. Notifications are for background progress."), Modifier.safeDrawingPadding()) {
+        Button(onClick = onGrant) { Text(lang.t("选择媒体访问权限", "Choose media access")) }
+        TextButton(onClick = { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + context.packageName))) }) { Text(lang.t("前往系统权限设置", "Open system permissions")) }
     }
 }
 
@@ -5853,7 +5889,7 @@ private data class GeneratedSelectionActionsState(
     val onDelete: () -> Unit,
 )
 
-@OptIn(ExperimentalFoundationApi::class)
+@OptIn(ExperimentalFoundationApi::class, ExperimentalLayoutApi::class)
 @Composable
 private fun GalleryScreen(
     state: UiState,
@@ -5889,30 +5925,14 @@ private fun GalleryScreen(
 ) {
     val lang = state.settings.language
     val density = LocalDensity.current
-    val view = LocalView.current
-    DisposableEffect(Unit) {
-        val window = (view.context as? Activity)?.window
-        val oldStatusBarColor = window?.statusBarColor
-        val oldSystemUiVisibility = window?.decorView?.systemUiVisibility
-        if (Build.VERSION.SDK_INT >= 21) {
-            window?.statusBarColor = Color.TRANSPARENT
-        }
-        if (Build.VERSION.SDK_INT >= 23) {
-            window?.decorView?.systemUiVisibility =
-                (oldSystemUiVisibility ?: 0) or
-                    android.view.View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                    android.view.View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
-                    android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
-        }
-        onDispose {
-            if (Build.VERSION.SDK_INT >= 21 && oldStatusBarColor != null) {
-                window?.statusBarColor = oldStatusBarColor
-            }
-            if (Build.VERSION.SDK_INT >= 23 && oldSystemUiVisibility != null) {
-                window?.decorView?.systemUiVisibility = oldSystemUiVisibility
-            }
-        }
-    }
+    val configuration = LocalConfiguration.current
+    var showGuide by rememberSaveable { mutableStateOf(false) }
+    var showTasks by rememberSaveable { mutableStateOf(false) }
+    var confirmReplace by remember { mutableStateOf(false) }
+    var dismissedMessage by remember { mutableStateOf<String?>(null) }
+    var dockHeightPx by remember { mutableStateOf(0) }
+    val bottomPadding = with(density) { dockHeightPx.toDp() } + 24.dp
+    val albumColumns = StudioLayout.columns(state.albumListColumns, configuration.screenWidthDp, configuration.fontScale, true)
     var lastPinchAt by remember { mutableStateOf(0L) }
     var selectedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
     var generatedSelectionActions by remember { mutableStateOf<GeneratedSelectionActionsState?>(null) }
@@ -5940,16 +5960,15 @@ private fun GalleryScreen(
         initialFirstVisibleItemScrollOffset = state.galleryScrollOffset.coerceAtLeast(0),
     )
     val gridState = if (state.homeTab == "albums" && state.selectedAlbumId != null) albumDetailGridState else allGridState
-    val timelineColumns = if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumDetailColumns else state.allColumns
+    val timelineColumns = StudioLayout.columns(if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumDetailColumns else state.allColumns, configuration.screenWidthDp, configuration.fontScale)
     var topBarHeightPx by remember { mutableStateOf(0) }
     val topContentPadding = with(density) { topBarHeightPx.toDp() }
     val topBarStatusText = if (state.homeTab == "generated" && state.selectedGeneratedVersion != null) {
-        state.selectedGeneratedVersion
+        cacheVersionTitle(state.selectedGeneratedVersion, lang)
     } else {
-        state.message?.let { lang.pickMixed(it) }
+        state.message?.let { lang.pickMixed(it) }?.takeUnless { it.startsWith("已加载最近") || it.startsWith("Loaded recent") }
     }
-    val minTopListPadding = if (topBarStatusText != null) 128.dp else 104.dp
-    val topListPadding = if (topContentPadding < minTopListPadding) minTopListPadding else topContentPadding
+    val topListPadding = topContentPadding
     val topBarScrollOffset = when {
         state.homeTab == "generated" && state.generatedTab == "videos" -> state.generatedVideoScrollIndex * 240 + state.generatedVideoScrollOffset
         state.homeTab == "generated" && state.selectedGeneratedVersion != null -> {
@@ -5960,22 +5979,11 @@ private fun GalleryScreen(
         state.homeTab == "albums" && state.selectedAlbumId == null -> albumListGridState.firstVisibleItemIndex * 240 + albumListGridState.firstVisibleItemScrollOffset
         else -> gridState.firstVisibleItemIndex * 240 + gridState.firstVisibleItemScrollOffset
     }
-    val topBarOverlap = topBarScrollOffset.coerceAtLeast(0).toFloat()
-    val topBarAlpha = if (topBarOverlap <= 0f || topBarHeightPx <= 0) {
-        1f
-    } else {
-        (1f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.58f).coerceIn(0.42f, 1f)
-    }
-    val topBarControlsAlpha = if (topBarOverlap <= 0f || topBarHeightPx <= 0) {
-        1f
-    } else {
-        (1f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.42f).coerceIn(0.58f, 1f)
-    }
     LaunchedEffect(state.homeTab) {
         if (state.homeTab != "generated") generatedSelectionActions = null
     }
 
-    Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).safeDrawingPadding().imePadding()) {
         Scaffold(
             containerColor = androidx.compose.ui.graphics.Color.Transparent,
             contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0.dp),
@@ -6000,6 +6008,7 @@ private fun GalleryScreen(
                         onOpenVersion = onOpenGeneratedVersion,
                         onCloseVersion = onCloseGeneratedVersion,
                         contentTopPadding = topListPadding + 8.dp,
+                        contentBottomPadding = bottomPadding,
                         onSetGeneratedColumns = { onSetPageColumns("generated", it) },
                         onGeneratedScroll = onGeneratedScroll,
                         onGeneratedVersionScroll = onGeneratedVersionScroll,
@@ -6017,6 +6026,8 @@ private fun GalleryScreen(
                         onGeneratedSelectionChange = { generatedSelectionActions = it },
                     )
                 }
+            } else if (state.homeTab != "generated" && (if (state.homeTab == "albums" && state.selectedAlbumId == null) state.albums.isEmpty() else visibleItems.isEmpty())) {
+                StudioEmptyState(lang.t("还没有可浏览的媒体", "No media to browse"), lang.t("授予媒体访问权限，或在系统图库添加图片与视频后刷新。", "Allow media access, or add photos and videos to your system gallery, then refresh.")) { OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) } }
             } else if (state.homeTab == "albums" && state.selectedAlbumId == null) {
                 Box(
                     Modifier
@@ -6024,25 +6035,25 @@ private fun GalleryScreen(
                         .padding(padding),
                 ) {
                     LazyVerticalGrid(
-                        columns = GridCells.Fixed(state.albumListColumns),
+                        columns = GridCells.Fixed(albumColumns),
                         state = albumListGridState,
                         modifier = Modifier
                             .fillMaxSize()
                             .discreteColumnPinch(
-                                columns = state.albumListColumns,
+                                columns = albumColumns,
                                 onColumns = { onSetPageColumns("albumList", it) },
                                 onPinchActivity = { lastPinchAt = System.currentTimeMillis() },
                             ),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 14.dp, top = topListPadding + 14.dp, end = 14.dp, bottom = 14.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 14.dp, top = topListPadding + 14.dp, end = 14.dp, bottom = bottomPadding),
                         verticalArrangement = Arrangement.spacedBy(14.dp),
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                     ) {
                         items(state.albums, key = { it.bucketId }) { album ->
-                            AlbumTile(album = album, lang = lang, columns = state.albumListColumns, onClick = { onOpenAlbum(album.bucketId) })
+                            AlbumTile(album = album, lang = lang, columns = albumColumns, onClick = { onOpenAlbum(album.bucketId) })
                         }
                     }
                     GridScrollbar(albumListGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-                    GridToTopButton(albumListGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
+                    GridToTopButton(albumListGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = bottomPadding))
                 }
             } else {
                 TimelineGrid(
@@ -6104,88 +6115,66 @@ private fun GalleryScreen(
             }
         }
         Column(
-            Modifier
-                .align(Alignment.TopCenter)
-                .fillMaxWidth()
-                .background(androidx.compose.ui.graphics.Color.White.copy(alpha = topBarAlpha))
-                .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 12.dp)
-                .onSizeChanged { topBarHeightPx = it.height },
+            Modifier.align(Alignment.TopCenter).fillMaxWidth()
+                .graphicsLayer { translationY = StudioLayout.headerOffset(topBarScrollOffset, topBarHeightPx) }
+                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.96f))
+                .onSizeChanged { topBarHeightPx = it.height }
+                .padding(horizontal = 12.dp, vertical = 6.dp),
         ) {
-                val generatedActions = generatedSelectionActions.takeIf { state.homeTab == "generated" }
-                if (selectedKeys.isEmpty() && generatedActions != null) {
-                    ManageSelectionActions(
-                        count = generatedActions.count,
-                        lang = lang,
-                        onClear = generatedActions.onClear,
-                        onSelectAll = generatedActions.onSelectAll,
-                        onSave = generatedActions.onSave,
-                        onRegenerate = generatedActions.onRegenerate,
-                        onDelete = generatedActions.onDelete,
-                    )
-                } else {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.graphicsLayer(alpha = topBarControlsAlpha),
-                    ) {
-                        if (selectedKeys.isEmpty()) {
-                            val title = when {
-                                state.homeTab == "albums" && state.selectedAlbumId != null -> state.albums.firstOrNull { it.bucketId == state.selectedAlbumId }?.name ?: lang.t("相册", "Album")
-                                state.homeTab == "albums" -> lang.t("相册", "Albums")
-                                else -> lang.t("全部", "All")
-                            }
-                            if (state.homeTab == "albums" && state.selectedAlbumId != null) {
-                                OutlinedButton(onClick = onCloseAlbum) { Text(lang.t("返回", "Back")) }
-                                Spacer(Modifier.width(8.dp))
-                            }
-                            if (state.homeTab == "generated") {
-                                RoundedPillTabs(
-                                    options = listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")),
-                                    selected = state.generatedTab,
-                                    onSelect = onSetGeneratedTab,
-                                )
-                                Spacer(Modifier.weight(1f))
-                            } else {
-                                Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                            }
-                            OutlinedButton(onClick = onSettings) { Text(lang.t("设置", "Settings")) }
-                            Spacer(Modifier.width(8.dp))
-                            OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) }
-                        } else {
-                            Text(lang.t("已选择 ${selectedKeys.size} 项", "${selectedKeys.size} selected"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                            OutlinedButton(onClick = { selectedKeys = emptySet() }) { Text(lang.t("取消", "Cancel")) }
-                            Spacer(Modifier.width(8.dp))
-                            Button(onClick = {
-                                onSaveGenerated(selectedIndexes)
-                                selectedKeys = emptySet()
-                            }) { Text(lang.t("保存", "Save")) }
-                            Spacer(Modifier.width(8.dp))
-                            Button(onClick = {
-                                onReplaceOriginal(selectedIndexes)
-                                selectedKeys = emptySet()
-                            }) { Text(lang.t("替换", "Replace")) }
-                        }
-                    }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if ((state.homeTab == "albums" && state.selectedAlbumId != null) || (state.homeTab == "generated" && state.selectedGeneratedVersion != null)) {
+                    IconButton(onClick = { if (state.homeTab == "albums") onCloseAlbum() else onCloseGeneratedVersion() }) { Icon(Icons.Default.ArrowBack, lang.t("返回", "Back")) }
                 }
-                topBarStatusText?.let {
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        text = it,
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.graphicsLayer(alpha = topBarControlsAlpha),
-                    )
+                Column(Modifier.weight(1f)) {
+                    Text(when (state.homeTab) {
+                        "generated" -> lang.t("生成", "Generated")
+                        "albums" -> state.selectedAlbumId?.let { id -> state.albums.firstOrNull { it.bucketId == id }?.name } ?: lang.t("相册", "Albums")
+                        else -> lang.t("全部", "All")
+                    }, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(if (state.homeTab == "generated") lang.t("结果与任务 · 按参数版本保留", "Results & jobs · kept by parameter version") else lang.t("选择素材，开始创作", "Choose media and create"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                SelectionActionIcon(Icons.Default.HelpOutline, lang.t("使用指南", "Guide")) { showGuide = true }
+                SelectionActionIcon(Icons.Default.ListAlt, lang.t("任务", "Tasks")) { showTasks = true }
+                SelectionActionIcon(Icons.Default.Settings, lang.t("设置", "Settings"), onSettings)
+                SelectionActionIcon(Icons.Default.Refresh, lang.t("刷新", "Refresh"), onRefresh)
+            }
+            if (state.homeTab == "generated") {
+                RoundedPillTabs(listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")), state.generatedTab, onSetGeneratedTab)
+            }
+            topBarStatusText?.takeIf { it != dismissedMessage }?.let { message ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(lang.pickMixed(message), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    IconButton(onClick = { dismissedMessage = message }, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Close, lang.t("收起提示", "Dismiss message"), Modifier.size(16.dp)) }
                 }
             }
-        HomeBottomNav(
-            current = state.homeTab,
-            lang = lang,
-            onSelect = {
-                selectedKeys = emptySet()
-                onSetTab(it)
-            },
-            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),
+        }
+        Surface(
+            modifier = Modifier.align(Alignment.BottomCenter).padding(horizontal = 12.dp, vertical = 8.dp).widthIn(max = 620.dp).fillMaxWidth().onSizeChanged { dockHeightPx = it.height },
+            color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = RoundedCornerShape(28.dp), shadowElevation = 6.dp,
+        ) {
+            val actions = generatedSelectionActions.takeIf { state.homeTab == "generated" }
+            if (actions != null) {
+                ManageSelectionActions(actions.count, lang, actions.onClear, actions.onSelectAll, actions.onSave, actions.onRegenerate, actions.onDelete,
+                    confirmChanges = !(state.generatedTab == "images" && state.selectedGeneratedVersion == null))
+            } else if (selectedKeys.isNotEmpty()) {
+                Column(Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
+                    Text(lang.t("已选 ${selectedKeys.size} 项 · 仅处理已生成图片", "${selectedKeys.size} selected · generated photos only"), style = MaterialTheme.typography.labelMedium)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        TextButton(onClick = { selectedKeys = emptySet() }) { Text(lang.t("取消", "Cancel")) }
+                        TextButton(onClick = { onSaveGenerated(selectedIndexes); selectedKeys = emptySet() }) { Text(lang.t("保存副本", "Save copies")) }
+                        TextButton(onClick = { confirmReplace = true }) { Text(lang.t("替换原图…", "Replace originals…")) }
+                    }
+                }
+            } else HomeBottomNav(state.homeTab, lang, { selectedKeys = emptySet(); onSetTab(it) })
+        }
+        if (showGuide) StudioGuideDialog(lang) { showGuide = false }
+        if (showTasks) StudioTasksSheet(state) { showTasks = false }
+        if (confirmReplace) AlertDialog(
+            onDismissRequest = { confirmReplace = false },
+            title = { Text(lang.t("替换所选原图？", "Replace selected originals?")) },
+            text = { Text(lang.t("仅替换所选项中已有生成结果的图片。这会改写系统原图，与保存副本不同；系统还会请求写入许可。", "Only selected photos with generated results are replaced. This changes original media, unlike Save copies. Android will also request write access.")) },
+            confirmButton = { Button(onClick = { confirmReplace = false; onReplaceOriginal(selectedIndexes); selectedKeys = emptySet() }) { Text(lang.t("继续", "Continue")) } },
+            dismissButton = { TextButton(onClick = { confirmReplace = false }) { Text(lang.t("取消", "Cancel")) } },
         )
     }
 }
@@ -6205,6 +6194,7 @@ private fun TimelineGrid(
     onNearEnd: () -> Unit,
     footerText: String?,
     contentTopPadding: androidx.compose.ui.unit.Dp = 8.dp,
+    contentBottomPadding: androidx.compose.ui.unit.Dp = 96.dp,
     modifier: Modifier = Modifier,
 ) {
     val restoreRenderLimit = min(items.size, max(1200, gridState.firstVisibleItemIndex + 400))
@@ -6248,7 +6238,7 @@ private fun TimelineGrid(
             modifier = Modifier
                 .fillMaxSize()
                 .discreteColumnPinch(columns = columns, onColumns = onColumns),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 8.dp, top = contentTopPadding, end = 8.dp, bottom = 8.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 8.dp, top = contentTopPadding, end = 8.dp, bottom = contentBottomPadding),
             verticalArrangement = Arrangement.spacedBy(3.dp),
             horizontalArrangement = Arrangement.spacedBy(3.dp),
         ) {
@@ -6292,14 +6282,14 @@ private fun TimelineGrid(
                     is TimelineCell.Footer -> Text(
                         text = cell.text ?: lang.t("已显示 ${cell.loaded}/${cell.total}，继续下滑自动加载更多", "Showing ${cell.loaded}/${cell.total}; keep scrolling to load more"),
                         style = MaterialTheme.typography.bodySmall,
-                        color = androidx.compose.ui.graphics.Color(0xff777777),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.fillMaxWidth().padding(14.dp),
                     )
                 }
             }
         }
         GridScrollbar(gridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-        GridToTopButton(gridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
+        GridToTopButton(gridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
     }
 }
 
@@ -6329,14 +6319,14 @@ private fun AlbumTile(album: AlbumItem, lang: AppLanguage, columns: Int, onClick
         Box(
             Modifier
                 .fillMaxWidth()
-                .aspectRatio(1.25f)
-                .background(androidx.compose.ui.graphics.Color(0xffe8eaed), RoundedCornerShape(18.dp)),
+                .aspectRatio(1.25f).clip(RoundedCornerShape(18.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(18.dp)),
         ) {
             AsyncMediaThumbnail(album.coverKind, album.coverUri, 420, ContentScale.Crop, Modifier.fillMaxSize())
         }
         Spacer(Modifier.height(textGap))
         Text(album.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold, fontSize = titleSize)
-        Text(lang.t("${album.count} 项", "${album.count} items"), color = androidx.compose.ui.graphics.Color(0xff777777), fontSize = countSize, maxLines = 1)
+        Text(lang.t("${album.count} 项", "${album.count} items"), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = countSize, maxLines = 1)
     }
 }
 
@@ -6348,7 +6338,7 @@ private fun GridScrollbar(
     val layoutInfo = gridState.layoutInfo
     val total = layoutInfo.totalItemsCount
     val visible = layoutInfo.visibleItemsInfo
-    if (total <= 0 || visible.isEmpty()) return
+    if (total <= 0 || visible.isEmpty() || total <= visible.size) return
     val first = visible.first().index
     val visibleCount = visible.size.coerceAtLeast(1)
     val thumbFraction = (visibleCount.toFloat() / total.toFloat()).coerceIn(0.06f, 1f)
@@ -6397,10 +6387,10 @@ private fun GridScrollbar(
 @Composable
 private fun HomeBottomNav(current: String, lang: AppLanguage, onSelect: (String) -> Unit, modifier: Modifier = Modifier) {
     Row(
-        modifier = modifier
-            .background(androidx.compose.ui.graphics.Color(0xccffffff), RoundedCornerShape(34.dp))
+        modifier = modifier.fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh, RoundedCornerShape(34.dp))
             .padding(6.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        horizontalArrangement = Arrangement.SpaceEvenly,
         verticalAlignment = Alignment.CenterVertically,
     ) {
         listOf(
@@ -6410,17 +6400,17 @@ private fun HomeBottomNav(current: String, lang: AppLanguage, onSelect: (String)
         ).forEach { (key, label) ->
             val selected = key == current
             Surface(
-                color = if (selected) androidx.compose.ui.graphics.Color(0xcc6650a4) else androidx.compose.ui.graphics.Color.Transparent,
+                color = if (selected) MaterialTheme.colorScheme.primary else androidx.compose.ui.graphics.Color.Transparent,
                 shape = RoundedCornerShape(28.dp),
-                modifier = Modifier
+                modifier = Modifier.weight(1f)
                     .clip(RoundedCornerShape(28.dp))
                     .clickable { onSelect(key) },
             ) {
                 Text(
                     text = label,
-                    color = if (selected) androidx.compose.ui.graphics.Color.White else androidx.compose.ui.graphics.Color(0xff333333),
+                    color = if (selected) androidx.compose.ui.graphics.Color.White else MaterialTheme.colorScheme.onSurface,
                     fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                    modifier = Modifier.padding(horizontal = 22.dp, vertical = 12.dp),
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
                 )
             }
         }
@@ -6436,7 +6426,7 @@ private fun RoundedPillTabs(
 ) {
     Row(
         modifier = modifier
-            .background(androidx.compose.ui.graphics.Color(0xccffffff), RoundedCornerShape(28.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh, RoundedCornerShape(28.dp))
             .padding(3.dp),
         horizontalArrangement = Arrangement.spacedBy(3.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -6444,7 +6434,7 @@ private fun RoundedPillTabs(
         options.forEach { (key, label) ->
             val active = key == selected
             Surface(
-                color = if (active) androidx.compose.ui.graphics.Color(0x99e9ddff) else androidx.compose.ui.graphics.Color.Transparent,
+                color = if (active) MaterialTheme.colorScheme.primaryContainer else androidx.compose.ui.graphics.Color.Transparent,
                 shape = RoundedCornerShape(24.dp),
                 modifier = Modifier
                     .clip(RoundedCornerShape(24.dp))
@@ -6452,7 +6442,7 @@ private fun RoundedPillTabs(
             ) {
                 Text(
                     text = label,
-                    color = if (active) androidx.compose.ui.graphics.Color(0xff3f2a78) else androidx.compose.ui.graphics.Color(0xff333333),
+                    color = if (active) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
                     fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 9.dp),
                 )
@@ -6510,7 +6500,7 @@ private fun Modifier.generatedGridDragSelection(
     val contentStartPaddingPx = with(LocalDensity.current) { contentStartPadding.toPx() }
     return pointerInput(gridState, contentStartPaddingPx) {
         awaitEachGesture {
-            val down = awaitFirstDown(requireUnconsumed = false)
+            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
             val selectionModeAtDown = currentSelectionMode
             var lastSelectedIndex: Int? = null
 
@@ -6537,23 +6527,35 @@ private fun Modifier.generatedGridDragSelection(
                 }
             }
 
-            val dragStart = if (selectionModeAtDown) {
-                awaitTouchSlopOrCancellation(down.id) { change, _ ->
-                    change.consume()
-                }?.also { change ->
-                    selectAt(down.position)
-                    selectAt(change.position)
+            var latest = down
+            // Observe before thumbnail click handlers consume stationary MOVE events.
+            // A scroll or a second finger cancels a fresh long press; selection-mode
+            // dragging takes ownership only after touch slop has been crossed.
+            val cancelled = withTimeoutOrNull(if (selectionModeAtDown) Long.MAX_VALUE else viewConfiguration.longPressTimeoutMillis) {
+                while (true) {
+                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                    val change = event.changes.firstOrNull { it.id == down.id }
+                    if (change == null || !change.pressed || event.changes.count { it.pressed } != 1) return@withTimeoutOrNull true
+                    latest = change
+                    if ((change.position - down.position).getDistance() > viewConfiguration.touchSlop) {
+                        return@withTimeoutOrNull !selectionModeAtDown
+                    }
                 }
-            } else {
-                awaitLongPressOrCancellation(down.id)?.also { change ->
-                    selectAt(change.position)
-                    change.consume()
-                }
-            } ?: return@awaitEachGesture
-
-            drag(dragStart.id) { change ->
-                selectAt(change.position)
+                @Suppress("UNREACHABLE_CODE") false
+            }
+            if (cancelled == true) return@awaitEachGesture
+            selectAt(down.position)
+            selectAt(latest.position)
+            latest.consume()
+            // Consume even stationary moves and UP before the thumbnail sees them;
+            // otherwise its click immediately toggles the long-pressed item off.
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Initial)
+                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                if (event.changes.count { it.pressed } > 1) break
                 change.consume()
+                if (!change.pressed) break
+                selectAt(change.position)
             }
         }
     }
@@ -6580,7 +6582,7 @@ private fun PhotoTile(
     val labelPaddingV = if (compact) 1.dp else 2.dp
     Box(
         modifier = Modifier
-            .fillMaxWidth()
+            .fillMaxWidth().semantics { contentDescription = photo.displayName; stateDescription = statusText }
             .aspectRatio(1f)
             .background(androidx.compose.ui.graphics.Color(0xff16191c))
             .combinedClickable(
@@ -6609,7 +6611,7 @@ private fun PhotoTile(
                 modifier = Modifier.align(Alignment.TopEnd).background(androidx.compose.ui.graphics.Color(0xcc111315)).padding(horizontal = 8.dp, vertical = 2.dp),
             )
         }
-        StatusBadge(
+        if (statusText != lang.t("原图", "Original") && statusText != lang.t("未生成", "Not generated")) StatusBadge(
             text = statusText,
             fontSize = labelSize,
             modifier = Modifier.align(Alignment.BottomStart),
@@ -6652,6 +6654,7 @@ private fun ManageScreen(
     onOpenVersion: (String) -> Unit,
     onCloseVersion: () -> Unit,
     contentTopPadding: androidx.compose.ui.unit.Dp = 0.dp,
+    contentBottomPadding: androidx.compose.ui.unit.Dp = 100.dp,
     onSetGeneratedColumns: (Int) -> Unit,
     onGeneratedScroll: (String, Int, Int) -> Unit,
     onGeneratedVersionScroll: (String, Int, Int) -> Unit,
@@ -6670,6 +6673,8 @@ private fun ManageScreen(
 ) {
     val lang = state.settings.language
     val tab = selectedTab
+    val config = LocalConfiguration.current
+    val gridColumns = StudioLayout.columns(state.generatedColumns, config.screenWidthDp, config.fontScale, tab == "videos" || state.selectedGeneratedVersion == null)
     var selectedImageKeys by remember { mutableStateOf(setOf<String>()) }
     var selectedVideoKeys by remember { mutableStateOf(setOf<String>()) }
     var selectedVersions by remember { mutableStateOf(setOf<String>()) }
@@ -6727,7 +6732,7 @@ private fun ManageScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(androidx.compose.ui.graphics.Color(0xfff5f6f7))
+            .background(MaterialTheme.colorScheme.background)
             .then(if (embedded) Modifier else Modifier.statusBarsPadding())
             .padding(
                 if (embedded) {
@@ -6799,19 +6804,16 @@ private fun ManageScreen(
                 Spacer(Modifier.height(8.dp))
             }
             if (videos.isEmpty()) {
-                Text(
-                    text = lang.t("暂无生成中或已生成的视频", "No generating or generated videos"),
-                    modifier = Modifier.padding(top = if (embedded) contentTopPadding else 0.dp),
-                )
+                StudioEmptyState(lang.t("还没有视频任务", "No video jobs yet"), lang.t("从全部或相册打开视频，手动加入 VR 队列。视频不会自动加入图片预加载。", "Open a video from All or Albums and add it to the VR queue. Videos are never added by image prefetch."), Modifier.padding(top = contentTopPadding, bottom = contentBottomPadding))
             } else {
                 Box(Modifier.fillMaxSize()) {
                     LazyVerticalGrid(
-                        columns = GridCells.Fixed(state.generatedColumns),
+                        columns = GridCells.Fixed(gridColumns),
                         state = videoGridState,
                         modifier = Modifier
                             .fillMaxSize()
-                            .background(androidx.compose.ui.graphics.Color.White)
-                            .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
+                            .background(MaterialTheme.colorScheme.background)
+                            .discreteColumnPinch(columns = gridColumns, onColumns = onSetGeneratedColumns)
                             .generatedGridDragSelection(
                                 gridState = videoGridState,
                                 selectionMode = selectedVideoKeys.isNotEmpty(),
@@ -6827,7 +6829,7 @@ private fun ManageScreen(
                             start = 8.dp,
                             top = if (embedded) contentTopPadding else 8.dp,
                             end = 8.dp,
-                            bottom = 8.dp,
+                            bottom = contentBottomPadding,
                         ),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -6839,39 +6841,34 @@ private fun ManageScreen(
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .background(androidx.compose.ui.graphics.Color(0xff16191c)),
+                                    .background(MaterialTheme.colorScheme.surface)
+                                    .clickable(enabled = index >= 0) {
+                                        if (selectedVideoKeys.isNotEmpty()) {
+                                            selectedVideoKeys = if (item.cacheKey in selectedVideoKeys) selectedVideoKeys - item.cacheKey else selectedVideoKeys + item.cacheKey
+                                        } else onOpenGeneratedVideo(index)
+                                    },
                             ) {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .aspectRatio(1f)
-                                        .clickable(
-                                            enabled = index >= 0,
-                                            onClick = {
-                                                if (selectedVideoKeys.isNotEmpty()) {
-                                                    selectedVideoKeys = if (item.cacheKey in selectedVideoKeys) selectedVideoKeys - item.cacheKey else selectedVideoKeys + item.cacheKey
-                                                } else {
-                                                    onOpenGeneratedVideo(index)
-                                                }
-                                            },
-                                        ),
+                                        .aspectRatio(1f),
                                 ) {
                                     AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
                                     if (item.cacheKey in selectedVideoKeys) SelectionBadge()
-                                    StatusBadge(
-                                        text = "${videoState.shortLabel(lang)} ${VideoProgress.percent(videoState, job?.progress)}%" +
-                                            (job?.let { " Cur ${it.currentFrameMs}ms Avg ${it.avgFrameMs}ms" } ?: ""),
-                                        fontSize = (10 - columnFontReduction(state.generatedColumns)).coerceAtLeast(7).sp,
-                                        modifier = Modifier.align(Alignment.BottomStart),
-                                        horizontalPadding = 2.dp,
-                                        verticalPadding = 1.dp,
-                                    )
+                                    StatusBadge(videoState.shortLabel(lang), fontSize = 12.sp, modifier = Modifier.align(Alignment.BottomStart))
+                                }
+                                Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text(item.displayName, style = MaterialTheme.typography.labelLarge, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                    Text(VideoProgress.frames(videoState, job?.currentFrame, job?.totalFrames)?.let { VideoProgress.percent(videoState, job?.progress).toString() + "% · " + it } ?: videoState.label(lang), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    if (videoState == VideoVrState.GENERATING || videoState == VideoVrState.QUEUED) LinearProgressIndicator(progress = { (job?.progress ?: 0f).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                                    job?.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis) }
+
                                 }
                             }
                         }
                     }
                     GridScrollbar(videoGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-                    GridToTopButton(videoGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
+                    GridToTopButton(videoGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
                 }
             }
         } else {
@@ -6879,10 +6876,7 @@ private fun ManageScreen(
                 LaunchedEffect(embedded) {
                     if (embedded) onGeneratedSelectionChange(null)
                 }
-                Text(
-                    text = lang.t("暂无已生成图片", "No generated images yet"),
-                    modifier = Modifier.padding(top = if (embedded) contentTopPadding else 0.dp),
-                )
+                StudioEmptyState(lang.t("创作结果会出现在这里", "Your creations will appear here"), lang.t("从全部或相册打开图片会自动开启 VR。结果按参数版本保存，长按可多选；不会改写系统原图。", "Opening a photo from All or Albums enables VR; use its Viewer switch to turn it off. Results are kept by parameter version; long press to select. Originals are unchanged."), Modifier.padding(top = contentTopPadding, bottom = contentBottomPadding))
             } else {
                 val selectedVersion = state.selectedGeneratedVersion
                 if (selectedVersion == null) {
@@ -6905,7 +6899,7 @@ private fun ManageScreen(
                             onClear = { selectedVersions = emptySet() },
                             onSelectAll = { selectedVersions = state.cacheVersions.mapTo(linkedSetOf()) { it.version } },
                             onSave = null, onRegenerate = { versionsToRegenerate = selectedVersions },
-                            onDelete = { versionsToDelete = selectedVersions })
+                            onDelete = { versionsToDelete = selectedVersions }, confirmChanges = false)
                     }
                     val versionGridState = rememberLazyGridState(
                         initialFirstVisibleItemIndex = state.generatedImageScrollIndex.coerceAtLeast(0),
@@ -6917,12 +6911,12 @@ private fun ManageScreen(
                     }
                     Box(Modifier.fillMaxSize()) {
                         LazyVerticalGrid(
-                            columns = GridCells.Fixed(state.generatedColumns.coerceIn(2, 6)),
+                            columns = GridCells.Fixed(gridColumns),
                             state = versionGridState,
                             modifier = Modifier
                                 .fillMaxSize()
-                                .background(androidx.compose.ui.graphics.Color.White)
-                                .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
+                                .background(MaterialTheme.colorScheme.background)
+                                .discreteColumnPinch(columns = gridColumns, onColumns = onSetGeneratedColumns)
                                 .generatedGridDragSelection(
                                     gridState = versionGridState,
                                     selectionMode = selectedVersions.isNotEmpty(),
@@ -6934,7 +6928,7 @@ private fun ManageScreen(
                                 start = 10.dp,
                                 top = if (embedded) contentTopPadding else 10.dp,
                                 end = 10.dp,
-                                bottom = 10.dp,
+                                bottom = contentBottomPadding,
                             ),
                             verticalArrangement = Arrangement.spacedBy(14.dp),
                             horizontalArrangement = Arrangement.spacedBy(14.dp),
@@ -6955,7 +6949,7 @@ private fun ManageScreen(
                             }
                         }
                         GridScrollbar(versionGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-                        GridToTopButton(versionGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
+                        GridToTopButton(versionGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
                     }
                 } else {
                     val itemsInVersion = state.managedCacheItems.filter { it.entry.version == selectedVersion }
@@ -7020,12 +7014,12 @@ private fun ManageScreen(
                         }
                         Box(Modifier.fillMaxSize()) {
                             LazyVerticalGrid(
-                                columns = GridCells.Fixed(state.generatedColumns),
+                                columns = GridCells.Fixed(gridColumns),
                                 state = imageGridState,
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .background(androidx.compose.ui.graphics.Color.White)
-                                    .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
+                                    .background(MaterialTheme.colorScheme.background)
+                                    .discreteColumnPinch(columns = gridColumns, onColumns = onSetGeneratedColumns)
                                     .generatedGridDragSelection(
                                         gridState = imageGridState,
                                         selectionMode = selectedImageKeys.isNotEmpty(),
@@ -7041,7 +7035,7 @@ private fun ManageScreen(
                                     start = 8.dp,
                                     top = if (embedded) contentTopPadding else 8.dp,
                                     end = 8.dp,
-                                    bottom = 8.dp,
+                                    bottom = contentBottomPadding,
                                 ),
                                 verticalArrangement = Arrangement.spacedBy(8.dp),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -7071,7 +7065,7 @@ private fun ManageScreen(
                                 }
                             }
                             GridScrollbar(imageGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-                            GridToTopButton(imageGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
+                            GridToTopButton(imageGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
                         }
                     }
                 }
@@ -7080,6 +7074,17 @@ private fun ManageScreen(
     }
 }
 
+private fun cacheVersionTitle(version: String, lang: AppLanguage): String {
+    val mode = when {
+        version.contains("_depthSSS22V8_") -> lang.t("参考新版 v2.2", "SSS reference v2.2")
+        version.contains("_depthV7_") -> lang.t("居中平滑", "Centered")
+        else -> lang.t("旧版兼容", "Legacy")
+    }
+    val scale = Regex("_s([0-9]+)_").find(version)?.groupValues?.get(1) ?: "—"
+    val edge = Regex("_m([0-9]+)_").find(version)?.groupValues?.get(1) ?: "—"
+    val upscale = if (version.contains("_du1_")) lang.t(" · 深度放大", " · Upsampled depth") else ""
+    return lang.t("$mode · 强度 $scale\n${edge}px$upscale", "$mode · Scale $scale\n${edge}px$upscale")
+}
 @Composable
 private fun GeneratedVersionTile(
     summary: CacheVersionSummary,
@@ -7121,8 +7126,8 @@ private fun GeneratedVersionTile(
         }
         Spacer(Modifier.height(6.dp))
         Text(
-            text = summary.version,
-            color = androidx.compose.ui.graphics.Color(0xff222222),
+            text = cacheVersionTitle(summary.version, lang),
+            color = MaterialTheme.colorScheme.onSurface,
             fontWeight = FontWeight.Bold,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
@@ -7130,7 +7135,7 @@ private fun GeneratedVersionTile(
         Text(
             text = "${(summary.bytes / 1024f / 1024f).roundToInt()} MB",
             style = MaterialTheme.typography.bodySmall,
-            color = androidx.compose.ui.graphics.Color(0xff666666),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
@@ -7151,15 +7156,16 @@ private fun GeneratedSbsThumbnail(entry: VrCacheEntry, maxSide: Int, contentScal
     }
     when {
         bitmap != null -> Image(bitmap!!.asImageBitmap(), contentDescription = null, modifier = modifier, contentScale = contentScale)
-        failed -> Box(modifier.background(androidx.compose.ui.graphics.Color(0xff202326)), contentAlignment = Alignment.Center) {
-            Text(lang.t("暂无预览", "No preview"), color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
+        failed -> Box(modifier.background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
+            Text(lang.t("暂无预览", "No preview"), color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.labelSmall)
         }
-        else -> Box(modifier.background(androidx.compose.ui.graphics.Color(0xff202326)), contentAlignment = Alignment.Center) {
+        else -> Box(modifier.background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
             CircularProgressIndicator(Modifier.size(22.dp))
         }
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ManageSelectionActions(
     count: Int,
@@ -7169,18 +7175,29 @@ private fun ManageSelectionActions(
     onSave: (() -> Unit)?,
     onRegenerate: (() -> Unit)?,
     onDelete: () -> Unit,
+    confirmChanges: Boolean = true,
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth().background(androidx.compose.ui.graphics.Color.White),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(0.dp),
-    ) {
-        Text(lang.t("已选 $count", "$count selected"), modifier = Modifier.weight(1f), fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        SelectionActionIcon(Icons.Default.Close, lang.t("取消", "Cancel"), onClear)
-        SelectionActionIcon(Icons.Default.SelectAll, lang.t("全选", "Select all"), onSelectAll)
-        onSave?.let { SelectionActionIcon(Icons.Default.SaveAlt, lang.t("保存", "Save"), it) }
-        onRegenerate?.let { SelectionActionIcon(Icons.Default.Replay, lang.t("重新生成", "Regenerate"), it) }
-        SelectionActionIcon(Icons.Default.DeleteOutline, lang.t("删除", "Delete"), onDelete)
+    var pending by remember { mutableStateOf<String?>(null) }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(lang.t("当前列表 · 已选 $count 项", "Current list · $count selected"), Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+            SelectionActionIcon(Icons.Default.Close, lang.t("取消选择", "Cancel selection"), onClear)
+        }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = onSelectAll) { Text(lang.t("全选", "Select all")) }
+            onSave?.let { TextButton(onClick = it) { Text(lang.t("保存副本", "Save copies")) } }
+            onRegenerate?.let { action -> TextButton(onClick = { if (confirmChanges) pending = "regenerate" else action() }) { Text(lang.t("重新生成", "Regenerate")) } }
+            TextButton(onClick = { if (confirmChanges) pending = "delete" else onDelete() }) { Text(lang.t("删除结果", "Delete results"), color = MaterialTheme.colorScheme.error) }
+        }
+    }
+    pending?.let { action ->
+        val deleting = action == "delete"
+        AlertDialog(onDismissRequest = { pending = null },
+            title = { Text(if (deleting) lang.t("删除所选 $count 项结果？", "Delete $count selected results?") else lang.t("重新生成所选 $count 项？", "Regenerate $count selected items?")) },
+            text = { Text(if (deleting) lang.t("仅删除所选生成结果并取消相关任务，不删除系统原图。", "Only selected generated results and related jobs are removed. Original media is kept.") else lang.t("使用当前设置重做所选项，可能覆盖目标参数版本；不启动邻图预加载，不改写系统原图。", "Regenerate the selection with current settings; the target parameter version may be replaced. No neighbor prefetch or original-media writes.")) },
+            confirmButton = { Button(onClick = { pending = null; if (deleting) onDelete() else onRegenerate?.invoke() }) { Text(lang.t("确认", "Confirm")) } },
+            dismissButton = { TextButton(onClick = { pending = null }) { Text(lang.t("取消", "Cancel")) } },
+        )
     }
 }
 
@@ -7205,6 +7222,7 @@ private fun SelectionBadge() {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SettingsScreen(
     settings: AppSettings,
@@ -7222,205 +7240,105 @@ private fun SettingsScreen(
     onInstallUpdate: () -> Unit,
 ) {
     val lang = settings.language
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(androidx.compose.ui.graphics.Color(0xfff5f6f7))
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-    ) {
+    val context = LocalContext.current
+    var section by rememberSaveable { mutableStateOf("general") }
+    StudioPage {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
-            Spacer(Modifier.width(12.dp))
-            Text(lang.t("设置", "Settings"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        }
-        Spacer(Modifier.height(16.dp))
-
-        SettingsSectionTitle(lang.t("公共设置", "General"))
-        Text(lang.t("语言", "Language"), fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(6.dp))
-        SingleChoiceSegmentedButtonRow {
-            listOf(AppLanguage.ZH to "中文", AppLanguage.EN to "English").forEachIndexed { index, option ->
-                SegmentedButton(
-                    selected = settings.language == option.first,
-                    onClick = { onChange(settings.copy(language = option.first)) },
-                    shape = SegmentedButtonDefaults.itemShape(index, 2),
-                ) { Text(option.second) }
+            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, lang.t("返回", "Back")) }
+            Column(Modifier.weight(1f)) {
+                Text(lang.t("创作设置", "Studio settings"), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+                Text(lang.t("参数仅影响新任务，已有结果保留", "New jobs use these settings; existing results stay"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-        Spacer(Modifier.height(16.dp))
-
-        OutlinedButton(onClick = onCheckUpdate) {
-            Text(lang.t("检查更新", "Check for updates"))
-        }
-        Spacer(Modifier.height(6.dp))
-        Text(
-            text = lang.t(
-                "当前版本：$CURRENT_VERSION_TAG ($CURRENT_VERSION_CODE)",
-                "Current version: $CURRENT_VERSION_TAG ($CURRENT_VERSION_CODE)",
-            ),
-            style = MaterialTheme.typography.bodySmall,
-        )
-        updateStatus?.let {
-            Spacer(Modifier.height(6.dp))
-            Text(it, style = MaterialTheme.typography.bodySmall)
-        }
-        if (updateDownloading) {
-            Spacer(Modifier.height(6.dp))
-            LinearProgressIndicator(progress = { updateDownloadProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
-        }
-        if (updateAvailable && updateApkPath == null && !updateDownloading) updateUrl?.let {
-            Spacer(Modifier.height(6.dp))
-            Button(onClick = onDownloadUpdate) {
-                Text(lang.t("下载更新", "Download update"))
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf("general" to lang.t("通用", "General"), "depth" to lang.t("深度与输出", "Depth & output"), "images" to lang.t("图片", "Images"), "video" to lang.t("视频", "Video")).forEach { (key, label) ->
+                FilterChip(selected = section == key, onClick = { section = key }, label = { Text(label) })
             }
         }
-        if (updateApkPath != null && !updateDownloading) {
-            Spacer(Modifier.height(6.dp))
-            Button(onClick = onInstallUpdate) {
-                Text(lang.t("安装更新", "Install update"))
+        when (section) {
+            "general" -> {
+                StudioCard(lang.t("偏好与权限", "Preferences & access"), lang.t("外观跟随系统的深浅模式", "Appearance follows your system")) {
+                    SettingChoice(lang.t("语言", "Language"), settings.language, AppLanguage.entries.toList(), { if (it == AppLanguage.ZH) "中文" else "English" }) { onChange(settings.copy(language = it)) }
+                    Text(lang.t("图片权限：${if (hasImagePermission(context)) "已允许" else "未允许"} · 视频权限：${if (hasVideoPermission(context)) "已允许" else "未允许"}", "Photos: ${if (hasImagePermission(context)) "allowed" else "not allowed"} · Videos: ${if (hasVideoPermission(context)) "allowed" else "not allowed"}"), style = MaterialTheme.typography.bodySmall)
+                    OutlinedButton(onClick = { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))) }) { Text(lang.t("管理媒体与通知权限", "Manage media & notifications")) }
+                }
+                StudioCard(lang.t("应用更新", "App updates"), "$CURRENT_VERSION_TAG · $CURRENT_VERSION_CODE") {
+                    updateStatus?.let { Text(lang.pickMixed(it), style = MaterialTheme.typography.bodyMedium) }
+                    if (updateDownloading) {
+                        if (updateDownloadProgress < 0) LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) else {
+                            LinearProgressIndicator(progress = { updateDownloadProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                            Text("${(updateDownloadProgress * 100).roundToInt()}%", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = onCheckUpdate, enabled = !updateDownloading) { Text(lang.t("检查更新", "Check for updates")) }
+                        if (updateAvailable && updateApkPath == null && !updateDownloading && updateUrl != null) Button(onClick = onDownloadUpdate) { Text(lang.t("下载更新", "Download update")) }
+                        if (updateApkPath != null && !updateDownloading) Button(onClick = onInstallUpdate) { Text(lang.t("安装更新", "Install update")) }
+                    }
+                    SettingHelp(lang.t("覆盖更新会保留原有媒体、设置与生成结果；不要卸载旧版。", "Update in place to keep media, settings and generated results. Do not uninstall."))
+                }
+                StudioCard(lang.t("开始创作", "Getting started")) {
+                    Text(lang.t("1  从全部或相册打开图片会自动开启 VR，可用 Viewer 开关关闭。\n2  当前图片先生成，再按该来源前后预加载；视频需要手动加入队列。\n3  在生成页查看参数版本、任务和结果，长按可多选。\n4  Viewer 中双击复位、双指缩放，左右眼保持同步。", "1  Opening a photo from All or Albums enables VR; use its Viewer switch to turn it off.\n2  The current photo starts first, then nearby photos in that source. Videos are queued manually.\n3  Generated holds parameter versions, jobs and results. Long press to select.\n4  Double tap to reset and pinch to zoom; both eyes stay synchronized."), style = MaterialTheme.typography.bodyMedium)
+                    SettingHelp(lang.t("生成缓存不等于修改原图。删除与重新生成会明确说明作用范围。GPU 和画质以设备实际结果为准。", "Generating cache does not change originals. Delete and regenerate actions explain their scope. GPU and visual results depend on the device."))
+                }
             }
-        }
-        Spacer(Modifier.height(16.dp))
-
-        Text(lang.t("边缘处理", "Edge processing"), fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(6.dp))
-        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-            DepthEdgeMode.entries.forEachIndexed { index, mode ->
-                SegmentedButton(
-                    selected = settings.edgeMode == mode,
-                    onClick = { onChange(settings.copy(edgeMode = mode)) },
-                    shape = SegmentedButtonDefaults.itemShape(index, DepthEdgeMode.entries.size),
-                ) {
-                    Text(when (mode) {
-                        DepthEdgeMode.LEGACY_V6 -> lang.t("旧版兼容", "Legacy")
-                        DepthEdgeMode.CENTERED_V7 -> lang.t("新版平滑", "Centered")
-                    })
+            "depth" -> {
+                StudioCard(lang.t("边缘与视差", "Edges & disparity")) {
+                    SettingChoice(lang.t("投影与边缘模式", "Projection & edge mode"), settings.edgeMode, listOf(DepthEdgeMode.REFERENCE_V8, DepthEdgeMode.LEGACY_V6, DepthEdgeMode.CENTERED_V7), { when (it) { DepthEdgeMode.LEGACY_V6 -> lang.t("旧版兼容 · depthV6", "Legacy · depthV6"); DepthEdgeMode.CENTERED_V7 -> lang.t("居中平滑 · depthV7", "Centered · depthV7"); DepthEdgeMode.REFERENCE_V8 -> lang.t("参考新版 v2.2 · Telea", "SSS reference v2.2 · Telea") } }) { onChange(settings.copy(edgeMode = it)) }
+                    SettingHelp(lang.t("旧版保留历史非对称取样与位移幅度；居中模式相同强度下可能产生更大视差。两种缓存独立保存，切换不会重做已有结果。", "Legacy keeps historical asymmetric sampling and gain. Centered may produce more disparity at the same strength. Both caches remain separate; switching does not regenerate results."))
+                    if (settings.edgeMode == DepthEdgeMode.REFERENCE_V8) SettingHelp(lang.t("参考当前上游外部深度 V2.2：左眼原图，右眼按图宽比例右移，遮挡洞使用 Telea 3px 修补。强度 5 约为图宽 1%，建议从 5 开始；不是旧版强度单位。此模式不使用旧滤波窗口和边缘填充，模型仍为原稳定模型。", "Current upstream external-depth V2.2: static left eye, width-relative right-eye projection and Telea 3px hole filling. Scale 5 means about 1% width; start at 5. These are not legacy units. Legacy filter/fill controls do not apply; the stable depth model is unchanged."))
+                    SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, (if (settings.edgeMode == DepthEdgeMode.REFERENCE_V8) listOf(1f, 2f, 5f, 10f, 20f, 30f, 50f) else listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f))) { onChange(settings.copy(depthScale = it)) }
+                    if (settings.edgeMode != DepthEdgeMode.REFERENCE_V8) SettingHelp(lang.t("控制水平位移，不是清晰度；越大立体感越强，也越容易拉伸轮廓。旧版单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。", "Controls disparity, not sharpness. Higher values increase depth and edge stretching. Legacy units: depth × 255 × scale / eye width; not a fixed percentage."))
+                    if (settings.edgeMode != DepthEdgeMode.REFERENCE_V8) {
+                    SettingInt(lang.t("深度图滤波窗口", "Depth filter window"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) { onChange(settings.copy(blurRadius = it)) }
+                    SettingHelp(lang.t("3 表示 3×3 窗口，不是插值次数；0/1 不滤波。默认在 518×518 深度图处理，先放大后平滑则作用于放大图。大窗口可能混合前后景。", "3 means a 3×3 window, not interpolation passes. 0/1 bypass. Filtering normally uses the 518×518 map; resize-first filters the larger map. Large windows can blend foreground and background."))
+                    SettingInt(lang.t("边缘填充（输出像素）", "Edge fill (output pixels)"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) { onChange(settings.copy(fillRadius = it)) }
+                    SettingHelp(lang.t("水平填充，不是 AI 补画。0 按 1 像素写入，较大值可能拉宽人物边缘。", "Horizontal fill, not AI inpainting. 0 writes one pixel. Wider fill can stretch silhouettes."))
+                    }
+                    StudioSwitch(lang.t("反转深度", "Invert depth"), lang.t("将 d 改为 1-d；不交换左右眼", "Uses 1-d; does not swap eyes"), settings.invertDepth) { onChange(settings.copy(invertDepth = it)) }
+                }
+                StudioCard(lang.t("深度放大", "Depth upsampling")) {
+                    DepthUpscaleControls(settings.depthUpscale, lang) { onChange(settings.copy(depthUpscale = it)) }
+                }
+                StudioCard(lang.t("输出尺寸", "Output size")) {
+                    SettingInt(lang.t("单眼最大长边", "Maximum eye long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) { onChange(settings.copy(maxLongEdge = it)) }
+                    SettingHelp(lang.t("不是 SBS 总宽。小图不强制放大；内存不足仍可能降采样。日常 JPEG 100 缓存有损，导出才编码无损 AVIF。", "Not total SBS width. Small images are not enlarged; memory pressure may downsample. Daily JPEG 100 cache is lossy; lossless AVIF is encoded on export."))
+                }
+            }
+            "images" -> {
+                StudioCard(lang.t("图片模型", "Image model"), modelWarmupStatus?.let(lang::pickMixed)) {
+                    ModelPicker(lang.t("模型", "Model"), settings.imageModelId, lang, ImageModels) { onChange(settings.copy(imageModelId = it.id, depthResolution = it.inputSize)) }
+                }
+                StudioCard(lang.t("来源预加载", "Source prefetch")) {
+                    SettingChoice(lang.t("前后范围", "Neighbor range"), if (settings.autoPrefetch) "auto" else settings.prefetchWindow.toString(), listOf("auto", "2", "4", "8"), { if (it == "auto") lang.t("自动 · 2 → 4 → 8", "Auto · 2 → 4 → 8") else lang.t("前后各 $it", "$it each side") }) {
+                        onChange(settings.copy(autoPrefetch = it == "auto", prefetchWindow = if (it == "auto") 2 else it.toInt()))
+                    }
+                    SettingHelp(lang.t("当前图优先，邻图只来自进入时的全部/相册范围。自动档在同档范围内补位，最多前八后八；固定档不反向补位。生成页不新增邻图预加载。", "Current image first. Neighbors stay in the captured All/Album scope. Auto borrows within each tier, up to ±8; fixed tiers do not borrow. Generated never creates neighbor prefetch."))
+                    SettingInt(lang.t("后台 worker 数", "Background workers"), settings.generationWorkers, listOf(1, 2, 3)) { onChange(settings.copy(generationWorkers = it)) }
+                    SettingHelp(lang.t("重叠解码、合成和写入；GPU 推理仍在拥有者线程串行运行，更多 worker 会增加内存。", "Overlaps decode, composition and writes. GPU inference remains serialized on its owner; more workers consume more memory."))
+                }
+                StudioCard(lang.t("图片推理", "Image inference")) {
+                    SettingInt(lang.t("每会话 CPU 线程", "CPU threads per session"), settings.modelThreads, listOf(1, 2, 4, 8)) { onChange(settings.copy(modelThreads = it)) }
+                    StudioSwitch(lang.t("强制 GPU", "Force GPU"), lang.t("失败会报错，不自动回退 CPU", "Failures are reported; no silent CPU fallback"), settings.useGpu) { onChange(settings.copy(useGpu = it)) }
+                    GpuModePicker(settings.gpuTestMode, lang) { onChange(settings.copy(gpuTestMode = it)) }
+                    SettingHelp(lang.t("GPU 模式供图片和视频共用，不是占用率限制。解释器与 delegate 的创建、推理、释放都在同一拥有者线程。关闭 GPU 才使用 CPU。", "GPU mode is shared by images and video; it is not a utilization cap. Interpreter/delegate creation, inference and release share one owner thread. Disable GPU to use CPU."))
+                }
+            }
+            "video" -> {
+                StudioCard(lang.t("视频模型", "Video model")) {
+                    ModelPicker(lang.t("模型", "Model"), settings.videoModelId, lang, VideoModels) { onChange(settings.copy(videoModelId = it.id)) }
+                    val spec = modelSpec(settings.videoModelId)
+                    SettingHelp(lang.t("模型固定输入 ${spec.inputSize}×${spec.inputSize}，不会因深度放大提高推理分辨率。", "Fixed ${spec.inputSize}×${spec.inputSize} model input; upsampling does not increase inference resolution."))
+                }
+                StudioCard(lang.t("视频流水线", "Video pipeline"), lang.t("视频独立排队，不参与图片预加载", "Videos are queued separately from image prefetch")) {
+                    SettingInt(lang.t("每会话 CPU 线程", "CPU threads per session"), settings.videoModelThreads, listOf(1, 2, 4, 8)) { onChange(settings.copy(videoModelThreads = it)) }
+                    SettingInt(lang.t("深度 worker 数", "Depth workers"), settings.videoDepthWorkers, listOf(1, 2)) { onChange(settings.copy(videoDepthWorkers = it)) }
+                    StudioSwitch(lang.t("视频强制 GPU", "Force GPU for video"), lang.t("GPU 使用单会话；失败不回退 CPU", "One GPU session; no silent CPU fallback"), settings.videoUseGpu) { onChange(settings.copy(videoUseGpu = it)) }
+                    GpuModePicker(settings.gpuTestMode, lang) { onChange(settings.copy(gpuTestMode = it)) }
+                    SettingHelp(lang.t("CPU 可使用 1–2 个独立深度会话；GPU 固定一个。解码、推理、写入、编码为有界流水线。保留原始时间线与音频，播放使用单个 SBS 源。这里不控制播放速度。", "CPU supports 1–2 depth sessions; GPU uses one. Decode, inference, writes and encoding form a bounded pipeline. Original timestamps and audio are retained, with one SBS playback source. These settings do not change playback speed."))
                 }
             }
         }
-        Spacer(Modifier.height(8.dp))
-        SettingHelp(lang.t("旧版兼容：v1.0.06 的 depthV6，默认使用，保留原来的平滑和位移幅度。新版平滑：v1.0.07 的 depthV7，使用居中均值滤波；相同强度下位移通常更大，人物边缘可能不同。图片与视频共用此选项，两种缓存分开保存；切换不自动重做已有结果。", "Legacy restores v1.0.06 depthV6 smoothing and disparity gain and is the default. Centered uses v1.0.07 depthV7 box filtering; the same strength usually produces more disparity and different contours. Applies to images and videos. Caches are separate; switching does not regenerate existing results."))
-        SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f)) {
-            onChange(settings.copy(depthScale = it))
-        }
-        SettingHelp(lang.t("控制左右眼的水平位移，不是清晰度。沿用旧版单位：位移约为深度值 × 255 × 强度 ÷ 单眼宽度。同一数值在不同分辨率下并不等于固定百分比；越大立体感越强，也越容易出现轮廓拉伸。", "Controls horizontal disparity, not sharpness. Legacy units: depth x 255 x scale / eye width. It is not a fixed percentage across resolutions. Larger values increase depth and edge stretching."))
-        SettingInt(lang.t("深度图滤波窗口", "Depth filter window"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) {
-            onChange(settings.copy(blurRadius = it))
-        }
-        SettingHelp(lang.t("新版数值是窗口边长：3 表示 3×3，5 表示 5×5，不是重复插值次数；旧版保留历史非对称取样及幅度处理。0/1 不滤波。默认在 518×518 深度图上进行；若选先放大后平滑，则作用在放大后的深度图。同一窗口在两种尺寸下影响范围不同。大窗口可能混合人物与背景边界。", "Centered values are window sizes: 3 means 3x3, not three interpolation passes. Legacy retains its historical sampling and gain. 0/1 bypass. Default filtering uses the 518x518 map; Resize then smooth filters the larger map, so the same window covers a different area. Large windows can blend foreground/background boundaries."))
-        DepthUpscaleControls(settings.depthUpscale, lang) { onChange(settings.copy(depthUpscale = it)) }
-        SettingInt(lang.t("边缘填充", "Fill radius"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) {
-            onChange(settings.copy(fillRadius = it))
-        }
-        SettingHelp(lang.t("旧版水平像素填充宽度，单位是输出像素，不是 AI 补画半径。0 按 1 像素写入；较大值覆盖更多位移空隙，但可能拉宽肩膀、头发、椅背等边缘。左右眼方向和填充算法保持旧版。", "Legacy horizontal fill width in output pixels, not an AI inpainting radius. 0 writes one pixel. Wider fills cover more gaps but may stretch hair, shoulders or object edges. Eye order and fill algorithm are unchanged."))
-        SettingInt(lang.t("输出最大长边", "Max output long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) {
-            onChange(settings.copy(maxLongEdge = it))
-        }
-        SettingHelp(lang.t("限制单眼长边，不是双眼合并后的总宽；小图不会被强制放大。越大占用的内存和写入时间越多，内存不足时仍会降采样并写入日志。JPEG 100 缓存仍属于有损压缩。", "Limits each eye's long edge, not the combined SBS width. Small sources are not upscaled. Larger output needs more memory and write time; memory-driven downsampling is logged. JPEG 100 cache is still lossy."))
-        Spacer(Modifier.height(12.dp))
-
-        SettingsSectionTitle(lang.t("图片生成设置", "Image generation"))
-        modelWarmupStatus?.let {
-            Text(it, style = MaterialTheme.typography.bodySmall)
-            Spacer(Modifier.height(8.dp))
-        }
-        ModelPicker(
-            title = lang.t("图片模型选择", "Image model"),
-            selectedModelId = settings.imageModelId,
-            lang = lang,
-            models = ImageModels,
-            onSelect = { spec -> onChange(settings.copy(imageModelId = spec.id, depthResolution = spec.inputSize)) },
-        )
-        Text(lang.t("实验模型首次使用会单独下载；如果模型输入输出不兼容，会在日志里显示失败原因。", "Experimental models download separately on first use. Shape incompatibility is reported in logs."), style = MaterialTheme.typography.bodySmall)
-        Spacer(Modifier.height(16.dp))
-
-        Text(lang.t("预加载", "Prefetch"), fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(6.dp))
-        SingleChoiceSegmentedButtonRow {
-            val options = listOf("auto", "2", "4", "8")
-            options.forEachIndexed { index, option ->
-                val selected = if (option == "auto") settings.autoPrefetch else !settings.autoPrefetch && settings.prefetchWindow == option.toInt()
-                SegmentedButton(
-                    selected = selected,
-                    onClick = {
-                        if (option == "auto") onChange(settings.copy(autoPrefetch = true, prefetchWindow = 2))
-                        else onChange(settings.copy(autoPrefetch = false, prefetchWindow = option.toInt()))
-                    },
-                    shape = SegmentedButtonDefaults.itemShape(index, options.size),
-                ) { Text(if (option == "auto") lang.t("自动", "Auto") else option) }
-            }
-        }
-        Spacer(Modifier.height(14.dp))
-        SettingHelp(lang.t("先启动当前图片，再让邻图进入流水线。自动档按来源列表从前后 2 扩到 4、8，遇到无图、视频或已完成项可向另一侧补位，最多前后各 8；固定档不反向补位。生成页只运行已入队或因切来源暂停的任务，不新建邻图预加载。", "The current image starts first, then neighboring images enter the pipeline. Auto expands within the source list from +/-2 to +/-4 and +/-8, borrowing opposite-side slots when needed. Fixed tiers do not borrow. Generated pages run existing jobs only and never create neighbor prefetch."))
-        SettingInt(lang.t("后台 worker 数", "Background workers"), settings.generationWorkers, listOf(1, 2, 3)) {
-            onChange(settings.copy(generationWorkers = it))
-        }
-        SettingHelp(lang.t("后台图片流水线数量；当前图有独立入口。GPU 推理统一串行调度，增加 worker 主要重叠解码、合成和写入，并不代表多个 GPU 同时推理；更多 worker 也会占用更多内存。", "Background image pipelines; the current image has a separate entry point. GPU inference is serialized. Extra workers overlap decoding, composition and writing rather than parallel GPU inference, and consume more RAM."))
-        SettingInt(lang.t("模型 CPU 线程", "Model CPU threads"), settings.modelThreads, listOf(1, 2, 4, 8)) {
-            onChange(settings.copy(modelThreads = it))
-        }
-        SettingHelp(lang.t("每个模型会话的 CPU 线程上限，不是后台任务数，也不是 GPU 占用率。线程越多未必越快，多个 worker 会叠加 CPU 负载。", "CPU threads per model session, not a job count or GPU utilization limit. More threads are not always faster; multiple workers add CPU load."))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(
-                checked = settings.useGpu,
-                onCheckedChange = { onChange(settings.copy(useGpu = it)) },
-            )
-            Text(lang.t("尝试 GPU 加速", "Try GPU acceleration"))
-        }
-        Text(lang.t("GPU 加速模式选择", "GPU acceleration mode"), fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(6.dp))
-        GpuModePicker(settings.gpuTestMode, lang) {
-            onChange(settings.copy(gpuTestMode = it))
-        }
-        SettingHelp(lang.t("自动：在 GPU 后端之间尝试，不是限制 GPU 占用。精确：优先精度，由运行时选后端。强制 OpenGL / OpenCL：只用指定后端，设备不支持会报错。系统推荐：采用 TFLite 给设备推荐的配置。此模式同时供图片和视频的 GPU 设置使用。", "Auto tries GPU configurations; it does not cap utilization. Accurate prioritizes precision with runtime backend selection. Forced OpenGL/OpenCL requires device support. System best uses TFLite's recommended options. The mode is shared by image and video GPU settings."))
-        Spacer(Modifier.height(6.dp))
-        Text(
-            lang.t(
-                "开启 GPU 后会强制使用所选 GPU 模式；失败或输出异常不会偷偷切 CPU。关闭 GPU 才会恢复 CPU。",
-                "When GPU is enabled, the selected GPU mode is forced. Failures or bad output will not silently fall back to CPU. Disable GPU to use CPU.",
-            ),
-            style = MaterialTheme.typography.bodySmall,
-        )
-        Spacer(Modifier.height(12.dp))
-
-        SettingsSectionTitle(lang.t("视频生成设置", "Video generation"))
-        ModelPicker(
-            title = lang.t("视频模型选择", "Video model"),
-            selectedModelId = settings.videoModelId,
-            lang = lang,
-            models = VideoModels,
-            onSelect = { spec -> onChange(settings.copy(videoModelId = spec.id)) },
-        )
-        SettingInt(lang.t("视频模型 CPU 线程", "Video model CPU threads"), settings.videoModelThreads, listOf(1, 2, 4, 8)) {
-            onChange(settings.copy(videoModelThreads = it))
-        }
-        SettingInt(lang.t("视频深度 worker 数", "Video depth workers"), settings.videoDepthWorkers, listOf(1, 2)) {
-            onChange(settings.copy(videoDepthWorkers = it))
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(
-                checked = settings.videoUseGpu,
-                onCheckedChange = { onChange(settings.copy(videoUseGpu = it)) },
-            )
-            Text(lang.t("视频生成尝试 GPU 加速", "Try GPU for video generation"))
-        }
-        SettingHelp(lang.t("仅影响视频生成。CPU 模式可使用 1–2 个独立深度会话；GPU 模式固定使用 1 个会话，避免重复占用 GPU。取帧、深度推理、缓存写入、编码是有界流水线；此处不是播放速度或帧率设置。视频 CPU 线程同样按每个会话计算。", "Video generation only. CPU supports 1-2 depth sessions; GPU uses one session to avoid duplicate GPU load. Decode, inference, cache and encode form a bounded pipeline. This is not playback speed or FPS. CPU threads are configured per session."))
-
-        Spacer(Modifier.height(12.dp))
-        Text(lang.t("深度图分辨率", "Depth resolution"), fontWeight = FontWeight.Bold)
-        val imageSpec = modelSpec(settings.imageModelId)
-        val videoSpec = modelSpec(settings.videoModelId)
-        Text(lang.t("图片 ${imageSpec.inputSize} x ${imageSpec.inputSize}；视频 ${videoSpec.inputSize} x ${videoSpec.inputSize}（由所选模型固定）", "Image ${imageSpec.inputSize} x ${imageSpec.inputSize}; video ${videoSpec.inputSize} x ${videoSpec.inputSize}. Fixed by selected models."), style = MaterialTheme.typography.bodySmall)
-        Spacer(Modifier.height(12.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(
-                checked = settings.invertDepth,
-                onCheckedChange = { onChange(settings.copy(invertDepth = it)) },
-            )
-            Text(lang.t("反转深度", "Invert depth"))
-        }
-        SettingHelp(lang.t("把处理后的深度值 d 改为 1-d，改变近远关系。不是交换左右画面，也不是修复人物边缘的开关。参数改变只影响之后的新任务；已有缓存保持原样，需要明确重新生成才会改变。", "Replaces processed depth d with 1-d and changes near/far perception. It does not swap eyes or repair contours. Changes apply to newly queued jobs; existing caches are unchanged until explicitly regenerated."))
     }
 }
 
@@ -7446,20 +7364,7 @@ private fun GpuModePicker(selected: GpuTestMode, lang: AppLanguage, onSelect: (G
         GpuTestMode.ACCURATE_OPENCL to lang.t("强制 OpenCL", "Force OpenCL"),
         GpuTestMode.BEST_COMPAT to lang.t("系统推荐", "System best"),
     )
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        options.forEach { (mode, label) ->
-            val modifier = Modifier.fillMaxWidth()
-            if (selected == mode) {
-                Button(onClick = { onSelect(mode) }, modifier = modifier) {
-                    Text(label)
-                }
-            } else {
-                OutlinedButton(onClick = { onSelect(mode) }, modifier = modifier) {
-                    Text(label)
-                }
-            }
-        }
-    }
+    SettingChoice(lang.t("GPU 后端（图片/视频共用）", "GPU backend (shared)"), selected, options.map { it.first }, { mode -> options.first { it.first == mode }.second }, onSelect)
 }
 
 @Composable
@@ -7549,7 +7454,7 @@ private fun <T> SettingChoice(title: String, value: T, options: List<T>, label: 
     var expanded by remember { mutableStateOf(false) }
     Text(title, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
     Box(Modifier.fillMaxWidth()) {
-        OutlinedButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth()) { Text(label(value)) }
+        OutlinedButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(label(value), modifier = Modifier.weight(1f)); Text("⌄") }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             options.forEach { option ->
                 DropdownMenuItem(text = { Text(label(option)) }, onClick = { expanded = false; onChange(option) })
@@ -7560,36 +7465,15 @@ private fun <T> SettingChoice(title: String, value: T, options: List<T>, label: 
 
 @Composable
 private fun SettingInt(title: String, value: Int, options: List<Int>, onChange: (Int) -> Unit) {
-    Text(title, fontWeight = FontWeight.Bold)
-    Spacer(Modifier.height(6.dp))
-    SingleChoiceSegmentedButtonRow {
-        options.forEachIndexed { index, option ->
-            SegmentedButton(
-                selected = value == option,
-                onClick = { onChange(option) },
-                shape = SegmentedButtonDefaults.itemShape(index, options.size),
-            ) { Text(option.toString()) }
-        }
-    }
-    Spacer(Modifier.height(14.dp))
+    SettingChoice(title, value, options, { it.toString() }, onChange)
 }
 
 @Composable
 private fun SettingFloat(title: String, value: Float, options: List<Float>, onChange: (Float) -> Unit) {
-    Text(title, fontWeight = FontWeight.Bold)
-    Spacer(Modifier.height(6.dp))
-    SingleChoiceSegmentedButtonRow {
-        options.forEachIndexed { index, option ->
-            SegmentedButton(
-                selected = abs(value - option) < 0.01f,
-                onClick = { onChange(option) },
-                shape = SegmentedButtonDefaults.itemShape(index, options.size),
-            ) { Text(option.roundToInt().toString()) }
-        }
-    }
-    Spacer(Modifier.height(14.dp))
+    SettingChoice(title, value, options, { it.roundToInt().toString() }, onChange)
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ViewerScreen(
     state: UiState,
@@ -7601,6 +7485,13 @@ private fun ViewerScreen(
     onOpenDebug: (Int) -> Unit,
 ) {
     val lang = state.settings.language
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    var resumed by remember { mutableStateOf(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) }
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, _ -> resumed = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
     val generatedViewer = state.viewerOrigin != ViewerOrigin.NORMAL
     val view = LocalView.current
     val context = view.context
@@ -7628,6 +7519,10 @@ private fun ViewerScreen(
     }
     val viewerItems = remember(state.photos, state.viewerScopeKeys, state.viewerScopeOrderedKeys) {
         viewerScopeIndices(state).map { it to state.photos[it] }
+    }
+    if (viewerItems.isEmpty()) {
+        StudioEmptyState(lang.t("此浏览范围已没有结果", "No results in this viewer scope"), lang.t("结果可能已被删除。返回列表重新选择，浏览范围不会回落到全部媒体。", "Results may have been deleted. Return to the list; this scope never falls back to all media.")) { Button(onClick = onClose) { Text(lang.t("返回", "Back")) } }
+        return
     }
     val initialPage = viewerItems.indexOfFirst { it.first == startIndex }.takeIf { it >= 0 } ?: 0
     val pagerState = rememberPagerState(initialPage = initialPage) { viewerItems.size }
@@ -7695,7 +7590,7 @@ private fun ViewerScreen(
                 val generated = state.videoEntries[photo.cacheKey]
                 val job = state.videoJobs.firstOrNull { it.item.cacheKey == photo.cacheKey }
                 val videoState = state.videoStates[photo.cacheKey] ?: VideoVrState.NORMAL
-                val activePage = page == pagerState.currentPage
+                val activePage = resumed && page == pagerState.currentPage
                 val playerContent: @Composable () -> Unit = {
                     VideoPlayer(
                         uri = generated?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri,
@@ -7736,12 +7631,12 @@ private fun ViewerScreen(
                 }
             }
         }
-        if (controlsVisible || !state.vrMode) {
-            Row(
-                modifier = Modifier.align(Alignment.TopStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
-                verticalAlignment = Alignment.CenterVertically,
+        if (controlsVisible) {
+            FlowRow(
+                modifier = Modifier.align(Alignment.TopStart).fillMaxWidth().background(MaterialTheme.colorScheme.surface.copy(alpha = 0.94f)).safeDrawingPadding().padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalArrangement = Arrangement.Center,
             ) {
-                OutlinedButton(onClick = onClose) { Text(lang.t("返回", "Back")) }
+                IconButton(onClick = onClose) { Icon(Icons.Default.Close, lang.t("返回", "Back")) }
                 Spacer(Modifier.width(8.dp))
                 val currentPair = viewerItems.getOrNull(pagerState.currentPage)
                 val currentIndex = currentPair?.first ?: startIndex
@@ -7780,7 +7675,7 @@ private fun ViewerScreen(
                     )
                 }
                 Spacer(Modifier.width(8.dp))
-                OutlinedButton(onClick = { onOpenDebug(currentIndex) }) { Text(lang.t("调试", "Debug")) }
+                SelectionActionIcon(Icons.Default.ListAlt, lang.t("诊断", "Diagnostics")) { onOpenDebug(currentIndex) }
             }
             val current = viewerItems.getOrNull(pagerState.currentPage)?.second
             if (!generatedViewer && state.vrMode && current?.kind != MediaKind.VIDEO) Column(
@@ -7798,9 +7693,9 @@ private fun ViewerScreen(
                         style = MaterialTheme.typography.bodySmall,
                     )
                     val recentLines = imageRecentGenerationLines(state, lang)
-                    repeat(3) { lineIndex ->
+                    recentLines.take(2).forEach { line ->
                         Text(
-                            text = recentLines.getOrNull(lineIndex).orEmpty(),
+                            text = line,
                             color = androidx.compose.ui.graphics.Color.White,
                             style = MaterialTheme.typography.labelSmall,
                             maxLines = 1,
@@ -7854,26 +7749,26 @@ private fun DebugScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(androidx.compose.ui.graphics.Color(0xff111315))
-            .statusBarsPadding()
+            .background(MaterialTheme.colorScheme.background)
+            .safeDrawingPadding().verticalScroll(rememberScrollState())
             .padding(12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
+            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, lang.t("返回", "Back")) }
             Spacer(Modifier.width(8.dp))
             Text(
                 text = lang.t("调试", "Debug"),
-                color = androidx.compose.ui.graphics.Color.White,
+                color = MaterialTheme.colorScheme.onSurface,
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.weight(1f),
             )
-            Button(onClick = onShare, enabled = !isVideo && entry != null) { Text(lang.t("分享调试包", "Share debug package")) }
+            if (!isVideo && entry != null) SelectionActionIcon(Icons.Default.Share, lang.t("分享调试包（包含媒体）", "Share diagnostics (includes media)"), onShare)
         }
         Spacer(Modifier.height(8.dp))
         Text(
             text = "${photo?.displayName.orEmpty()}  ${lang.t("状态", "State")}: ${if (isVideo) photo?.let { state.videoStates[it.cacheKey] } ?: VideoVrState.NORMAL else vrState}",
-            color = androidx.compose.ui.graphics.Color.White,
+            color = MaterialTheme.colorScheme.onSurface,
             style = MaterialTheme.typography.bodyMedium,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -7881,8 +7776,7 @@ private fun DebugScreen(
         Spacer(Modifier.height(8.dp))
         Column(
             modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState()),
+                .fillMaxWidth(),
         ) {
             if (isVideo) {
                 DebugSection(lang.t("视频运行状态", "Video runtime")) {
@@ -7992,10 +7886,10 @@ private fun DebugSection(title: String, content: @Composable ColumnScope.() -> U
         modifier = Modifier
             .fillMaxWidth()
             .padding(bottom = 8.dp)
-            .background(androidx.compose.ui.graphics.Color(0xff202326))
+            .background(MaterialTheme.colorScheme.surfaceContainer, RoundedCornerShape(18.dp))
             .padding(10.dp),
     ) {
-        Text(title, color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold)
+        Text(title, color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(4.dp))
         content()
     }
@@ -8004,8 +7898,8 @@ private fun DebugSection(title: String, content: @Composable ColumnScope.() -> U
 @Composable
 private fun DebugLine(label: String, value: String) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(label, color = androidx.compose.ui.graphics.Color(0xffc8cdd2), style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(96.dp))
-        Text(value, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelMedium, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(96.dp))
+        Text(value, color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.labelMedium, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
     }
 }
 
@@ -8013,7 +7907,7 @@ private fun DebugLine(label: String, value: String) {
 private fun DebugMonoLine(value: String) {
     Text(
         value,
-        color = androidx.compose.ui.graphics.Color.White,
+        color = MaterialTheme.colorScheme.onSurface,
         style = MaterialTheme.typography.labelSmall,
         maxLines = 2,
         overflow = TextOverflow.Ellipsis,
@@ -8065,6 +7959,52 @@ private fun DebugImagePanel(title: String, uri: Uri?, modifier: Modifier = Modif
                 ContentScale.Fit,
                 modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black),
             )
+        }
+    }
+}
+
+@Composable
+private fun StudioGuideDialog(lang: AppLanguage, onClose: () -> Unit) {
+    AlertDialog(onDismissRequest = onClose,
+        title = { Text(lang.t("开始创作", "Start creating")) },
+        text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(lang.t("打开素材 → VR 生成 → 查看结果", "Open media → Generate VR → View results"), fontWeight = FontWeight.SemiBold)
+            Text(lang.t("图片：当前图先生成，随后只在本次全部/相册范围内预加载。生成页不扩展预加载，视频需手动加入队列。", "Images start with the current photo, then prefetch within the captured All/Album source. Generated never expands prefetch; videos are queued manually."))
+            Text(lang.t("长按结果可多选。全选限当前列表；重新生成使用当前设置；删除只针对所选生成结果，不删除系统原图。", "Long press results to select. Select all stays in the current list. Regenerate uses current settings; Delete removes selected generated results, not originals."))
+            Text(lang.t("双指缩放、单指拖动、双击复位；双眼同步。点击画面收起控件。设置分为通用、深度与输出、图片、视频。", "Pinch to zoom, drag to pan and double tap to reset; both eyes stay synchronized. Tap the image to hide controls. Settings are grouped by General, Depth, Images and Video."))
+            Text(lang.t("保存副本与替换原图不同。替换会改写原始媒体，始终先阅读确认提示。", "Save copies and Replace originals are different. Replacing changes original media; always read its confirmation."), color = MaterialTheme.colorScheme.error)
+        } }, confirmButton = { Button(onClick = onClose) { Text(lang.t("知道了", "Got it")) } })
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun StudioTasksSheet(state: UiState, onClose: () -> Unit) {
+    val lang = state.settings.language
+    ModalBottomSheet(onDismissRequest = onClose, containerColor = MaterialTheme.colorScheme.background) {
+        Column(Modifier.fillMaxWidth().fillMaxHeight(0.85f).navigationBarsPadding().padding(horizontal = 20.dp)) {
+            Text(lang.t("任务与进度", "Tasks & progress"), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+            Text(lang.t("仅查看现有队列；不会新增任务或恢复所有暂停项。视频的暂停/续跑在 Viewer 中操作。", "View existing jobs only; opening this sheet does not enqueue or resume jobs. Pause/resume video in its Viewer."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 8.dp))
+            androidx.compose.foundation.lazy.LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 24.dp)) {
+                if (state.jobs.isEmpty() && state.videoJobs.isEmpty()) item { Text(lang.t("当前没有任务。从全部或相册打开素材开始。", "No jobs yet. Open media from All or Albums to begin."), Modifier.padding(vertical = 24.dp)) }
+                items(state.videoJobs.size, key = { "video_" + state.videoJobs[it].item.cacheKey }) { index ->
+                    val job = state.videoJobs[index]
+                    StudioCard(job.item.displayName, lang.t("视频 · ", "Video · ") + job.state.label(lang)) {
+                        val percent = VideoProgress.percent(job.state, job.progress)
+                        LinearProgressIndicator(progress = { percent / 100f }, modifier = Modifier.fillMaxWidth())
+                        Text("$percent% · " + (VideoProgress.frames(job.state, job.currentFrame, job.totalFrames) ?: lang.t("等待帧信息", "Waiting for frame information")), style = MaterialTheme.typography.bodySmall)
+                        job.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                    }
+                }
+                items(state.jobs.size, key = { "image_" + state.jobs[it].photoItem.cacheKey }) { index ->
+                    val job = state.jobs[index]
+                    StudioCard(job.photoItem.displayName, lang.t("图片 · ", "Image · ") + job.state.label(lang)) {
+                        val percent = if (job.state == VrState.READY) 100 else (job.progress * 100).roundToInt().coerceIn(0, 99)
+                        LinearProgressIndicator(progress = { percent / 100f }, modifier = Modifier.fillMaxWidth())
+                        Text("$percent% · " + (job.source?.name ?: "—"), style = MaterialTheme.typography.bodySmall)
+                        job.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                    }
+                }
+            }
         }
     }
 }
@@ -9443,6 +9383,9 @@ private fun loadModelFile(file: File): ByteBuffer {
 private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, outputWidth: Int, outputHeight: Int, timings: GenerationTimings, depth: DepthMap): String {
     val existing = org.json.JSONObject()
         .put("photoKey", photo.cacheKey).put("cacheVersion", cacheVersion()).put("displayName", photo.displayName)
+        .put("projection", if (edgeMode == DepthEdgeMode.REFERENCE_V8) "SSS_EXTERNAL_V2_2_30372fec" else "LEGACY_PHONE")
+        .put("inpaint", if (edgeMode == DepthEdgeMode.REFERENCE_V8) "OpenCV_4_12_TELEA_radius_3" else "HORIZONTAL_FILL")
+        .put("legacyFilterAndFillApplied", edgeMode != DepthEdgeMode.REFERENCE_V8)
         .put("sourceWidth", source.width).put("sourceHeight", source.height)
         .put("outputWidth", outputWidth).put("outputHeight", outputHeight)
         .put("depthModel", depthModel).put("outputMode", "SPLIT_EYES_JPEG_Q$IMAGE_EYE_JPEG_QUALITY")
@@ -9494,17 +9437,7 @@ private fun Throwable.shortMessage(): String {
 
 private fun Float.format3(): String = "%.3f".format(Locale.US, this)
 
-private fun compareVersionTags(left: String, right: String): Int {
-    val a = left.trim().removePrefix("v").split('.').map { it.toIntOrNull() ?: 0 }
-    val b = right.trim().removePrefix("v").split('.').map { it.toIntOrNull() ?: 0 }
-    val size = max(a.size, b.size)
-    for (index in 0 until size) {
-        val av = a.getOrElse(index) { 0 }
-        val bv = b.getOrElse(index) { 0 }
-        if (av != bv) return av.compareTo(bv)
-    }
-    return 0
-}
+private fun compareVersionTags(left: String, right: String): Int = UpdatePolicy.compare(left, right)
 
 private fun File.sha256(): String {
     val digest = MessageDigest.getInstance("SHA-256")

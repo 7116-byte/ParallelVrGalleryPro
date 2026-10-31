@@ -12,8 +12,8 @@ android {
         applicationId = "com.local.parallelvrgallerypro"
         minSdk = 30
         targetSdk = 35
-        versionCode = 10200
-        versionName = "1.2.00"
+        versionCode = 10300
+        versionName = "1.3.00"
     }
 
     buildFeatures {
@@ -50,5 +50,9 @@ dependencies {
     implementation("org.tensorflow:tensorflow-lite-gpu-api:2.16.1")
     implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
     implementation("com.github.awxkee:avif-coder:2.1.4")
+    // Targeted addition for the explicitly selected SSS V2.2 Telea inpaint mode.
+    implementation("org.opencv:opencv:4.12.0") {
+        exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk8")
+    }
     debugImplementation("androidx.compose.ui:ui-tooling:1.7.6")
 }

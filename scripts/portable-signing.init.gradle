@@ -1,0 +1,16 @@
+gradle.beforeProject { project ->
+    project.plugins.withId('com.android.application') {
+        def keyPath = System.getenv('PVG_SIGNING_KEYSTORE')
+        if (!keyPath || !new File(keyPath).isFile()) {
+            throw new GradleException('Original recovery signing key missing')
+        }
+        project.android.signingConfigs.getByName('debug').with {
+            storeFile = new File(keyPath)
+            storePassword = 'android'
+            keyAlias = 'androiddebugkey'
+            keyPassword = 'android'
+        }
+        // Production build, signed with the historical certificate for in-place upgrades.
+        project.android.buildTypes.getByName('release').signingConfig = project.android.signingConfigs.getByName('debug')
+    }
+}

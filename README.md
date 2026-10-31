@@ -2,6 +2,15 @@
 
 一个本地 Android 图库应用：按“全部 / 相册 / 生成”浏览系统图片和视频，并在手机本地生成平行眼 SBS VR 缓存。
 
+## v1.3.00 更新
+
+- 统一深浅跟随系统的创作工具界面：全部、相册、生成、Viewer、设置、任务、确认弹窗及权限引导。
+- 自然滚动标题与提示；底部圆角操作槽按实际高度避让内容和系统栏；手机/平板、横竖屏和大字体自适应。
+- 设置按通用、深度与输出、图片、视频分组；参数说明、生成版本名称、多选范围、任务进度与失败反馈更清楚。
+- 新增参考上游 SSS 外部深度 V2.2 的独立模式：按图宽投影、显式空洞掩码和 Telea 3px 修补。建议强度从 5 开始；它与旧版强度单位、眼序定义不同，不会覆盖原模式或旧结果。
+- LEGACY_V6 / CENTERED_V7、来源队列、删除 token、强制 GPU、单源 SBS、深度放大与旧参数缓存规则保留。
+- 更新包新增原证书校验，修正下载进度按镜像份数折算的问题。正式包使用原发布证书的 Release 构建；资产名继续 `app-debug.apk` 以兼容旧更新器。
+- 实现、验证边界及已知限制见 [docs/studio-v1.3.00.md](docs/studio-v1.3.00.md)。
 ## v1.2.00 更新
 
 - 生成图片相册首页多选后可批量重新生成，确认框显示图片数量；按当前设置、同一原图只入队一次，其他参数版本保留，不启动邻图预加载。
@@ -147,10 +156,10 @@ SBS 39ms
 
 ## 构建
 
+2026-10-31 恢复后的本机入口为根目录 `Verify-Restoration.cmd`（默认离线，测试、Lint、构建与原签名核验）。日常环境及证据路径见 [docs/development.md](docs/development.md)，本次结果和旧备份删除条件见 [docs/recovery-acceptance-2026-10-31.md](docs/recovery-acceptance-2026-10-31.md)。
+
 ```powershell
-$env:JAVA_HOME='D:\AndroidBuild\jdk17\jdk-17.0.19+10'
-$env:ANDROID_SDK_ROOT='D:\Android\Sdk'
-D:\AndroidBuild\gradle\gradle-8.10.2\bin\gradle.bat assembleDebug
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Build.ps1
 ```
 
 APK 输出：

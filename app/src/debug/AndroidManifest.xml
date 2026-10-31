@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Debug-only, explicitly invoked from adb. No instrumentation is shipped in Release. -->
+    <instrumentation android:name="com.local.parallelvrgallerypro.StudioGestureInstrumentation"
+        android:targetPackage="com.local.parallelvrgallerypro" android:label="Studio gesture regression" />
+</manifest>

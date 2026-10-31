@@ -5,12 +5,17 @@ import kotlin.math.min
 
 enum class DepthEdgeMode(val cacheVersion: String) {
     LEGACY_V6("depthV6"),
-    CENTERED_V7("depthV7");
+    CENTERED_V7("depthV7"),
+    REFERENCE_V8("depthSSS22V8");
 
     companion object {
         fun restore(name: String?, previousCacheVersion: String? = null): DepthEdgeMode =
             entries.firstOrNull { it.name == name }
-                ?: if (previousCacheVersion?.contains("_depthV7_") == true) CENTERED_V7 else LEGACY_V6
+                ?: when {
+                    previousCacheVersion?.contains("_depthSSS22V8_") == true -> REFERENCE_V8
+                    previousCacheVersion?.contains("_depthV7_") == true -> CENTERED_V7
+                    else -> LEGACY_V6
+                }
     }
 }
 
@@ -19,6 +24,12 @@ internal object DepthFilters {
         when (mode) {
             DepthEdgeMode.LEGACY_V6 -> legacyV6(depth, width, height, diameter, invert)
             DepthEdgeMode.CENTERED_V7 -> boxMean(depth, width, height, diameter, invert)
+            // The upstream external-depth V2.2 node does not apply its blur argument.
+            // Keep raw depth (and requested inversion); projection quantizes separately.
+            DepthEdgeMode.REFERENCE_V8 -> {
+                require(width > 0 && height > 0 && depth.size == width * height)
+                FloatArray(depth.size) { if (invert) 1f - depth[it] else depth[it] }
+            }
         }
 
     // Preserve v1.0.06's asymmetric filter and gain, including its edge normalization.
