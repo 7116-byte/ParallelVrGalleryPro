@@ -25,13 +25,15 @@
 
 ## 验证与备份边界
 
-恢复基线有 7 类、58 项 JVM 测试；v1.3.00 为 9 类、77 项，v1.3.01 为 10 类、81 项。实际通过数、Lint 数量、APK 哈希和签名以本次运行的 `.local/verification/runs/*/result.json` 为证，历史记录不能充当新验收。构建通过与真机通过分开记录。
+恢复基线有 7 类、58 项 JVM 测试；v1.3.00 为 9 类、77 项，v1.3.01 为 10 类、81 项，v1.4.00 为 13 类、93 项。实际通过数、Lint 数量、APK 哈希和签名以本次运行的 `.local/verification/runs/*/result.json` 为证，历史记录不能充当新验收。构建通过与真机通过分开记录。
 
 `.local/recovery/` 是完整旧备份的逐文件校验副本，保持不变；`.local/toolchain/` 是日常可写工具链。普通版的 bundle、含未提交改动的快照、旧工作副本、3.0.08 APK、共享签名/模型、v2.32 基准及技术记录均需保留。Pro 恢复完成不代表整个旧备份可删；删除条件见恢复验收记录。
 
 ## v1.3.00 UI 与参考模式
 
 当前还需先读 `docs/comfy-main-v1.4.00.md` 与 `docs/releases/v1.4.00.md`。COMFY_LEGACY_V10 / COMFY_SUBPIXEL_V11 对应 depthSSSMainV10 / depthSSSMainV11，均不自动迁移旧偏好、缓存或队列。主节点与 External 的眼序、强度单位、反转约定不同；测试预设为 60 / 3 / 反转开启、额外放大关闭。亚像素为本项目改良，不冒充官方版本或保证所有素材更优；CPU 投影更慢。原 58 项基线仍保留，当前新增测试以实际构建报告为准。Debug `kind=comfyRaster/comfyPipeline` 仅直接读写 `PVG_QA_comfy_1400`，不启动 Activity/ViewModel/MediaStore；使用缓冲流写浮点证据，PNG 对照导出标准 sRGB 像素，不能将色彩配置差异当作投影误差。
+
+设备验收可能与用户正常操作重叠。v1.4.00 收尾的平板新增 85 项已由用户确认是其主动查看效果产生，全部保留；不要误删或用旧队列覆盖新操作。旧/新队列按 key 合并，同 key 以当前记录为准，保留双方原字节快照。GUI 坐标必须在稳定的目标页面核验，安装器/设置确认与图库操作分开；不要在同一设备同时运行多个 uiautomator 控制器，也不要仅凭页面跳转和缓存增量推断是脚本触发。来源结论与实际用户反馈一起记录。
 
 当前修正及证据还应先读 docs/studio-v1.3.01.md、docs/releases/v1.3.01.md。REFERENCE_V9 独立缓存 depthSSS22V9；当前参考设置从 V8 转 V9，旧缓存及已持久化的视频队列仍按原版本。不要把旧队列恢复改为偏好迁移入口。最终眼图浮点恢复/3×3 Gaussian 在量化前执行；V6/V7/V8 不变。参考 QA 可用 Debug kind=referenceRaster，只读写 PVG_QA_reference_1301 专属目录，不经过 MediaStore；所有私人素材及 .codex-attachments 均禁止提交。
 
