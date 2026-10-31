@@ -2,6 +2,8 @@
 
 正式项目：`E:\AI-Programme\ParallelVrGalleryPro`。恢复日期：2026-10-31（Asia/Shanghai）。历史恢复基线为 **1.2.00 / 10200**；当前正式迭代为 **1.3.00 / 10300**，详见 [studio-v1.3.00.md](studio-v1.3.00.md)。恢复历史来自离线 bundle，origin 为 `https://github.com/7116-byte/ParallelVrGalleryPro.git`。
 
+1.3.00 已正式发布，完整构建、CI、公开下载和旧版 App 覆盖升级的证据入口见 [发布验收](releases/v1.3.00.md)。原有未提交恢复资料已保留并随本次正式提交归档；私密资产仍只在 `.local/`。
+
 ## 日常命令
 
 在项目根目录双击 `Verify-Restoration.cmd`，或执行：
