@@ -30,6 +30,10 @@ public final class StudioGestureInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if(kind.equals("bodyCalibration")) {
+                BodyCalibrationQa.run(getTargetContext());
+                result.putString("qa","PASS: user-supplied scales and V11/35 control rendered; only isolated QA inputs, no inference or queues");finish(0,result);return;
+            }
             if(kind.equals("referenceDirection")) {
                 FixedCalibrationQa.run(getTargetContext(),true);
                 result.putString("qa","PASS: V8/V9 reversed-depth candidate eye images rendered from fixed QA inputs; no new inference");finish(0,result);return;

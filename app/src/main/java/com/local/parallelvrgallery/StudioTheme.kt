@@ -11,6 +11,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.platform.LocalView
 import android.app.Activity
 import androidx.core.view.WindowCompat
@@ -55,6 +56,19 @@ private val StudioDark = darkColorScheme(
 @Composable
 fun StudioTheme(dark: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {
     val view = LocalView.current
+    val systemDark = isSystemInDarkTheme()
+    // A dark Viewer can outlive its light destination during AnimatedContent's exit.
+    // Restore system-theme icon contrast when that temporary theme leaves composition.
+    DisposableEffect(view, dark, systemDark) {
+        onDispose {
+            if (dark != systemDark) (view.context as? Activity)?.window?.let { window ->
+                WindowInsetsControllerCompat(window, view).apply {
+                    isAppearanceLightStatusBars = !systemDark
+                    isAppearanceLightNavigationBars = !systemDark
+                }
+            }
+        }
+    }
     SideEffect {
         (view.context as? Activity)?.window?.let { window ->
             WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -75,12 +89,15 @@ fun StudioTheme(dark: Boolean = isSystemInDarkTheme(), content: @Composable () -
 
 /** A bounded reading column; every control remains reachable with the IME or large fonts. */
 @Composable
-fun StudioPage(content: @Composable ColumnScope.() -> Unit) {
+fun StudioPage(header: (@Composable () -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).studioSafeArea().imePadding(), contentAlignment = Alignment.TopCenter) {
-        Column(
-            Modifier.widthIn(max = 840.dp).fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp), content = content,
-        )
+        Column(Modifier.widthIn(max = 840.dp).fillMaxWidth()) {
+            header?.let { Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) { it() } }
+            Column(
+                Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp), content = content,
+            )
+        }
     }
 }
 

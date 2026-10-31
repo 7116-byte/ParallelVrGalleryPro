@@ -81,6 +81,10 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.stateDescription
@@ -4486,6 +4490,7 @@ private class VrGenerator(
                 val modeSource = if (factor < 1f) Bitmap.createScaledBitmap(source,
                     max(1, (source.width * factor).roundToInt()), max(1, (source.height * factor).roundToInt()), true) else source
                 if (modeSource !== source) owned += modeSource
+                android.util.Log.i("ModeComparison", "${mode.name}: scale=${params.depthScale}, eye=${modeSource.width}x${modeSource.height}, blur=${params.blurRadius}, invert=${params.invertDepth}, inputInvert=${params.invertModelDepth}, upscale=${params.depthUpscale}")
                 val started = SystemClock.uptimeMillis()
                 val depth = prepareDepth(raw, params, modeSource.width, modeSource.height)
                 checkCurrent()
@@ -5968,6 +5973,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
         viewModel.closeAlbum()
     }
 
+    val pageState = rememberSaveableStateHolder()
     AnimatedContent(
         targetState = screen,
         transitionSpec = {
@@ -6004,6 +6010,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onGenerateImages = viewModel::generateAdditionalImages,
             )
             AppScreen.Settings -> SettingsScreen(
+                fromDebug = state.debugIndex != null,
                 settings = state.settings,
                 modelWarmupStatus = state.modelWarmupStatus,
                 updateStatus = state.updateStatus,
@@ -6021,15 +6028,16 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onDownloadUpdate = viewModel::downloadUpdateApk,
                 onInstallUpdate = { viewModel.installDownloadedUpdate(context) },
             )
-            AppScreen.Debug -> DebugScreen(
+            AppScreen.Debug -> pageState.SaveableStateProvider("debug-${state.debugIndex}") { DebugScreen(
                 state = state,
                 index = state.debugIndex ?: state.galleryAnchorIndex,
                 onBack = viewModel::closeDebug,
+                onSettings = viewModel::openSettings,
                 onCompare = { viewModel.startComparison(state.debugIndex ?: state.galleryAnchorIndex) },
                 onGenerate = { viewModel.generateAdditionalImages(listOf(state.debugIndex ?: state.galleryAnchorIndex)) },
                 onRegenerate = { viewModel.regenerateViewedImage(state.debugIndex ?: state.galleryAnchorIndex) },
                 onShare = { viewModel.exportDebug(context, state.debugIndex ?: state.galleryAnchorIndex) },
-            )
+            ) }
             AppScreen.Viewer -> StudioTheme(dark = true) { ViewerScreen(
                 state = state,
                 startIndex = state.selectedIndex ?: state.galleryAnchorIndex,
@@ -6202,8 +6210,19 @@ private fun GalleryScreen(
     LaunchedEffect(state.homeTab) {
         if (state.homeTab != "generated") generatedSelectionActions = null
     }
+    var headerY by rememberSaveable(state.homeTab, state.selectedAlbumId, state.selectedGeneratedVersion, state.generatedTab) { mutableStateOf(0f) }
+    val headerScroll = remember(state.homeTab, state.selectedAlbumId, state.selectedGeneratedVersion, state.generatedTab) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                headerY = (headerY + available.y).coerceIn(-topBarHeightPx.toFloat(), 0f)
+                return Offset.Zero
+            }
+        }
+    }
+    LaunchedEffect(topBarScrollOffset == 0) { if (topBarScrollOffset == 0) headerY = 0f }
 
-    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).studioSafeArea().imePadding()) {
+
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).studioSafeArea().imePadding().nestedScroll(headerScroll)) {
         Scaffold(
             containerColor = androidx.compose.ui.graphics.Color.Transparent,
             contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0.dp),
@@ -6337,7 +6356,7 @@ private fun GalleryScreen(
         }
         Column(
             Modifier.align(Alignment.TopCenter).fillMaxWidth()
-                .graphicsLayer { translationY = StudioLayout.headerOffset(topBarScrollOffset, topBarHeightPx) }
+                .graphicsLayer { translationY = headerY.coerceIn(-topBarHeightPx.toFloat(), 0f) }
                 .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.96f))
                 .onSizeChanged { topBarHeightPx = it.height }
                 .padding(horizontal = 12.dp, vertical = 6.dp),
@@ -6387,7 +6406,10 @@ private fun GalleryScreen(
                         TextButton(onClick = { confirmReplace = true }) { Text(lang.t("替换原图…", "Replace originals…")) }
                     }
                 }
-            } else HomeBottomNav(state.homeTab, lang, { selectedKeys = emptySet(); onSetTab(it) })
+            } else Row(verticalAlignment = Alignment.CenterVertically) {
+                HomeBottomNav(state.homeTab, lang, { selectedKeys = emptySet(); onSetTab(it) }, Modifier.weight(1f))
+                IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, lang.t("快捷设置", "Quick settings")) }
+            }
         }
         if (showGuide) StudioGuideDialog(lang) { showGuide = false }
         if (showTasks) StudioTasksSheet(state) { showTasks = false }
@@ -7479,6 +7501,7 @@ private fun SelectionBadge() {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SettingsScreen(
+    fromDebug: Boolean = false,
     settings: AppSettings,
     modelWarmupStatus: String?,
     updateStatus: String?,
@@ -7498,18 +7521,19 @@ private fun SettingsScreen(
 ) {
     val lang = settings.language
     val context = LocalContext.current
-    var section by rememberSaveable { mutableStateOf("general") }
+    var section by rememberSaveable(fromDebug) { mutableStateOf(if (fromDebug) "depth" else "general") }
     var defaultSaved by remember(settings.edgeMode) { mutableStateOf(false) }
     var defaultSaveFailed by remember(settings.edgeMode) { mutableStateOf(false) }
     LaunchedEffect(settings) { defaultSaved = false; defaultSaveFailed = false }
-    StudioPage {
+    StudioPage(header = {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, lang.t("返回", "Back")) }
+            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, if (fromDebug) lang.t("返回调试", "Back to diagnostics") else lang.t("返回", "Back")) }
             Column(Modifier.weight(1f)) {
                 Text(lang.t("创作设置", "Studio settings"), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
                 Text(lang.t("参数仅影响新任务，已有结果保留", "New jobs use these settings; existing results stay"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
+    }) {
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             listOf("general" to lang.t("通用", "General"), "depth" to lang.t("深度与输出", "Depth & output"), "images" to lang.t("图片", "Images"), "video" to lang.t("视频", "Video")).forEach { (key, label) ->
                 FilterChip(selected = section == key, onClick = { section = key }, label = { Text(label) })
@@ -7545,7 +7569,7 @@ private fun SettingsScreen(
             "depth" -> {
                 StudioCard(lang.t("边缘与视差", "Edges & disparity")) {
                     SettingChoice(lang.t("投影与边缘模式", "Projection & edge mode"), settings.edgeMode, listOf(DepthEdgeMode.COMFY_LEGACY_V10, DepthEdgeMode.LEGACY_V6, DepthEdgeMode.COMFY_SUBPIXEL_V11, DepthEdgeMode.REFERENCE_V9, DepthEdgeMode.CENTERED_V7, DepthEdgeMode.REFERENCE_V8), { when (it) { DepthEdgeMode.LEGACY_V6 -> lang.t("旧版兼容 · depthV6", "Legacy · depthV6"); DepthEdgeMode.CENTERED_V7 -> lang.t("居中平滑 · depthV7", "Centered · depthV7"); DepthEdgeMode.REFERENCE_V8 -> lang.t("参考旧结果 · 1.3.00", "Reference · 1.3.00"); DepthEdgeMode.REFERENCE_V9 -> lang.t("参考新版 · 平滑轮廓", "Reference · smooth contours"); DepthEdgeMode.COMFY_LEGACY_V10 -> lang.t("ComfyUI 主节点 · 原样兼容", "ComfyUI main · compatible"); DepthEdgeMode.COMFY_SUBPIXEL_V11 -> lang.t("ComfyUI 主节点 · 亚像素", "ComfyUI main · subpixel") } }) { onChange(settings.copy(edgeMode = it)) }
-                    SettingHelp(lang.t("各模式独立保存视觉参数，切换自动恢复。默认强度为固定数值：V6 100、V7 45、V8/V9 3.5、V10/V11 50。按单眼宽 1280 对齐 V10 50 的近似视差；不同路线的单位、轮廓和遮挡仍有区别。点击数值可输入修改。GPU 与队列设置共用。", "Each mode remembers its visual controls. Fixed native defaults approximate V10/50 at 1280 eye width; tap the numeric value to edit. Occlusion and convergence still differ. GPU and queue controls stay shared."))
+                    SettingHelp(lang.t("各模式独立保存视觉参数，切换自动恢复。默认强度为固定数值：V6 100、V7 45、V8/V9 3.5、V10/V11 50。曾按单眼宽 1280 的整体位移试调，不保证局部凸起感相同；不同路线的单位、轮廓和遮挡仍有区别。点击数值可输入修改。GPU 与队列设置共用。", "Each mode remembers its visual controls. Fixed native starting values were trialed on whole-image displacement at 1280 eye width, not local perceived depth; tap the numeric value to edit. Occlusion and convergence still differ. GPU and queue controls stay shared."))
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(onClick = { defaultSaved = onSaveDefault(); defaultSaveFailed = !defaultSaved }) { Text(lang.t("保存为默认值", "Save as default")) }
                         OutlinedButton(onClick = onResetDefault) { Text(lang.t("恢复此模式默认值", "Restore this mode's defaults")) }
@@ -7564,7 +7588,7 @@ private fun SettingsScreen(
                     }
                     if (settings.edgeMode == DepthEdgeMode.REFERENCE_V9) SettingHelp(lang.t("修正轮廓采样：先连续恢复浮点深度，再投影并用 Telea 3px 补洞。强度 5 约为图宽 1%。旧结果保留；遮挡区域仍可能模糊。", "Restores continuous float depth before projection and Telea 3px filling. Scale 5 is about 1% width. Existing results stay available; occluded regions can remain soft."))
                     else if (settings.edgeMode.isReference) SettingHelp(lang.t("参考当前上游外部深度 V2.2：左眼原图，右眼按图宽比例右移，遮挡洞使用 Telea 3px 修补。原生强度 5 约为图宽 1%；固定默认 3.5 是参照 V10 50 实图试调的近似值，单位与主节点不同。此模式不使用旧滤波窗口和边缘填充，模型仍为原稳定模型。", "Current upstream external-depth V2.2: static left eye, width-relative right-eye projection and Telea 3px hole filling. Scale 5 means about 1% width; the fixed default 3.5 approximates V10 scale 50 at 1280 eye width. These are not legacy units. Legacy filter/fill controls do not apply; the stable depth model is unchanged."))
-                    SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, if (settings.edgeMode.isReference) 100f else 500f) { onChange(settings.copy(depthScale = it, matchV10Default = false)) }
+                    SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, if (settings.edgeMode.isReference || settings.edgeMode.isComfyMain) 100f else 500f) { onChange(settings.copy(depthScale = it, matchV10Default = false)) }
                     if (!settings.edgeMode.isReference) SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。默认基准为 50；较大位移仍会放大遮挡缺陷。", "Main-node units: depth × 255 × scale / eye width, not a fixed percentage. The default baseline is 50; larger shifts expose more occlusion defects.") else lang.t("控制水平位移，不是清晰度；越大立体感越强，也越容易拉伸轮廓。旧版单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。", "Controls disparity, not sharpness. Higher values increase depth and edge stretching. Legacy units: depth × 255 × scale / eye width; not a fixed percentage."))
                     if (!settings.edgeMode.isReference) {
                     SettingInt(if (settings.edgeMode.isComfyMain) lang.t("最终深度平滑窗口", "Final depth Gaussian window") else lang.t("深度图滤波窗口", "Depth filter window"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) { onChange(settings.copy(blurRadius = it)) }
@@ -8052,6 +8076,7 @@ private fun DebugScreen(
     state: UiState,
     index: Int,
     onBack: () -> Unit,
+    onSettings: () -> Unit,
     onCompare: () -> Unit,
     onGenerate: () -> Unit,
     onRegenerate: () -> Unit,
@@ -8072,13 +8097,7 @@ private fun DebugScreen(
 
     val videoLogLines = remember(videoEntry?.logPath, videoEntry?.createdAt) { videoEntry?.logPath?.let { readLastLines(File(it), 18) } ?: emptyList() }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .safeDrawingPadding().verticalScroll(rememberScrollState())
-            .padding(12.dp),
-    ) {
+    StudioPage(header = {
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, lang.t("返回", "Back")) }
             Spacer(Modifier.width(8.dp))
@@ -8089,8 +8108,10 @@ private fun DebugScreen(
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.weight(1f),
             )
+            IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, lang.t("调试参数设置", "Diagnostic settings")) }
             if (!isVideo && entry != null) SelectionActionIcon(Icons.Default.Share, lang.t("分享调试包（包含媒体）", "Share diagnostics (includes media)"), onShare)
         }
+    }) {
         if (!isVideo && recordedParams != null) {
             DebugSection(lang.t("当前结果的实际参数", "Actual parameters of this result")) {
                 DebugLine(lang.t("模式", "Mode"), recordedParams.optString("edgeMode", "历史版本"))

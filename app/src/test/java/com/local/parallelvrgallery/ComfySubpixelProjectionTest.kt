@@ -4,6 +4,21 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ComfySubpixelProjectionTest {
+    @Test fun mainAndSubpixelUseTheSameStrengthUnitOnAnInteriorFeature() {
+        val width = 1280
+        val source = IntArray(width) { if (it in 400..430) 0xff00ff00.toInt() else 0xff000000.toInt() }
+        val depth = FloatArray(width) { .7f }
+        fun center(pixels: IntArray): Double {
+            val weights = pixels.map { ((it ushr 8) and 255).toDouble() }
+            return weights.indices.sumOf { it * weights[it] } / weights.sum()
+        }
+        val legacy = center(ComfyLegacyProjection.project(source, width, 1, depth, 35f)) - center(source)
+        val subpixel = center(ComfySubpixelProjection.project(source, width, 1, depth, 35f)) - center(source)
+        assertEquals(255.0 * .7 * 35 / width, subpixel, .03)
+        assertTrue(kotlin.math.abs(legacy - subpixel) < 1.0)
+        val low = center(ComfySubpixelProjection.project(source, width, 1, depth, 6f)) - center(source)
+        assertTrue(low < subpixel / 4)
+    }
     @Test fun zeroDepthKeepsEverySourcePixelAndRowsIndependent() {
         val source = IntArray(255 * 3) { 0xff000000.toInt() or (it * 13 and 0xffffff) }
         assertArrayEquals(source, ComfySubpixelProjection.project(source, 255, 3, FloatArray(source.size), 60f))
