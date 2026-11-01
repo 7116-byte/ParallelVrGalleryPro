@@ -23,6 +23,7 @@
 - 上游项目：https://github.com/DepthAnything/Depth-Anything-V2
 - 用途：当前图片和视频逐帧深度估计模型来源。
 - 说明：模型文件不提交到 Git；App 首次生成前从 Release 资产下载并校验 SHA-256。
+- v1.6.00 可选 Small 770 模型为本项目从原稳定 518 图转换的独立衍生资产，非上游官方 770 发布。位置编码插值和空间常量调整见 [技术记录](docs/depth-resolution-v1.6.00.md)；Small 与 DINOv2 的 Apache-2.0 授权和修改说明见 [许可证](docs/licenses/Depth-Anything-V2-APACHE-2.0.txt) 与 [来源说明](docs/licenses/Depth-Anything-V2-770-NOTICE.txt)。Release 随模型附完整 LICENSE 文件。
 
 ## Video Depth Anything
 
