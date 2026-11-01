@@ -81,9 +81,6 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.material.icons.filled.Share
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
@@ -487,6 +484,16 @@ private val ImageModels = listOf(
         sha256 = "B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F",
     ),
     ModelSpec(
+        id = "depth_anything_v2_small_770_v1",
+        displayName = "Depth Anything V2 Small 770（高分辨率）",
+        inputSize = 770,
+        fileName = "depth_anything_v2_small_770_v1.tflite",
+        url = "https://github.com/7116-byte/ParallelVrGalleryPro/releases/download/v1.6.00/depth_anything_v2_small_770_v1.tflite",
+        sha256 = "60efba90dbd854f72b9e8140fe349edbdfa464439872510a3ddd154b5e7d0596",
+        noteZh = "真实 770×770 输入与深度输出，约 101 MB。平板实测推理约为 518 的 4 倍耗时，首次 GPU 准备更慢；细节可能改善，不保证所有边缘更好。仅图片可选，原 518 保留。",
+        noteEn = "Real 770×770 input/output, about 101 MB. Tested tablet inference takes about 4× the 518 time, with slower initial GPU setup. Detail may improve; edges are not universally better. Optional for images; 518 stays available.",
+    ),
+    ModelSpec(
         id = "qualcomm_depth_anything_v2_tflite",
         displayName = "Qualcomm Depth Anything V2 TFLite 518（实验）",
         inputSize = 518,
@@ -499,7 +506,7 @@ private val ImageModels = listOf(
     ),
 )
 
-private val VideoModels = ImageModels + listOf(
+private val VideoModels = ImageModels.filter { it.inputSize == 518 } + listOf(
     ModelSpec(
         id = "video_depth_anything_small_pending",
         displayName = "Video Depth Anything Small（视频专用，待导入）",
@@ -3346,7 +3353,7 @@ private class SettingsStore(context: Context) {
             fillRadius = prefs.getInt("fillRadius", 10),
             invertDepth = invertDepth,
             maxLongEdge = prefs.getInt("maxLongEdge", 6000),
-            depthResolution = 518,
+            depthResolution = modelSpec(prefs.getString("imageModelId", oldModelId) ?: oldModelId).inputSize,
             generationWorkers = prefs.getInt("generationWorkers", 1),
             modelThreads = prefs.getInt("modelThreads", 4),
             useGpu = prefs.getBoolean("useGpu", false),
@@ -4340,8 +4347,8 @@ private class VrGenerator(
             val modelMs = System.currentTimeMillis() - depthStart
             mark("model inference ${modelMs}ms")
             val depthPostStart = System.currentTimeMillis()
-            val modelDepthBitmap = depthToBitmap(DepthMap(DepthDirection.modelDepth(rawDepth,
-                DepthDirection.reversed(params.edgeMode, params.invertModelDepth, params.invertDepth)), 518, 518))
+            val modelDepthBitmap = depthToBitmap(DepthTensorShape.map(DepthDirection.modelDepth(rawDepth,
+                DepthDirection.reversed(params.edgeMode, params.invertModelDepth, params.invertDepth))))
             try { FileOutputStream(File(dir, "model_depth.png")).use { modelDepthBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) } }
             finally { modelDepthBitmap.recycle() }
             var depthMap = prepareDepth(rawDepth, params, original.width, original.height)
@@ -4507,8 +4514,8 @@ private class VrGenerator(
                     val h = max(1, (source.height * factor).roundToInt())
                     return depthToBitmap(DepthResampling.resize(map, w, h, DepthInterpolation.BILINEAR))
                 }
-                val modelPreview = preview(DepthMap(DepthDirection.modelDepth(raw,
-                    DepthDirection.reversed(mode, params.invertModelDepth, params.invertDepth)), 518, 518)).also { owned += it }
+                val modelPreview = preview(DepthTensorShape.map(DepthDirection.modelDepth(raw,
+                    DepthDirection.reversed(mode, params.invertModelDepth, params.invertDepth)))).also { owned += it }
                 val projectionPreview = preview(depth).also { owned += it }
                 result += ModeComparisonImage(mode, left, right, params, params.effectiveScale(modeSource.width, depth), SystemClock.uptimeMillis() - started, modelPreview, projectionPreview)
                 checkCurrent()
@@ -4707,13 +4714,14 @@ private class VrGenerator(
         // Reserve space for resize/filter intermediates and the diagnostic bitmap per active job.
         val budget = (Runtime.getRuntime().maxMemory() / 8).coerceAtMost(96L * 1024 * 1024)
         val canonical = DepthDirection.modelDepth(depth, params.invertModelDepth)
-        val prepared = DepthPostProcessing.process(DepthMap(canonical, 518, 518), width, height, params, max(1L, budget / 16))
+        val modelDepth = DepthTensorShape.map(canonical)
+        val prepared = DepthPostProcessing.process(modelDepth, width, height, params, max(1L, budget / 16))
         if (params.edgeMode.isComfyMain) {
             val restored = ComfyLegacyStereoRenderer.prepareDepth(prepared.values, prepared.width, prepared.height, width, height, params.blurRadius, true)
             return DepthMap(restored, width, height, if (params.matchV10Default) 50f else null)
         }
         if (!params.matchV10Default) return prepared
-        val baseline = ComfyLegacyStereoRenderer.prepareDepth(canonical, 518, 518, width, height, 3, true)
+        val baseline = ComfyLegacyStereoRenderer.prepareDepth(canonical, modelDepth.width, modelDepth.height, width, height, 3, true)
         return prepared.copy(projectionScale = DefaultDisparityCalibration.scale(params, width, prepared.values, baseline))
     }
 
@@ -4845,7 +4853,7 @@ private class DepthModelRuntime(
     private val forceGpuNoFallback: Boolean,
     private val onRuntimeInfo: (String) -> Unit = {},
 ) : Closeable {
-    private val inputSize = 518
+    private val inputSize: Int
     private val model = loadModelFile(modelFile)
     private var gpuDelegate: GpuDelegate? = null
     private var interpreter: Interpreter
@@ -4853,9 +4861,9 @@ private class DepthModelRuntime(
     private var gpuValidated = false
     private var activeGpuMode: GpuMode? = null
     private val threadCount = modelThreads.coerceIn(1, 8)
-    private val input = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
-    private val pixels = IntArray(inputSize * inputSize)
-    private val output = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 4).order(ByteOrder.nativeOrder())
+    private val input: ByteBuffer
+    private val pixels: IntArray
+    private val output: ByteBuffer
 
     init {
         val gpuDiagnostics = mutableListOf<String>()
@@ -4877,7 +4885,15 @@ private class DepthModelRuntime(
                 }
             runCatching { compatibility?.close() }
         }
-        onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu forceGpu=$forceGpuNoFallback delegateActive=$delegateActive gpuMode=${activeGpuMode ?: "CPU"} reusedSession=true ${gpuDiagnostics.joinToString(" ")}")
+        try {
+            inputSize = DepthTensorShape.inputSize(interpreter.getInputTensor(0).shape(), interpreter.getOutputTensor(0).shape())
+            input = ByteBuffer.allocateDirect(inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
+            pixels = IntArray(inputSize * inputSize)
+            output = ByteBuffer.allocateDirect(inputSize * inputSize * 4).order(ByteOrder.nativeOrder())
+        } catch (error: Throwable) {
+            interpreter.close();gpuDelegate?.close();throw error
+        }
+        onRuntimeInfo("tflite runtime input=${inputSize}x$inputSize threads=$threadCount requestedGpu=$useGpu forceGpu=$forceGpuNoFallback delegateActive=$delegateActive gpuMode=${activeGpuMode ?: "CPU"} reusedSession=true ${gpuDiagnostics.joinToString(" ")}")
     }
 
     @Synchronized
@@ -6197,32 +6213,10 @@ private fun GalleryScreen(
         state.message?.let { lang.pickMixed(it) }?.takeUnless { it.startsWith("已加载最近") || it.startsWith("Loaded recent") }
     }
     val topListPadding = topContentPadding
-    val topBarScrollOffset = when {
-        state.homeTab == "generated" && state.generatedTab == "videos" -> state.generatedVideoScrollIndex * 240 + state.generatedVideoScrollOffset
-        state.homeTab == "generated" && state.selectedGeneratedVersion != null -> {
-            val version = state.selectedGeneratedVersion
-            (state.generatedVersionScrollIndexes[version] ?: 0) * 240 + (state.generatedVersionScrollOffsets[version] ?: 0)
-        }
-        state.homeTab == "generated" -> state.generatedImageScrollIndex * 240 + state.generatedImageScrollOffset
-        state.homeTab == "albums" && state.selectedAlbumId == null -> albumListGridState.firstVisibleItemIndex * 240 + albumListGridState.firstVisibleItemScrollOffset
-        else -> gridState.firstVisibleItemIndex * 240 + gridState.firstVisibleItemScrollOffset
-    }
     LaunchedEffect(state.homeTab) {
         if (state.homeTab != "generated") generatedSelectionActions = null
     }
-    var headerY by rememberSaveable(state.homeTab, state.selectedAlbumId, state.selectedGeneratedVersion, state.generatedTab) { mutableStateOf(0f) }
-    val headerScroll = remember(state.homeTab, state.selectedAlbumId, state.selectedGeneratedVersion, state.generatedTab) {
-        object : NestedScrollConnection {
-            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                headerY = (headerY + available.y).coerceIn(-topBarHeightPx.toFloat(), 0f)
-                return Offset.Zero
-            }
-        }
-    }
-    LaunchedEffect(topBarScrollOffset == 0) { if (topBarScrollOffset == 0) headerY = 0f }
-
-
-    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).studioSafeArea().imePadding().nestedScroll(headerScroll)) {
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).studioSafeArea().imePadding()) {
         Scaffold(
             containerColor = androidx.compose.ui.graphics.Color.Transparent,
             contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0.dp),
@@ -6356,8 +6350,6 @@ private fun GalleryScreen(
         }
         Column(
             Modifier.align(Alignment.TopCenter).fillMaxWidth()
-                .graphicsLayer { translationY = headerY.coerceIn(-topBarHeightPx.toFloat(), 0f) }
-                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.96f))
                 .onSizeChanged { topBarHeightPx = it.height }
                 .padding(horizontal = 12.dp, vertical = 6.dp),
         ) {
@@ -6406,10 +6398,7 @@ private fun GalleryScreen(
                         TextButton(onClick = { confirmReplace = true }) { Text(lang.t("替换原图…", "Replace originals…")) }
                     }
                 }
-            } else Row(verticalAlignment = Alignment.CenterVertically) {
-                HomeBottomNav(state.homeTab, lang, { selectedKeys = emptySet(); onSetTab(it) }, Modifier.weight(1f))
-                IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, lang.t("快捷设置", "Quick settings")) }
-            }
+            } else HomeBottomNav(state.homeTab, lang, { selectedKeys = emptySet(); onSetTab(it) })
         }
         if (showGuide) StudioGuideDialog(lang) { showGuide = false }
         if (showTasks) StudioTasksSheet(state) { showTasks = false }
@@ -7592,7 +7581,7 @@ private fun SettingsScreen(
                     if (!settings.edgeMode.isReference) SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。默认基准为 50；较大位移仍会放大遮挡缺陷。", "Main-node units: depth × 255 × scale / eye width, not a fixed percentage. The default baseline is 50; larger shifts expose more occlusion defects.") else lang.t("控制水平位移，不是清晰度；越大立体感越强，也越容易拉伸轮廓。旧版单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。", "Controls disparity, not sharpness. Higher values increase depth and edge stretching. Legacy units: depth × 255 × scale / eye width; not a fixed percentage."))
                     if (!settings.edgeMode.isReference) {
                     SettingInt(if (settings.edgeMode.isComfyMain) lang.t("最终深度平滑窗口", "Final depth Gaussian window") else lang.t("深度图滤波窗口", "Depth filter window"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) { onChange(settings.copy(blurRadius = it)) }
-                    SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点在实际单眼尺寸上执行 Gaussian，3 表示 3×3；0/1 不滤波。额外深度放大先执行，与旧模式滤波顺序不同。", "Main applies Gaussian at actual eye size: 3 means 3×3, 0/1 bypass. Optional upsampling runs first, separately from legacy filter order.") else lang.t("3 表示 3×3 窗口，不是插值次数；0/1 不滤波。默认在 518×518 深度图处理，先放大后平滑则作用于放大图。大窗口可能混合前后景。", "3 means a 3×3 window, not interpolation passes. 0/1 bypass. Filtering normally uses the 518×518 map; resize-first filters the larger map. Large windows can blend foreground and background."))
+                    SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点在实际单眼尺寸上执行 Gaussian，3 表示 3×3；0/1 不滤波。额外深度放大先执行，与旧模式滤波顺序不同。", "Main applies Gaussian at actual eye size: 3 means 3×3, 0/1 bypass. Optional upsampling runs first, separately from legacy filter order.") else lang.t("3 表示 3×3 窗口，不是插值次数；0/1 不滤波。默认在模型原生深度图尺寸处理，先放大后平滑则作用于放大图。大窗口可能混合前后景。", "3 means a 3×3 window, not interpolation passes. 0/1 bypass. Filtering normally uses the native model depth size; resize-first filters the larger map. Large windows can blend foreground and background."))
                     if (!settings.edgeMode.isComfyMain) {
                     SettingInt(lang.t("边缘填充（输出像素）", "Edge fill (output pixels)"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) { onChange(settings.copy(fillRadius = it)) }
                     SettingHelp(lang.t("水平填充，不是 AI 补画。0 按 1 像素写入，较大值可能拉宽人物边缘。", "Horizontal fill, not AI inpainting. 0 writes one pixel. Wider fill can stretch silhouettes."))
@@ -7604,8 +7593,10 @@ private fun SettingsScreen(
                     }
 
                 }
-                StudioCard(lang.t("深度放大", "Depth upsampling")) {
-                    SettingHelp(lang.t("当前模型实际输入为 518×518。下方仅对模型输出做插值，不会改变推理分辨率。", "Actual model input is 518×518. These controls resize its output, not the inference input."))
+                StudioCard(lang.t("模型推理与深度放大", "Model inference and depth upsampling")) {
+                    val depthModel = modelSpec(settings.imageModelId)
+                    SettingChoice(lang.t("图片模型推理分辨率", "Image model inference resolution"), settings.imageModelId, ImageModels.map { it.id }, { modelSpec(it).displayName }) { onChange(settings.copy(imageModelId = it, depthResolution = modelSpec(it).inputSize)) }
+                    SettingHelp(lang.t("实际输入与深度输出：${depthModel.inputSize}×${depthModel.inputSize}。770 对齐模型的 14 像素分块，需要首次下载约 101 MB；平板实测推理约慢 4 倍，首次 GPU 准备约 21 秒。细节不保证处处更好。下面的放大只是插值，不改变模型分辨率。", "Actual input/depth output: ${depthModel.inputSize}×${depthModel.inputSize}. 770 aligns to 14-pixel model patches and downloads about 101 MB. Tested tablet inference is about 4× slower, with about 21 seconds initial GPU setup. Detail is not universally better. Upsampling below only interpolates the output."))
                     DepthUpscaleControls(settings.depthUpscale, lang, settings.edgeMode.isComfyMain) { onChange(settings.copy(depthUpscale = it)) }
                 }
                 StudioCard(lang.t("输出尺寸", "Output size")) {

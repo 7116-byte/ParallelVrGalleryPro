@@ -1,8 +1,8 @@
 # 本机开发与交接
 
-正式项目：`E:\AI-Programme\ParallelVrGalleryPro`。恢复日期：2026-10-31（Asia/Shanghai）。历史恢复基线为 **1.2.00 / 10200**；当前版本为 **1.5.02 / 10502**，详见 [mode-controls-v1.5.01.md](mode-controls-v1.5.01.md)。恢复历史来自离线 bundle，origin 为 `https://github.com/7116-byte/ParallelVrGalleryPro.git`。
+正式项目：`E:\AI-Programme\ParallelVrGalleryPro`。恢复日期：2026-10-31（Asia/Shanghai）。历史恢复基线为 **1.2.00 / 10200**；当前版本为 **1.6.00 / 10600**，详见 [depth-resolution-v1.6.00.md](depth-resolution-v1.6.00.md)。恢复历史来自离线 bundle，origin 为 `https://github.com/7116-byte/ParallelVrGalleryPro.git`。
 
-先读 [参数入口与人体多点复核](navigation-and-body-v1.5.02.md) 及 [本版发布验收](releases/v1.5.02.md)，再读 [固定参数、反转与对比](mode-controls-v1.5.01.md)，再读 [主节点技术记录](comfy-main-v1.4.00.md)。历史发布与恢复资料保留；私密资产仍只在 `.local/`。
+先读 [固定透明顶栏与真实 770 推理](depth-resolution-v1.6.00.md) 及 [本版发布验收](releases/v1.6.00.md)，再读 [人体多点复核](navigation-and-body-v1.5.02.md)，再读 [固定参数、反转与对比](mode-controls-v1.5.01.md)，再读 [主节点技术记录](comfy-main-v1.4.00.md)。历史发布与恢复资料保留；私密资产仍只在 `.local/`。
 
 模式含义与画质证据需同时阅读 [六模式完整对比](mode-comparison-v1.4.00.md)。V6–V11 是内部算法/缓存标识，分属三组路线；同深度投影一致不代表整条桌面工作流或 JPEG 成品等效，更不构成六模式画质排名。
 
@@ -56,7 +56,7 @@ java -version
 
 ## 下一次继续开发
 
-v1.5.02 当前有 18 类、119 项 JVM 测试。模式档案与个人默认只保存视觉参数，共用模型/GPU/队列偏好。旧缓存标识在新选项关闭时不变；自动匹配、模型输入反转和独立副本分别追加 `_eq1050`、`_di1`、`_take…`。图片队列保存明确参数和替换目标，启动先恢复 `image_work` 的发布事务，再扫描成品。不得把替换改回“先删后生成”。
+v1.6.00 当前有 19 类、124 项 JVM 测试。模式档案与个人默认只保存视觉参数，共用模型/GPU/队列偏好。旧缓存标识在新选项关闭时不变；自动匹配、模型输入反转和独立副本分别追加 `_eq1050`、`_di1`、`_take…`。图片队列保存明确参数和替换目标，启动先恢复 `image_work` 的发布事务，再扫描成品。不得把替换改回“先删后生成”。
 
 Debug 的 `kind=modeProfiles` 对指定私密 QA 目录直接做六模式强制 GPU 对照，不启动图库；`kind=comparison` 只在指定 QA 相册检查实际加载完成后的缩放/位置及画面哈希；`kind=imageWrites` 只在合成 S1 副本验证新增、定向替换及实际读取失败。所有入口需要显式 `album/sample`，正式包不含测试入口。对比页必须等待可访问的“对比视口”出现后才注入手势，不能拿加载动画的哈希变化当验收通过。
 

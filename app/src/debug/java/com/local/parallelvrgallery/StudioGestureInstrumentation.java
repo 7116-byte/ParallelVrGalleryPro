@@ -30,6 +30,14 @@ public final class StudioGestureInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if(kind.equals("highResolutionPipeline")) {
+                HighResolutionQa.runPipeline(getTargetContext());
+                result.putString("qa","PASS: actual session and six-mode pipeline at 518/770; isolated authorized inputs; no catalog writes");finish(0,result);return;
+            }
+            if(kind.equals("highResolution")) {
+                HighResolutionQa.run(getTargetContext());
+                result.putString("qa","DONE: isolated fixed 518/770 GPU research; inspect per-size results; no CPU fallback or gallery writes");finish(0,result);return;
+            }
             if(kind.equals("bodyCalibration")) {
                 BodyCalibrationQa.run(getTargetContext());
                 result.putString("qa","PASS: user-supplied scales and V11/35 control rendered; only isolated QA inputs, no inference or queues");finish(0,result);return;

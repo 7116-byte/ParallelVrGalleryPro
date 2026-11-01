@@ -1,0 +1,11 @@
+ParallelVrGallery Pro: Depth Anything V2 Small 770 export, version 1.
+Upstream: https://github.com/DepthAnything/Depth-Anything-V2
+Authors: Lihe Yang, Bingyi Kang, Zilong Huang, Xiaogang Xu, Jiashi Feng, Hengshuang Zhao.
+Backbone: Meta DINOv2 (Apache-2.0).
+Modified by ParallelVrGalleryPro: fixed spatial graph 518 to 770, patch grid 37 to 55,
+decoder spatial constants and positional embedding bicubic interpolation with upstream 0.1 offset.
+All other learned parameter buffers are preserved. This is a project conversion, not an official 770 release.
+The original 518 model and existing results are retained; no private training or test media is included.
+Source SHA-256: b407f34f61750f31441e6f858a4bc48d8572f9ee5399ffd015cee5fa1767083f
+Export SHA-256: 60efba90dbd854f72b9e8140fe349edbdfa464439872510a3ddd154b5e7d0596
+
