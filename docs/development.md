@@ -79,3 +79,5 @@ Debug 专用原生手势回归入口：`adb -s <serial> shell am instrument -w -
 `scripts/Build-Benchmark.ps1 -OutputDirectory .local/bench/<新目录>` 构建带显式 QA 入口、非 debuggable 的 benchmark 包，保留源清单和原证书验证；不能把它发布为正式 APK。可用 `-SourceRoot` 对隔离的历史源码使用同一工具链。基准和对照统一 AOT 模式，记录当前设备/模型是否已经准备，使用新缓存根目录并核对实际推理数。正式发布仍用 Build.ps1 -Variant Release，并验证无 instrumentation。
 
 145 项回归覆盖逐位相同的 TensorTransfer、逐像素相同的 V10 反向覆盖及共享池租借生命周期。视频只借现成匹配会话，否则独立创建并释放，不能淘汰其他图片模型。ViewModel 等视频 worker 结束后再关闭池。原缓存键、模型、图像参数与队列语义保持。
+
+`coldProjection` 是早期基线上的候选算法实验入口；当前生产版也已采用优化覆盖规则，在当前版单独运行不能重新得出历史投影提速。前后性能应使用隔离的对应历史源码；独立原像素循环回归保留在 JVM 测试中。图片 770 与视频 518 不共享会话，不能套用同配置已就绪的 28.7% 收益。
