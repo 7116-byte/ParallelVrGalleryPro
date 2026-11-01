@@ -12,8 +12,8 @@ android {
         applicationId = "com.local.parallelvrgallerypro"
         minSdk = 30
         targetSdk = 35
-        versionCode = 10700
-        versionName = "1.7.00"
+        versionCode = 10800
+        versionName = "1.8.00"
     }
 
     buildFeatures {
@@ -29,6 +29,20 @@ android {
 
     androidResources {
         noCompress += "tflite"
+    }
+
+    // Local performance harness: Release runtime flags, explicit QA entry points, never a release asset.
+    buildTypes {
+        create("benchmark") {
+            initWith(getByName("release"))
+            isDebuggable = false
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+        }
+    }
+    sourceSets.getByName("benchmark") {
+        java.srcDir("src/debug/java")
+        manifest.srcFile("src/debug/AndroidManifest.xml")
     }
 }
 

@@ -30,6 +30,11 @@ public final class StudioGestureInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if(kind.equals("coldPreferences")){ColdGenerationQa.preferences(getTargetContext());result.putString("qa","PASS: two full-precision inference preferences measured");finish(0,result);return;}
+            if(kind.equals("coldVideoOnly")){ColdGenerationQa.videoOnly(getTargetContext(),album.replace("PVG_QA_cold1800_",""));result.putString("qa","PASS: new video from an uninitialized model and empty cache");finish(0,result);return;}
+            if(kind.equals("coldProjection")) {ProjectionExperiment.run(getTargetContext());result.putString("qa","PASS: exact projection experiment measured");finish(0,result);return;}
+            if(kind.equals("coldKernels")) {ColdGenerationQa.kernels(getTargetContext());result.putString("qa","PASS: accurate GPU kernel breakdown recorded");finish(0,result);return;}
+            if(kind.equals("coldPipeline")) {ColdGenerationQa.pipeline(getTargetContext(),album.replace("PVG_QA_cold1800_",""));result.putString("qa","PASS: all-new scoped image/video generation measured");finish(0,result);return;}
             if(kind.equals("performanceConfirmation")) {
                 PerformancePipelineQa.run(getTargetContext(),"confirmation");
                 result.putString("qa","PASS: final generation confirmation without altering a cached frame");finish(0,result);return;

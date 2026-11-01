@@ -7,6 +7,34 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CoreRegressionTest {
+    @Test fun videoMissCannotEvictOrAllocateOverThePreparedImageModel() {
+        val closed=mutableListOf<String>();val pool=IdleResourcePool<String,Closeable>(1)
+        pool.acquire("image770"){Closeable{closed+="image770"}}.close()
+        assertNull(pool.acquireIfPresent("video518"))
+        assertTrue(closed.isEmpty())
+        pool.acquireIfPresent("image770")!!.close()
+        assertTrue(closed.isEmpty());pool.close();assertEquals(listOf("image770"),closed)
+    }
+    @Test fun sharedVideoLeaseRetainsNativeSessionAfterImageLeaseAndPoolClose() {
+        val events=mutableListOf<Pair<String,Long>>()
+        AffinityWorker("shared-session-owner").use {worker ->
+            val pool=IdleResourcePool<String,ThreadBoundResource<Closeable>>(1)
+            val key=AppSettings(useGpu=true).toParams().depthSessionKey()
+            val image=pool.acquire(key){ThreadBoundResource(worker){events+="create" to Thread.currentThread().id;Closeable{events+="close" to Thread.currentThread().id}}}
+            val video=pool.acquireIfPresent(key) ?: error("Same inference configuration should reuse the prepared session")
+            image.close();pool.close()
+            video.value.use {events+="video" to Thread.currentThread().id}
+            assertEquals(listOf("create","video"),events.map{it.first})
+            video.close();video.close()
+            assertEquals(listOf("create","video","close"),events.map{it.first})
+            assertEquals(1,events.map{it.second}.distinct().size)
+        }
+    }
+    @Test fun sharingNeverAliasesDifferentModelOrPrecisionConfigurations() {
+        val base=AppSettings(useGpu=true).toParams()
+        val variants=listOf(base,base.copy(depthModel="depth_anything_v2_small_770_v1"),base.copy(useGpu=false),base.copy(modelThreads=2),base.copy(gpuTestMode=GpuTestMode.ACCURATE_OPENGL),base.copy(forceGpuNoFallback=false))
+        assertEquals(variants.size,variants.map{it.depthSessionKey()}.distinct().size)
+    }
     @Test fun generatedViewerAndClosedViewerNeverEnablePrefetch() {
         assertFalse(ViewerScope.canPrefetch(true, false, true, true, true, true))
         assertFalse(ViewerScope.canPrefetch(false, true, true, true, false, true))

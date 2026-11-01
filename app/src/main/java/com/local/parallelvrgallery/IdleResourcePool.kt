@@ -17,7 +17,18 @@ internal class IdleResourcePool<K, T : Closeable>(private val maxIdle: Int = 1) 
             check(!closed)
             entries.getOrPut(key) { Entry(create(), 0) }.also { it.users++ }
         }
-        return Borrowed(entry.value) {
+        return borrow(entry)
+    }
+
+    fun acquireIfPresent(key:K):Borrowed<T>? {
+        val entry=synchronized(this) {
+            check(!closed)
+            entries[key]?.also{it.users++}
+        } ?: return null
+        return borrow(entry)
+    }
+
+    private fun borrow(entry:Entry<T>):Borrowed<T> = Borrowed(entry.value) {
             val dispose = synchronized(this) {
                 entry.users--
                 val idle = entries.filterValues { it.users == 0 }.keys.toList()
@@ -25,7 +36,6 @@ internal class IdleResourcePool<K, T : Closeable>(private val maxIdle: Int = 1) 
                     .mapNotNull { entries.remove(it)?.value }
             }
             dispose.forEach { it.close() }
-        }
     }
 
     override fun close() {

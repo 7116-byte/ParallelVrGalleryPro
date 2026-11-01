@@ -1,8 +1,8 @@
 # 本机开发与交接
 
-正式项目：`E:\AI-Programme\ParallelVrGalleryPro`。恢复日期：2026-10-31（Asia/Shanghai）。历史恢复基线为 **1.2.00 / 10200**；当前版本为 **1.7.00 / 10700**，详见 [performance-v1.7.00.md](performance-v1.7.00.md)。恢复历史来自离线 bundle，origin 为 `https://github.com/7116-byte/ParallelVrGalleryPro.git`。
+正式项目：`E:\AI-Programme\ParallelVrGalleryPro`。恢复日期：2026-10-31（Asia/Shanghai）。历史恢复基线为 **1.2.00 / 10200**；当前版本为 **1.8.00 / 10800**，详见 [fresh-generation-v1.8.00.md](fresh-generation-v1.8.00.md)。恢复历史来自离线 bundle，origin 为 `https://github.com/7116-byte/ParallelVrGalleryPro.git`。
 
-先读 [生成性能与格式实测](performance-v1.7.00.md) 和 [本版验收](releases/v1.7.00.md)，再读 [固定透明顶栏与真实 770 推理](depth-resolution-v1.6.00.md) 及 [v1.6.00 验收](releases/v1.6.00.md)，再读 [人体多点复核](navigation-and-body-v1.5.02.md)，再读 [固定参数、反转与对比](mode-controls-v1.5.01.md)，再读 [主节点技术记录](comfy-main-v1.4.00.md)。历史发布与恢复资料保留；私密资产仍只在 `.local/`。
+先读 [新任务性能](fresh-generation-v1.8.00.md) 和 [1.8.00 验收](releases/v1.8.00.md)，再读 [生成性能与格式实测](performance-v1.7.00.md) 和 [本版验收](releases/v1.7.00.md)，再读 [固定透明顶栏与真实 770 推理](depth-resolution-v1.6.00.md) 及 [v1.6.00 验收](releases/v1.6.00.md)，再读 [人体多点复核](navigation-and-body-v1.5.02.md)，再读 [固定参数、反转与对比](mode-controls-v1.5.01.md)，再读 [主节点技术记录](comfy-main-v1.4.00.md)。历史发布与恢复资料保留；私密资产仍只在 `.local/`。
 
 模式含义与画质证据需同时阅读 [六模式完整对比](mode-comparison-v1.4.00.md)。V6–V11 是内部算法/缓存标识，分属三组路线；同深度投影一致不代表整条桌面工作流或 JPEG 成品等效，更不构成六模式画质排名。
 
@@ -56,7 +56,7 @@ java -version
 
 ## 下一次继续开发
 
-v1.7.00 当前有 22 类、136 项 JVM 测试。模式档案与个人默认只保存视觉参数，共用模型/GPU/队列偏好。旧缓存标识在新选项关闭时不变；自动匹配、模型输入反转和独立副本分别追加 `_eq1050`、`_di1`、`_take…`。图片队列保存明确参数和替换目标，启动先恢复 `image_work` 的发布事务，再扫描成品。不得把替换改回“先删后生成”。
+v1.8.00 当前有 23 类、145 项 JVM 测试。模式档案与个人默认只保存视觉参数，共用模型/GPU/队列偏好。旧缓存标识在新选项关闭时不变；自动匹配、模型输入反转和独立副本分别追加 `_eq1050`、`_di1`、`_take…`。图片队列保存明确参数和替换目标，启动先恢复 `image_work` 的发布事务，再扫描成品。不得把替换改回“先删后生成”。
 
 Debug 的 `kind=modeProfiles` 对指定私密 QA 目录直接做六模式强制 GPU 对照，不启动图库；`kind=comparison` 只在指定 QA 相册检查实际加载完成后的缩放/位置及画面哈希；`kind=imageWrites` 只在合成 S1 副本验证新增、定向替换及实际读取失败。所有入口需要显式 `album/sample`，正式包不含测试入口。对比页必须等待可访问的“对比视口”出现后才注入手势，不能拿加载动画的哈希变化当验收通过。
 
@@ -73,3 +73,9 @@ JVM 与 Lint 不证明真机画质或流畅度。恢复阶段未安装手机或�
 Debug 专用原生手势回归入口：`adb -s <serial> shell am instrument -w -e album PVG_QA_<explicit_album> -e sample PVG_QA_<explicit_file> com.local.parallelvrgallerypro/.StudioGestureInstrumentation`。仅在用户明确授权的测试副本上运行；Release 不包含该入口。设备覆盖安装始终用原包名与原证书，不能卸载或清空数据。生成、删除或私人媒体测试仍需先限定范围并得到授权。
 
 新依赖只有 OpenCV Android 4.12.0，用于用户明确请求的参考 V2.2 补洞，不升级原 JDK/Gradle/AGP/Kotlin/TFLite。备份当前可离线构建的环境时，要包含日常工具链中新解析的依赖；不能用只含 1.2.00 的历史归档替代最新环境备份。
+
+## 非调试性能测量
+
+`scripts/Build-Benchmark.ps1 -OutputDirectory .local/bench/<新目录>` 构建带显式 QA 入口、非 debuggable 的 benchmark 包，保留源清单和原证书验证；不能把它发布为正式 APK。可用 `-SourceRoot` 对隔离的历史源码使用同一工具链。基准和对照统一 AOT 模式，记录当前设备/模型是否已经准备，使用新缓存根目录并核对实际推理数。正式发布仍用 Build.ps1 -Variant Release，并验证无 instrumentation。
+
+145 项回归覆盖逐位相同的 TensorTransfer、逐像素相同的 V10 反向覆盖及共享池租借生命周期。视频只借现成匹配会话，否则独立创建并释放，不能淘汰其他图片模型。ViewModel 等视频 worker 结束后再关闭池。原缓存键、模型、图像参数与队列语义保持。

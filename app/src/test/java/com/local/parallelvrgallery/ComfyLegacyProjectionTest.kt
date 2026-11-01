@@ -4,6 +4,21 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ComfyLegacyProjectionTest {
+    @Test fun optimizedCoveragePreservesClampsNonfiniteDepthAndUncoveredOriginalPixels() {
+        val random=java.util.Random(180018)
+        for(w in listOf(1,2,17,257,2048))for(scale in listOf(1f,4.5f,35f,50f,100f)) {
+            val h=4;val source=IntArray(w*h){random.nextInt()}
+            val depth=FloatArray(w*h){when(it%13){0->Float.NaN;1->Float.POSITIVE_INFINITY;2->Float.NEGATIVE_INFINITY;3->-2f;4->3f;else->random.nextFloat()}}
+            val expected=source.copyOf()
+            for(y in 0 until h)for(x in 0 until w) {
+                val value=depth[y*w+x];val d=if(value.isFinite())value.coerceIn(0f,1f) else 0f
+                val shift=((d*255f).toInt()*(scale.toDouble()/w)).toInt()
+                val first=(x+shift).coerceIn(0,w-1);val end=minOf(w,first+shift+10)
+                for(destination in first until end)expected[y*w+destination]=source[y*w+x]
+            }
+            assertArrayEquals("w=$w scale=$scale",expected,ComfyLegacyProjection.project(source,w,h,depth,scale))
+        }
+    }
     @Test fun matchesIndependentOriginalPixelLoopIncludingOverwriteAndClippedFill() {
         val random = java.util.Random(8492)
         for (w in listOf(1, 2, 9, 37, 128, 1280)) for (scale in listOf(1f, 40f, 60f, 100f)) {

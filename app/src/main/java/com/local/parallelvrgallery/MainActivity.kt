@@ -887,9 +887,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         imageJobs.forEach { it.cancel() }
         AppWorkScopes.video.launch {
             imageJobs.forEach { it.join() }
-            generator.close()
             queueTags.close()
             videoWorkers.toList().forEach { it.join() }
+            generator.close()
             videoQueueTags.close()
         }
         super.onCleared()
@@ -4301,7 +4301,7 @@ private class VrGenerator(
     private val cache: VrCacheManager,
     private val modelManager: ModelManager,
 ) : Closeable {
-    private val imageSessions = IdleResourcePool<String, DepthModelSession>(maxIdle = 1)
+    private val depthSessions = IdleResourcePool<String, DepthModelSession>(maxIdle = 1)
 
     fun generate(
         photo: PhotoItem,
@@ -4327,7 +4327,7 @@ private class VrGenerator(
         var sessionLease: IdleResourcePool.Borrowed<DepthModelSession>? = null
         val ownedBitmaps = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Bitmap, Boolean>())
         try {
-            sessionLease = sharedImageDepthSession(params, onModelProgress) { mark(it) }
+            sessionLease = borrowDepthSession(params, onModelProgress) { mark(it) }
             checkCurrent()
             val depthSession = sessionLease.value
             mark("model session ready key=${params.depthSessionKey()}")
@@ -4489,7 +4489,7 @@ private class VrGenerator(
         var success = false
         try {
             onProgress(0.05f, "推理当前图片；不创建队列")
-            val raw = sharedImageDepthSession(base.toParams(), {}, { android.util.Log.i("ModeComparison", it) }).use { lease ->
+            val raw = borrowDepthSession(base.toParams(), {}, { android.util.Log.i("ModeComparison", it) }).use { lease ->
                 lease.value.run(source, 0) { checkCurrent() }
             }
             checkCurrent()
@@ -4634,7 +4634,7 @@ private class VrGenerator(
     }
 
     fun prepareImageSession(params: VrGenerationParams, onRuntimeInfo: (String) -> Unit) {
-        imageSessions.acquire(params.depthSessionKey()) {
+        depthSessions.acquire(params.depthSessionKey()) {
             val session = openDepthSession(params, onRuntimeInfo = onRuntimeInfo, allowDownload = false)
             try {
                 session.prepare()
@@ -4646,13 +4646,16 @@ private class VrGenerator(
         }.close()
     }
 
-    private fun sharedImageDepthSession(
+    fun borrowDepthSession(
         params: VrGenerationParams,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit,
     ): IdleResourcePool.Borrowed<DepthModelSession> {
         val key = params.depthSessionKey()
-        return imageSessions.acquire(key) { openDepthSession(params, onModelProgress, onRuntimeInfo) }
+        var created = false
+        val lease = depthSessions.acquire(key) { created = true; openDepthSession(params, onModelProgress, onRuntimeInfo) }
+        onRuntimeInfo("depth session acquired reused=${!created} key=$key")
+        return lease
     }
 
     fun openDepthSession(
@@ -4663,6 +4666,15 @@ private class VrGenerator(
     ): DepthModelSession {
         val modelFile = modelManager.ensureModel(params.depthModel, onModelProgress, allowDownload)
         return DepthModelSession(modelFile, params.modelThreads, params.useGpu, params.gpuTestMode, params.forceGpuNoFallback, onRuntimeInfo)
+    }
+
+    fun borrowVideoDepthSession(params:VrGenerationParams,onModelProgress:(Float)->Unit,onRuntimeInfo:(String)->Unit):IdleResourcePool.Borrowed<DepthModelSession> {
+        val key=params.depthSessionKey()
+        depthSessions.acquireIfPresent(key)?.let {onRuntimeInfo("depth session acquired reused=true key=$key");return it}
+        // A different video model must not evict the selected image model (notably the 770 model).
+        val owned=openDepthSession(params,onModelProgress,onRuntimeInfo)
+        onRuntimeInfo("depth session acquired reused=false ownedVideo=true key=$key")
+        return IdleResourcePool.Borrowed(owned){owned.close()}
     }
 
     private fun memorySafeMaxLongEdge(width: Int, height: Int, requested: Int, mode: DepthEdgeMode): Int {
@@ -4693,7 +4705,7 @@ private class VrGenerator(
     }
 
     override fun close() {
-        imageSessions.close()
+        depthSessions.close()
     }
 
     private fun depthToBitmap(depth: DepthMap): Bitmap {
@@ -4797,10 +4809,6 @@ private data class StereoBitmapPair(
     }
 }
 
-private data class DepthRunResult(
-    val values: FloatArray,
-    val range: Float,
-)
 
 private data class DepthCompareResult(
     val meanAbs: Float,
@@ -4868,6 +4876,10 @@ private class DepthModelRuntime(
     private val input: ByteBuffer
     private val pixels: IntArray
     private val output: ByteBuffer
+    private val packedRgb: FloatArray
+    private val floatInput: FloatBuffer
+    private var lastInvokeNs = 0L
+    private var lastReadNs = 0L
 
     init {
         val gpuDiagnostics = mutableListOf<String>()
@@ -4894,6 +4906,8 @@ private class DepthModelRuntime(
             input = ByteBuffer.allocateDirect(inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
             pixels = IntArray(inputSize * inputSize)
             output = ByteBuffer.allocateDirect(inputSize * inputSize * 4).order(ByteOrder.nativeOrder())
+            packedRgb = FloatArray(inputSize * 3)
+            floatInput = input.asFloatBuffer()
         } catch (error: Throwable) {
             interpreter.close();gpuDelegate?.close();throw error
         }
@@ -4905,16 +4919,15 @@ private class DepthModelRuntime(
 
     @Synchronized
     fun run(bitmap: Bitmap): FloatArray {
+        val prepareStarted = System.nanoTime()
         val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         input.clear()
         scaled.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
         if (scaled !== bitmap) scaled.recycle()
-        for (pixel in pixels) {
-            input.putFloat(Color.red(pixel) / 255f)
-            input.putFloat(Color.green(pixel) / 255f)
-            input.putFloat(Color.blue(pixel) / 255f)
-        }
+        val packStarted = System.nanoTime()
+        TensorTransfer.packRgb(pixels,packedRgb,floatInput)
         input.rewind()
+        val packedAt = System.nanoTime()
         var normalized = runInterpreterAndRead()
         if ((!normalized.range.isFinite() || normalized.range <= 0.0001f) && useGpu && delegateActive) {
             onRuntimeInfo("tflite gpu output flat mode=$activeGpuMode range=${normalized.range} forceGpu=$forceGpuNoFallback")
@@ -4937,6 +4950,7 @@ private class DepthModelRuntime(
             onRuntimeInfo("tflite forced gpu mode=$activeGpuMode outputRange=${normalized.range} noCpuValidation=true")
             gpuValidated = true
         }
+        InferenceProfiling.listener?.invoke(inputSize, packStarted-prepareStarted, packedAt-packStarted, lastInvokeNs, lastReadNs)
         return normalized.values
     }
 
@@ -5060,6 +5074,7 @@ private class DepthModelRuntime(
 
     private fun runInterpreterAndRead(): DepthRunResult {
         output.clear()
+        val invokedAt = System.nanoTime()
         runCatching {
             interpreter.run(input, output)
         }.onFailure { error ->
@@ -5079,7 +5094,9 @@ private class DepthModelRuntime(
             interpreter.run(input, output)
             onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=false reusedSession=true gpuFallback=runFailure")
         }
-        return readDepthOutput(output)
+        val readAt = System.nanoTime()
+        lastInvokeNs = readAt-invokedAt
+        return readDepthOutput(output).also {lastReadNs=System.nanoTime()-readAt}
     }
 
     private fun runCpuReferenceAndRead(): DepthRunResult {
@@ -5096,22 +5113,7 @@ private class DepthModelRuntime(
     }
 
     private fun readDepthOutput(buffer: ByteBuffer): DepthRunResult {
-        val flat = FloatArray(inputSize * inputSize)
-        var minValue = Float.MAX_VALUE
-        var maxValue = -Float.MAX_VALUE
-        buffer.rewind()
-        for (i in flat.indices) {
-            val value = buffer.getFloat().takeIf { it.isFinite() } ?: 0f
-            flat[i] = value
-            minValue = min(minValue, value)
-            maxValue = max(maxValue, value)
-        }
-        val rawRange = maxValue - minValue
-        val range = if (rawRange.isFinite()) max(0.0001f, rawRange) else 0.0001f
-        for (i in flat.indices) {
-            flat[i] = (flat[i] - minValue) / range
-        }
-        return DepthRunResult(flat, rawRange)
+        return TensorTransfer.readNormalized(buffer,inputSize*inputSize)
     }
 
     private fun compareDepthMaps(a: FloatArray, b: FloatArray): DepthCompareResult {
@@ -5268,7 +5270,7 @@ private class VideoVrGenerator(
             var width = 0
             var height = 0
             val temporalSmoother = DepthTemporalSmoother()
-            DeferredResource { frameGenerator.openDepthSession(vrParams, onModelProgress, onRuntimeInfo) }.use { depthSession ->
+            DeferredResource { frameGenerator.borrowVideoDepthSession(vrParams, onModelProgress, onRuntimeInfo) }.use { depthSession ->
                 val cachedFirst = readCachedStereoFrame(framesDir, 0, previousFramesDirs)?.also {
                     onRuntimeInfo("frame cache hit frame=0 version=$version")
                 }
@@ -5280,7 +5282,7 @@ private class VideoVrGenerator(
                         } else {
                             first.copy(Bitmap.Config.ARGB_8888, false)
                         }
-                        val generated = frameGenerator.generateVideoSbsBitmap(firstSource, vrParams, depthSession.get(), temporalSmoother)
+                        val generated = frameGenerator.generateVideoSbsBitmap(firstSource, vrParams, depthSession.get().value, temporalSmoother)
                         try {
                             writeStereoFrameCache(framesDir, 0, generated.eyes)
                         } catch (error: Throwable) {
@@ -5428,7 +5430,7 @@ private class VideoVrGenerator(
         version: String,
         params: VrGenerationParams,
         videoParams: VideoGenerationParams,
-        depthSession: DeferredResource<DepthModelSession>,
+        depthSession: DeferredResource<IdleResourcePool.Borrowed<DepthModelSession>>,
         temporalSmoother: DepthTemporalSmoother,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit,
@@ -5585,7 +5587,7 @@ private class VideoVrGenerator(
                     },
                     depth = { data, worker ->
                         if (!data.cacheHit) {
-                            val session = if (worker == 0) depthSession.get() else synchronized(extraSessions) {
+                            val session = if (worker == 0) depthSession.get().value else synchronized(extraSessions) {
                                 extraSessions.getOrPut(worker) { frameGenerator.openDepthSession(params, onModelProgress, onRuntimeInfo) }
                             }
                             data.startedAt = SystemClock.uptimeMillis()
