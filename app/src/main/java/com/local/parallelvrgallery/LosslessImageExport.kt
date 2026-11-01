@@ -21,6 +21,17 @@ internal object LosslessImageExport {
     fun png(bitmap:Bitmap,file:File) = publish(file) { target ->
         target.outputStream().buffered(256*1024).use{check(bitmap.compress(Bitmap.CompressFormat.PNG,100,it)){"PNG encoding failed"}}
     }
+    fun originalPng(left: Bitmap, right: Bitmap, file: File, checkCurrent: () -> Unit) {
+        require(left.width == right.width && left.height == right.height)
+        publish(file) { target ->
+            target.outputStream().buffered(256 * 1024).use { stream ->
+                SbsPngWriter.write(left.width, left.height, stream,
+                    { y, row -> checkCurrent(); left.getPixels(row, 0, left.width, 0, y, left.width, 1) },
+                    { y, row -> right.getPixels(row, 0, right.width, 0, y, right.width, 1) })
+            }
+            checkCurrent()
+        }
+    }
     fun avif(bitmap:Bitmap,file:File) {
         val bytes=HeifCoder().encodeAvif(bitmap,quality=100,preciseMode=PreciseMode.LOSSLESS)
         val decoded=BitmapFactory.decodeByteArray(bytes,0,bytes.size) ?: error("AVIF decode validation failed")

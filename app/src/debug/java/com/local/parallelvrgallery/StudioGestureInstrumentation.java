@@ -30,6 +30,10 @@ public final class StudioGestureInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if(kind.equals("originalRetriever")){OriginalExportQa.retrieverOwnership(getTargetContext());result.putString("qa","PASS: retriever opaque pixels, six modes, exact shared eyes and ownership lifetime");finish(0,result);return;}
+            if(kind.equals("originalExportMore")){OriginalExportQa.moreImages(getTargetContext());result.putString("qa","PASS: three portraits, official crop, real 770 and failure paths");finish(0,result);return;}
+            if(kind.equals("originalExport")){OriginalExportQa.images(getTargetContext());result.putString("qa","PASS: original PNG rendering and publication");finish(0,result);return;}
+            if(kind.equals("videoEyeReuse")){OriginalExportQa.video(getTargetContext(),album.replace("PVG_QA_original1900_",""));result.putString("qa","PASS: fresh video original-eye A/B");finish(0,result);return;}
             if(kind.equals("coldPreferences")){ColdGenerationQa.preferences(getTargetContext());result.putString("qa","PASS: two full-precision inference preferences measured");finish(0,result);return;}
             if(kind.equals("coldVideoOnly")){ColdGenerationQa.videoOnly(getTargetContext(),album.replace("PVG_QA_cold1800_",""));result.putString("qa","PASS: new video from an uninitialized model and empty cache");finish(0,result);return;}
             if(kind.equals("coldProjection")) {ProjectionExperiment.run(getTargetContext());result.putString("qa","PASS: exact projection experiment measured");finish(0,result);return;}

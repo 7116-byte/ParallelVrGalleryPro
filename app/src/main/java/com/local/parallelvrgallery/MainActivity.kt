@@ -520,7 +520,7 @@ private val VideoModels = ImageModels.filter { it.inputSize == 518 } + listOf(
     ),
 )
 
-private val AvailableModels = (ImageModels + VideoModels).distinctBy { it.id }
+internal val AvailableModels = (ImageModels + VideoModels).distinctBy { it.id }
 
 private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
@@ -833,6 +833,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val currentImageFirst = CurrentImageFirst()
     private var modelWarmupJob: Job? = null
     private var comparisonJob: Job? = null
+    private var imageExportJob: Job? = null
     private val comparisonRevision = java.util.concurrent.atomic.AtomicLong()
 
     private val _uiState = MutableStateFlow(
@@ -883,7 +884,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     override fun onCleared() {
         comparisonRevision.incrementAndGet()
         comparisonJob?.cancel()
-        val imageJobs = workers.toList() + listOfNotNull(currentWorker, modelWarmupJob)
+        val imageJobs = workers.toList() + listOfNotNull(currentWorker, modelWarmupJob, imageExportJob)
         imageJobs.forEach { it.cancel() }
         AppWorkScopes.video.launch {
             imageJobs.forEach { it.join() }
@@ -1801,30 +1802,63 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun saveGeneratedCopies(context: Context, indexes: List<Int>) {
+        val state = _uiState.value
+        val version = state.selectedGeneratedVersion.takeIf { state.homeTab == "generated" || state.viewerOrigin != ViewerOrigin.NORMAL }
+        val selected = indexes.distinct().mapNotNull { index ->
+            state.photos.getOrNull(index)?.let { photo -> cache.findEntry(photo, version)?.let { ManagedCacheItem(photo, it) } }
+        }
+        saveManagedGeneratedCopies(context, selected)
+    }
+
+    fun saveManagedGeneratedCopies(context: Context, selected: List<ManagedCacheItem>) {
+        if (imageExportJob?.isActive == true) return
         val lang = _uiState.value.settings.language
-        val exportFormat = _uiState.value.settings.imageExportFormat
-        _uiState.update { it.copy(blockingMessage = lang.t("保存中", "Saving")) }
-        viewModelScope.launch {
-            val message = withContext(Dispatchers.IO) {
+        // Capture exact entries and parameters before asynchronous work or navigation changes the selection.
+        val requests = selected.distinctBy { it.entry.photoKey to it.entry.version }.map { item ->
+            Triple(item, imageRuns.token(item.entry.photoKey), runCatching { readOriginalExportSpec(item.entry) })
+        }
+        if (requests.isEmpty()) { _uiState.update { it.copy(message = lang.t("没有可保存的已生成 VR 图", "No generated VR images to save")) }; return }
+        _uiState.update { it.copy(blockingMessage = lang.t("正在从原图生成无损 PNG", "Rendering lossless PNG from original")) }
+        imageExportJob = viewModelScope.launch {
+            try {
+                val message = withContext(Dispatchers.IO) {
+                val coroutineJob = kotlin.coroutines.coroutineContext[Job]
                 var saved = 0
                 var failed = 0
                 var failure: String? = null
-                indexes.distinct().forEach { index ->
-                    val photo = _uiState.value.photos.getOrNull(index) ?: return@forEach
-                    val entry = cache.findEntry(photo) ?: return@forEach
-                    runCatching {
-                        val output = if(exportFormat == "AVIF") materializeSbsAvif(entry) else materializeSbsPng(entry)
-                        saveImageToGallery(context, output, "${GENERATED_VR_PREFIX}${photo.cacheKey}_${photo.displayName}", if(exportFormat == "AVIF") "image/avif" else "image/png")
+                requests.forEachIndexed { position, (item, token, captured) ->
+                    val photo = item.photoItem
+                    val entry = item.entry
+                    fun current() = coroutineJob?.isActive != false && imageRuns.isCurrent(entry.photoKey, token)
+                    val work = File(app.getExternalFilesDir(null), "export_work/${java.util.UUID.randomUUID()}")
+                    try {
+                        val spec = captured.getOrThrow()
+                        check(current() && cache.findEntry(photo, entry.version)?.createdAt == entry.createdAt) { "Result deleted or replaced" }
+                        check(work.mkdirs()) { "Cannot create export staging directory" }
+                        val output = generator.exportOriginalPng(photo, spec, File(work, "original_sbs.png"), ::current) { _, stage ->
+                            _uiState.update { it.copy(blockingMessage = lang.t("无损 PNG ${position + 1}/${requests.size} · $stage", "Lossless PNG ${position + 1}/${requests.size} · $stage")) }
+                        }
+                        saveImageToGallery(context, output, "${GENERATED_VR_PREFIX}${photo.cacheKey}_${photo.displayName}", "image/png") { publish ->
+                            check(imageRuns.ifCurrent(entry.photoKey, token) {
+                                check(current() && cache.findEntry(photo, entry.version)?.createdAt == entry.createdAt) { "结果已删除或替换，取消保存 / Result deleted or replaced" }
+                                publish()
+                            }) { "结果已删除或替换，取消保存 / Result deleted or replaced" }
+                        }
                         saved++
-                    }.onFailure { failed++;failure=it.message }
+                    } catch (error: Throwable) {
+                        if (coroutineJob?.isActive == false) throw error
+                        failed++; failure = error.message
+                    } finally { work.deleteRecursively() }
                 }
                 when {
-                    failed > 0 -> lang.t("已保存 $saved 张 $exportFormat，失败 $failed 张：${failure.orEmpty()}", "Saved $saved $exportFormat images, failed $failed: ${failure.orEmpty()}")
-                    saved == 0 -> lang.t("没有可保存的已生成 VR 图", "No generated VR images to save")
-                    else -> lang.t("已保存 $saved 张 $exportFormat 到系统图库", "Saved $saved $exportFormat images to system gallery")
+                    failed > 0 -> lang.t("已保存 $saved 张无损 PNG，失败 $failed 张：${failure.orEmpty()}", "Saved $saved lossless PNG images, failed $failed: ${failure.orEmpty()}")
+                    else -> lang.t("已从原图生成并保存 $saved 张无损 PNG", "Rendered and saved $saved lossless PNG images from originals")
                 }
+                }
+                _uiState.update { it.copy(message = message) }
+            } finally {
+                _uiState.update { it.copy(blockingMessage = null) }
             }
-            _uiState.update { it.copy(blockingMessage = null, message = message) }
         }
     }
 
@@ -4296,10 +4330,11 @@ private class ModelManager(private val context: Context) {
         .removePrefix("www.")
 }
 
-private class VrGenerator(
+private class VrGenerator @JvmOverloads constructor(
     private val context: Context,
     private val cache: VrCacheManager,
     private val modelManager: ModelManager,
+    private val reuseVideoOriginalEye: Boolean = true,
 ) : Closeable {
     private val depthSessions = IdleResourcePool<String, DepthModelSession>(maxIdle = 1)
 
@@ -4472,6 +4507,47 @@ private class VrGenerator(
         }
     }
 
+    fun exportOriginalPng(photo: PhotoItem, spec: OriginalImageExportSpec, output: File,
+        shouldContinue: () -> Boolean, onProgress: (Float, String) -> Unit): File {
+        fun checkCurrent() { if (!shouldContinue()) throw ImageJobObsoleteException() }
+        checkCurrent()
+        require(!output.exists() && output.extension == "png") { "Use a new PNG export staging path" }
+        validateOriginalExportSource(context, photo)
+        val params = spec.params
+        var original: Bitmap? = null
+        var eyes: StereoBitmapPair? = null
+        borrowDepthSession(params, { onProgress(it * 0.1f, "准备记录的模型 / Preparing recorded model") }, {}).use { lease ->
+            try {
+                checkCurrent()
+                val edge = max(spec.eyeWidth, spec.eyeHeight)
+                check(memorySafeMaxLongEdge(spec.eyeWidth, spec.eyeHeight, edge,
+                    if (params.matchV10Default) DepthEdgeMode.COMFY_LEGACY_V10 else params.edgeMode) >= edge) {
+                    "内存不足，未降低保存尺寸；请结束其他任务后重试 / Insufficient memory; export dimensions were not reduced"
+                }
+                onProgress(0.15f, "读取原图 / Reading original")
+                val source = decodeScaledBitmap(context, photo.uri, edge).also { original = it }
+                check(source.width == spec.eyeWidth && source.height == spec.eyeHeight) {
+                    "原图尺寸与该结果不一致，未使用缓存替代 / Original dimensions differ from recorded result"
+                }
+                checkCurrent()
+                onProgress(0.3f, "按该结果参数推理 / Inferring with recorded parameters")
+                val raw = lease.value.run(source, 0, ::checkCurrent)
+                checkCurrent()
+                val depth = prepareDepth(raw, params, source.width, source.height)
+                onProgress(0.65f, "投影单眼 / Projecting one eye")
+                val rendered = makeParallelStereoPair(source, depth, params.effectiveScale(source.width, depth),
+                    params.fillRadius, params.edgeMode, shareOriginalEye = true).also { eyes = it }
+                checkCurrent()
+                onProgress(0.8f, "写入无损 PNG / Writing lossless PNG")
+                LosslessImageExport.originalPng(rendered.left, rendered.right, output, ::checkCurrent)
+                onProgress(1f, "完成 / Complete")
+                return output
+            } finally {
+                listOfNotNull(eyes?.left, eyes?.right, original).distinct().forEach { if (!it.isRecycled) it.recycle() }
+            }
+        }
+    }
+
     fun generateComparison(photo: PhotoItem, base: AppSettings,
         profiles: Map<DepthEdgeMode, ModeVisualProfile>, requestedLongEdge: Int,
         shouldContinue: () -> Boolean, onProgress: (Float, String) -> Unit): List<ModeComparisonImage> {
@@ -4615,10 +4691,17 @@ private class VrGenerator(
         val depthPostMs = SystemClock.uptimeMillis() - depthPostStart
         val sbsStart = SystemClock.uptimeMillis()
         val eyes = try {
-            makeParallelStereoPair(depth.source, depthMap, params.effectiveScale(depth.source.width, depthMap), params.fillRadius, params.edgeMode)
-        } finally {
+            // Decoded video pixels are opaque even when Bitmap's hasAlpha metadata is true.
+            // Only reuse canonical sRGB ARGB8 storage for the encoder's raw texture upload.
+            val share = reuseVideoOriginalEye && depth.source.config == Bitmap.Config.ARGB_8888 && depth.source.colorSpace?.isSrgb == true
+            makeParallelStereoPair(depth.source, depthMap, params.effectiveScale(depth.source.width, depthMap), params.fillRadius, params.edgeMode, shareOriginalEye = share)
+        } catch (error: Throwable) {
             depth.source.recycle()
+            throw error
         }
+        // Ownership of a shared decoded eye passes to the pair until both encode and cache write finish.
+        InferenceProfiling.videoEyeReuseListener?.invoke(depth.source === eyes.left || depth.source === eyes.right)
+        if (depth.source !== eyes.left && depth.source !== eyes.right) depth.source.recycle()
         val sbsMs = SystemClock.uptimeMillis() - sbsStart
         return VideoSbsResult(
             eyes = eyes,
@@ -4741,13 +4824,13 @@ private class VrGenerator(
         return prepared.copy(projectionScale = DefaultDisparityCalibration.scale(params, width, prepared.values, baseline))
     }
 
-    private fun makeParallelStereoPair(source: Bitmap, depth: DepthMap, depthScale: Float, fillRadius: Int, mode: DepthEdgeMode = DepthEdgeMode.LEGACY_V6): StereoBitmapPair {
+    private fun makeParallelStereoPair(source: Bitmap, depth: DepthMap, depthScale: Float, fillRadius: Int, mode: DepthEdgeMode = DepthEdgeMode.LEGACY_V6, shareOriginalEye: Boolean = false): StereoBitmapPair {
         if (mode.isComfyMain) {
-            val (left, right) = ComfyLegacyStereoRenderer.renderPrepared(source, depth.values, depthScale, mode == DepthEdgeMode.COMFY_SUBPIXEL_V11)
+            val (left, right) = ComfyLegacyStereoRenderer.renderPrepared(source, depth.values, depthScale, mode == DepthEdgeMode.COMFY_SUBPIXEL_V11, shareOriginalEye)
             return StereoBitmapPair(left, right)
         }
         if (mode.isReference) {
-            val (left, right) = ReferenceStereoRenderer.render(source, depth.values, depth.width, depth.height, depthScale, mode == DepthEdgeMode.REFERENCE_V9)
+            val (left, right) = ReferenceStereoRenderer.render(source, depth.values, depth.width, depth.height, depthScale, mode == DepthEdgeMode.REFERENCE_V9, shareOriginalEye)
             return StereoBitmapPair(left, right)
         }
         val w = source.width
@@ -4755,7 +4838,7 @@ private class VrGenerator(
         val fill = fillRadius.coerceIn(1, 32)
         val depthScaling = depthScale / w.toFloat()
         val left = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val right = try { source.copy(Bitmap.Config.ARGB_8888, false) } catch (error: Throwable) {
+        val right = try { if (shareOriginalEye) source else source.copy(Bitmap.Config.ARGB_8888, false) } catch (error: Throwable) {
             left.recycle()
             throw error
         }
@@ -4781,7 +4864,7 @@ private class VrGenerator(
             return StereoBitmapPair(left, right)
         } catch (error: Throwable) {
             left.recycle()
-            right.recycle()
+            if (right !== source) right.recycle()
             throw error
         }
     }
@@ -5276,22 +5359,26 @@ private class VideoVrGenerator(
                 }
                 val firstEyes = cachedFirst ?: run {
                     val first = reader.frameAt(0)
+                    var ownedEyes: StereoBitmapPair? = null
+                    var firstSource: Bitmap? = null
                     try {
-                        val firstSource = if (first.config == Bitmap.Config.ARGB_8888) {
+                        val source = if (first.config == Bitmap.Config.ARGB_8888) {
                             first
                         } else {
                             first.copy(Bitmap.Config.ARGB_8888, false)
-                        }
-                        val generated = frameGenerator.generateVideoSbsBitmap(firstSource, vrParams, depthSession.get().value, temporalSmoother)
+                        }.also { firstSource = it }
+                        val generated = frameGenerator.generateVideoSbsBitmap(source, vrParams, depthSession.get().value, temporalSmoother)
                         try {
                             writeStereoFrameCache(framesDir, 0, generated.eyes)
                         } catch (error: Throwable) {
                             generated.eyes.recycle()
                             throw error
                         }
-                        generated.eyes
+                        generated.eyes.also { ownedEyes = it }
                     } finally {
-                        if (!first.isRecycled) first.recycle()
+                        listOfNotNull(first, firstSource).distinct().forEach {
+                            if (it !== ownedEyes?.left && it !== ownedEyes?.right && !it.isRecycled) it.recycle()
+                        }
                     }
                 }
                 width = even(firstEyes.sbsWidth)
@@ -5598,7 +5685,7 @@ private class VideoVrGenerator(
                         if (!data.cacheHit) {
                             val result = frameGenerator.finishVideoSbs(requireNotNull(data.depth), params, temporalSmoother)
                             data.eyes = result.eyes
-                            data.source?.let { if (!it.isRecycled) it.recycle() }
+                            data.source?.let { if (it !== result.eyes.left && it !== result.eyes.right && !it.isRecycled) it.recycle() }
                             data.source = null
                             data.depth = null
                             data.timings = result.timings.copy(decodeMs = data.timings.decodeMs)
@@ -6026,7 +6113,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSaveVideos = { viewModel.saveGeneratedVideos(context, it) },
                 onDeleteVideos = viewModel::deleteGeneratedVideos,
                 onRegenerateVideos = viewModel::regenerateVideos,
-                onSaveImages = { viewModel.saveGeneratedCopies(context, it) },
+                onSaveImages = { viewModel.saveManagedGeneratedCopies(context, it) },
                 onDeleteImages = viewModel::deleteGeneratedImageEntries,
                 onRegenerateImages = viewModel::regenerateImages,
                 onGenerateImages = viewModel::generateAdditionalImages,
@@ -6109,7 +6196,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSaveVideos = { viewModel.saveGeneratedVideos(context, it) },
                 onDeleteVideos = viewModel::deleteGeneratedVideos,
                 onRegenerateVideos = viewModel::regenerateVideos,
-                onSaveImages = { viewModel.saveGeneratedCopies(context, it) },
+                onSaveImages = { viewModel.saveManagedGeneratedCopies(context, it) },
                 onDeleteImages = viewModel::deleteGeneratedImageEntries,
                 onRegenerateImages = viewModel::regenerateImages,
                 onGenerateImages = viewModel::generateAdditionalImages,
@@ -6168,7 +6255,7 @@ private fun GalleryScreen(
     onSaveVideos: (List<Int>) -> Unit,
     onDeleteVideos: (List<Int>) -> Unit,
     onRegenerateVideos: (List<Int>) -> Unit,
-    onSaveImages: (List<Int>) -> Unit,
+    onSaveImages: (List<ManagedCacheItem>) -> Unit,
     onDeleteImages: (List<ManagedCacheItem>) -> Unit,
     onRegenerateImages: (List<ManagedCacheItem>) -> Unit,
     onGenerateImages: (List<Int>) -> Unit,
@@ -6400,7 +6487,7 @@ private fun GalleryScreen(
                     Text(lang.t("已选 ${selectedKeys.size} 项 · 仅处理已生成图片", "${selectedKeys.size} selected · generated photos only"), style = MaterialTheme.typography.labelMedium)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         TextButton(onClick = { selectedKeys = emptySet() }) { Text(lang.t("取消", "Cancel")) }
-                        TextButton(onClick = { onSaveGenerated(selectedIndexes); selectedKeys = emptySet() }) { Text(lang.t("保存副本", "Save copies")) }
+                        TextButton(onClick = { onSaveGenerated(selectedIndexes); selectedKeys = emptySet() }) { Text(lang.t("保存无损 PNG", "Save lossless PNG")) }
                         TextButton(onClick = { confirmReplace = true }) { Text(lang.t("替换原图…", "Replace originals…")) }
                     }
                 }
@@ -6918,7 +7005,7 @@ private fun ManageScreen(
     onSaveVideos: (List<Int>) -> Unit,
     onDeleteVideos: (List<Int>) -> Unit,
     onRegenerateVideos: (List<Int>) -> Unit,
-    onSaveImages: (List<Int>) -> Unit,
+    onSaveImages: (List<ManagedCacheItem>) -> Unit,
     onDeleteImages: (List<ManagedCacheItem>) -> Unit,
     onRegenerateImages: (List<ManagedCacheItem>) -> Unit,
     onGenerateImages: (List<Int>) -> Unit,
@@ -7248,7 +7335,7 @@ private fun ManageScreen(
                                         count = selectedImageKeys.size,
                                         onClear = { selectedImageKeys = emptySet() },
                                         onSelectAll = { selectedImageKeys = itemsInVersion.mapTo(linkedSetOf()) { "${it.entry.photoKey}|${it.entry.version}" } },
-                                        onSave = { onSaveImages(selectedImageIndexes); selectedImageKeys = emptySet() },
+                                        onSave = { onSaveImages(selectedItems); selectedImageKeys = emptySet() },
                                         onRegenerate = { onRegenerateImages(selectedItems); selectedImageKeys = emptySet() },
                                         onGenerate = { onGenerateImages(selectedImageIndexes); selectedImageKeys = emptySet() },
                                         imageReplacement = true,
@@ -7265,7 +7352,7 @@ private fun ManageScreen(
                                 lang = lang,
                                 onClear = { selectedImageKeys = emptySet() },
                                 onSelectAll = { selectedImageKeys = itemsInVersion.mapTo(linkedSetOf()) { "${it.entry.photoKey}|${it.entry.version}" } },
-                                onSave = { onSaveImages(selectedImageIndexes); selectedImageKeys = emptySet() },
+                                onSave = { onSaveImages(selectedItems); selectedImageKeys = emptySet() },
                                 onRegenerate = { onRegenerateImages(selectedItems); selectedImageKeys = emptySet() },
                                         onGenerate = { onGenerateImages(selectedImageIndexes); selectedImageKeys = emptySet() },
                                         imageReplacement = true,
@@ -7454,7 +7541,7 @@ private fun ManageSelectionActions(
         }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = onSelectAll) { Text(lang.t("全选", "Select all")) }
-            onSave?.let { TextButton(onClick = it) { Text(lang.t("保存副本", "Save copies")) } }
+            onSave?.let { TextButton(onClick = it) { Text(if (imageReplacement) lang.t("保存无损 PNG", "Save lossless PNG") else lang.t("保存副本", "Save copies")) } }
             onGenerate?.let { action -> TextButton(onClick = { pending = "additional" }) { Text(lang.t("使用新参数生成", "Generate with new parameters")) } }
             onRegenerate?.let { action -> TextButton(onClick = { if (confirmChanges) pending = "regenerate" else action() }) { Text(lang.t("重新生成", "Regenerate")) } }
             TextButton(onClick = { if (confirmChanges) pending = "delete" else onDelete() }) { Text(lang.t("删除结果", "Delete results"), color = MaterialTheme.colorScheme.error) }
@@ -7608,8 +7695,8 @@ private fun SettingsScreen(
                 StudioCard(lang.t("输出尺寸", "Output size")) {
                     SettingInt(lang.t("单眼最大长边", "Maximum eye long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) { onChange(settings.copy(maxLongEdge = it)) }
                     SettingHelp(lang.t("不是 SBS 总宽。小图不强制放大；内存不足仍可能降采样。日常 JPEG 100 缓存有损。", "Not total SBS width. Small images are not enlarged; memory pressure may downsample. Daily JPEG 100 cache is lossy."))
-                    SettingChoice(lang.t("保存到图库的格式", "Gallery save format"), settings.imageExportFormat, listOf("PNG","AVIF"), { if(it=="PNG") lang.t("PNG · 无额外像素损失", "PNG · no additional pixel loss") else lang.t("AVIF · 严格校验后保存", "AVIF · verified before saving") }) {onChange(settings.copy(imageExportFormat=it))}
-                    SettingHelp(lang.t("PNG 默认保存当前 SBS 缓存，不再引入像素损失，但不能还原 JPEG 已损失的细节。现有 AVIF 编码器实测有色彩问题；像素校验失败会明确报错，不自动更换格式。", "PNG saves the current SBS cache without further pixel loss; it cannot restore prior JPEG loss. The current AVIF encoder showed color errors; pixel validation failures are reported without substituting formats."))
+                    Text(lang.t("保存到图库：原图重新生成 · 无损 PNG", "Gallery save: re-render original · lossless PNG"), style = MaterialTheme.typography.bodyMedium)
+                    SettingHelp(lang.t("预览使用 JPEG 100 缓存。保存副本时读取所选结果记录的模型、模式和参数，从原图重新推理并投影单眼，另一眼复用原图，直接写 PNG；不会把 JPEG 缓存转成 PNG。保持该结果的实际尺寸，不改当前设置、旧结果或队列；原图、参数缺失或内存不足会明确失败。视频保存仍复制已生成 MP4。", "Preview uses JPEG 100. Saving a copy re-renders the original using that result's recorded model, mode and parameters, projects one eye and reuses the original for the other, then writes PNG directly. Keeps recorded dimensions, settings, old results and queues. Missing originals/parameters or insufficient memory fail explicitly. Video save still copies its generated MP4."))
                 }
             }
             "images" -> {
@@ -9500,7 +9587,8 @@ private fun decodeSbsLeftPreview(file: File, maxLongEdge: Int): Bitmap {
     }
 }
 
-private fun saveImageToGallery(context: Context, source: File, displayName: String, mimeType: String = "image/jpeg"): Uri {
+internal fun saveImageToGallery(context: Context, source: File, displayName: String, mimeType: String = "image/jpeg",
+    publish: (() -> Unit) -> Unit = { it() }): Uri {
     val extension = when (mimeType) {
         "image/avif" -> "avif"
         "image/png" -> "png"
@@ -9524,8 +9612,10 @@ private fun saveImageToGallery(context: Context, source: File, displayName: Stri
         resolver.openOutputStream(uri)?.use { output ->
             source.inputStream().use { input -> input.copyTo(output) }
         } ?: error("Unable to open gallery output")
-        if (Build.VERSION.SDK_INT >= 29) {
-            resolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
+        publish {
+            if (Build.VERSION.SDK_INT >= 29) {
+                check(resolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null) == 1) { "Cannot publish saved image" }
+            }
         }
     }.onFailure { error ->
         resolver.delete(uri, null, null)

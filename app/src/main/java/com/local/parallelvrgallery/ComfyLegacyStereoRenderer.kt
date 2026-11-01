@@ -33,12 +33,13 @@ internal object ComfyLegacyStereoRenderer {
     }
 
     @Synchronized
-    fun renderPrepared(source: Bitmap, depth: FloatArray, scale: Float, subpixel: Boolean = false): Pair<Bitmap, Bitmap> {
+    @JvmOverloads
+    fun renderPrepared(source: Bitmap, depth: FloatArray, scale: Float, subpixel: Boolean = false, shareOriginalEye: Boolean = false): Pair<Bitmap, Bitmap> {
         val w = source.width; val h = source.height
         val pixels = IntArray(w * h); source.getPixels(pixels, 0, w, 0, 0, w, h)
         val projected = if (subpixel) ComfySubpixelProjection.project(pixels, w, h, depth, scale) else ComfyLegacyProjection.project(pixels, w, h, depth, scale)
         val left = Bitmap.createBitmap(projected, w, h, Bitmap.Config.ARGB_8888)
-        try { return left to Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888) }
+        try { return left to if (shareOriginalEye) source else Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888) }
         catch (error: Throwable) { left.recycle(); throw error }
     }
 }

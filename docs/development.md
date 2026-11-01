@@ -1,8 +1,8 @@
 # 本机开发与交接
 
-正式项目：`E:\AI-Programme\ParallelVrGalleryPro`。恢复日期：2026-10-31（Asia/Shanghai）。历史恢复基线为 **1.2.00 / 10200**；当前版本为 **1.8.00 / 10800**，详见 [fresh-generation-v1.8.00.md](fresh-generation-v1.8.00.md)。恢复历史来自离线 bundle，origin 为 `https://github.com/7116-byte/ParallelVrGalleryPro.git`。
+正式项目：`E:\AI-Programme\ParallelVrGalleryPro`。恢复日期：2026-10-31（Asia/Shanghai）。历史恢复基线为 **1.2.00 / 10200**；当前版本为 **1.9.00 / 10900**，详见 [fresh-generation-v1.8.00.md](fresh-generation-v1.8.00.md)。恢复历史来自离线 bundle，origin 为 `https://github.com/7116-byte/ParallelVrGalleryPro.git`。
 
-先读 [新任务性能](fresh-generation-v1.8.00.md) 和 [1.8.00 验收](releases/v1.8.00.md)，再读 [生成性能与格式实测](performance-v1.7.00.md) 和 [本版验收](releases/v1.7.00.md)，再读 [固定透明顶栏与真实 770 推理](depth-resolution-v1.6.00.md) 及 [v1.6.00 验收](releases/v1.6.00.md)，再读 [人体多点复核](navigation-and-body-v1.5.02.md)，再读 [固定参数、反转与对比](mode-controls-v1.5.01.md)，再读 [主节点技术记录](comfy-main-v1.4.00.md)。历史发布与恢复资料保留；私密资产仍只在 `.local/`。
+先读 [原图无损保存](original-png-v1.9.00.md) 与 [1.9.00 验收](releases/v1.9.00.md)，再读 [新任务性能](fresh-generation-v1.8.00.md) 和 [1.8.00 验收](releases/v1.8.00.md)，再读 [生成性能与格式实测](performance-v1.7.00.md) 和 [本版验收](releases/v1.7.00.md)，再读 [固定透明顶栏与真实 770 推理](depth-resolution-v1.6.00.md) 及 [v1.6.00 验收](releases/v1.6.00.md)，再读 [人体多点复核](navigation-and-body-v1.5.02.md)，再读 [固定参数、反转与对比](mode-controls-v1.5.01.md)，再读 [主节点技术记录](comfy-main-v1.4.00.md)。历史发布与恢复资料保留；私密资产仍只在 `.local/`。
 
 模式含义与画质证据需同时阅读 [六模式完整对比](mode-comparison-v1.4.00.md)。V6–V11 是内部算法/缓存标识，分属三组路线；同深度投影一致不代表整条桌面工作流或 JPEG 成品等效，更不构成六模式画质排名。
 
@@ -56,7 +56,7 @@ java -version
 
 ## 下一次继续开发
 
-v1.8.00 当前有 23 类、145 项 JVM 测试。模式档案与个人默认只保存视觉参数，共用模型/GPU/队列偏好。旧缓存标识在新选项关闭时不变；自动匹配、模型输入反转和独立副本分别追加 `_eq1050`、`_di1`、`_take…`。图片队列保存明确参数和替换目标，启动先恢复 `image_work` 的发布事务，再扫描成品。不得把替换改回“先删后生成”。
+v1.9.00 当前有 25 类、153 项 JVM 测试。模式档案与个人默认只保存视觉参数，共用模型/GPU/队列偏好。旧缓存标识在新选项关闭时不变；自动匹配、模型输入反转和独立副本分别追加 `_eq1050`、`_di1`、`_take…`。图片队列保存明确参数和替换目标，启动先恢复 `image_work` 的发布事务，再扫描成品。不得把替换改回“先删后生成”。
 
 Debug 的 `kind=modeProfiles` 对指定私密 QA 目录直接做六模式强制 GPU 对照，不启动图库；`kind=comparison` 只在指定 QA 相册检查实际加载完成后的缩放/位置及画面哈希；`kind=imageWrites` 只在合成 S1 副本验证新增、定向替换及实际读取失败。所有入口需要显式 `album/sample`，正式包不含测试入口。对比页必须等待可访问的“对比视口”出现后才注入手势，不能拿加载动画的哈希变化当验收通过。
 
@@ -81,3 +81,9 @@ Debug 专用原生手势回归入口：`adb -s <serial> shell am instrument -w -
 145 项回归覆盖逐位相同的 TensorTransfer、逐像素相同的 V10 反向覆盖及共享池租借生命周期。视频只借现成匹配会话，否则独立创建并释放，不能淘汰其他图片模型。ViewModel 等视频 worker 结束后再关闭池。原缓存键、模型、图像参数与队列语义保持。
 
 `coldProjection` 是早期基线上的候选算法实验入口；当前生产版也已采用优化覆盖规则，在当前版单独运行不能重新得出历史投影提速。前后性能应使用隔离的对应历史源码；独立原像素循环回归保留在 JVM 测试中。图片 770 与视频 518 不共享会话，不能套用同配置已就绪的 28.7% 收益。
+
+## 从原图保存 PNG（v1.9.00）
+
+普通图片保存只走 OriginalImageExportSpec 和 VrGenerator.exportOriginalPng，禁止退回 materializeSbsPng 或从 JPEG 拼接。捕获选中条目及参数，保留历史模式，不读当前参数；原图不可用或参数校验失败时明确失败。保持条目记录的实际单眼尺寸，不能为保存静默缩图。SbsPngWriter 按 sRGB RGBA 行写 Sub filter / 低压缩 PNG，不增加 JPEG 编码步骤；这保证当前 8-bit 生成管线的像素，不宣称恢复原图固有 JPEG 损失、HDR 或 16-bit 精度。
+
+临时文件仅在扫描范围外 export_work；最终图库发布仍受 GenerationGuard 与选中结果身份检查保护，取消/失败删除 pending 行。预览缓存与队列不被改写。AVIF 旧偏好保留供兼容，普通保存不再读取它；设置明确说明原图重新生成 PNG。视频保存依旧复制已生成 MP4。

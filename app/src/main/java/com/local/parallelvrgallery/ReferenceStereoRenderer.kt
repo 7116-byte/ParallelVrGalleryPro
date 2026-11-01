@@ -17,7 +17,8 @@ internal object ReferenceStereoRenderer {
 
     // Bound native inpaint allocations across concurrent image workers.
     @Synchronized
-    fun render(source: Bitmap, depth: FloatArray, depthWidth: Int, depthHeight: Int, scale: Float, continuousDepth: Boolean = false): Pair<Bitmap, Bitmap> {
+    @JvmOverloads
+    fun render(source: Bitmap, depth: FloatArray, depthWidth: Int, depthHeight: Int, scale: Float, continuousDepth: Boolean = false, shareOriginalEye: Boolean = false): Pair<Bitmap, Bitmap> {
         check(initialized)
         val width = source.width
         val height = source.height
@@ -47,10 +48,10 @@ internal object ReferenceStereoRenderer {
             for (i in raster.pixels.indices) {
                 raster.pixels[i] = (0xff shl 24) or ((bgr[i * 3 + 2].toInt() and 255) shl 16) or ((bgr[i * 3 + 1].toInt() and 255) shl 8) or (bgr[i * 3].toInt() and 255)
             }
-            val left = Bitmap.createBitmap(original, width, height, Bitmap.Config.ARGB_8888)
+            val left = if (shareOriginalEye) source else Bitmap.createBitmap(original, width, height, Bitmap.Config.ARGB_8888)
             try {
                 return left to Bitmap.createBitmap(raster.pixels, width, height, Bitmap.Config.ARGB_8888)
-            } catch (error: Throwable) { left.recycle(); throw error }
+            } catch (error: Throwable) { if (left !== source) left.recycle(); throw error }
         } finally {
             output.release()
             mask.release()
