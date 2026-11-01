@@ -203,8 +203,6 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import com.radzivon.bartoshyk.avif.coder.HeifCoder
-import com.radzivon.bartoshyk.avif.coder.PreciseMode
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.core.app.NotificationCompat
@@ -430,6 +428,7 @@ data class AppSettings(
     val depthUpscale: DepthUpscaleSettings = DepthUpscaleSettings(),
     val matchV10Default: Boolean = false,
     val invertModelDepth: Boolean = false,
+    val imageExportFormat: String = "PNG",
 ) {
     fun toParams(): VrGenerationParams = VrGenerationParams(
         depthModel = imageModelId,
@@ -707,6 +706,7 @@ data class UiState(
     val settings: AppSettings = AppSettings(),
     val activePrefetchWindow: Int = 2,
     val prefetchSlotState: PrefetchSlotState = PrefetchSlotState(),
+    val viewerTravelDirection: Int = 0,
     val states: Map<String, VrState> = emptyMap(),
     val entries: Map<String, VrCacheEntry> = emptyMap(),
     val jobs: List<VrJob> = emptyList(),
@@ -1025,6 +1025,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 galleryAnchorSlot = (index - firstVisibleIndex).coerceAtLeast(0),
                 vrMode = true,
                 viewerOrigin = ViewerOrigin.NORMAL,
+                viewerTravelDirection = 0,
                 manageViewerKeys = emptySet(),
                 viewerScopeKeys = orderedKeys.toSet(),
                 viewerScopeOrderedKeys = orderedKeys,
@@ -1622,7 +1623,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (before.selectedIndex == null || before.selectedIndex == index || index !in viewerScopeIndices(before)) return
         currentImageFirst.select(before.photos.getOrNull(index)?.cacheKey)
         if (before.viewerOrigin == ViewerOrigin.NORMAL && before.vrMode) pauseWaitingImageJobs()
-        _uiState.update { it.copy(selectedIndex = index, galleryAnchorIndex = index, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow, prefetchSlotState = PrefetchSlotState()) }
+        val scope = viewerScopeIndices(before)
+        val direction = NeighborPriority.direction(scope.indexOf(before.selectedIndex), scope.indexOf(index))
+        _uiState.update { it.copy(selectedIndex = index, galleryAnchorIndex = index, viewerTravelDirection = direction, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow, prefetchSlotState = PrefetchSlotState()) }
         val state = _uiState.value
         if (state.viewerOrigin != ViewerOrigin.NORMAL) return
         if (state.vrMode && state.photos.getOrNull(index)?.kind == MediaKind.IMAGE) {
@@ -1799,24 +1802,26 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun saveGeneratedCopies(context: Context, indexes: List<Int>) {
         val lang = _uiState.value.settings.language
+        val exportFormat = _uiState.value.settings.imageExportFormat
         _uiState.update { it.copy(blockingMessage = lang.t("保存中", "Saving")) }
         viewModelScope.launch {
             val message = withContext(Dispatchers.IO) {
                 var saved = 0
                 var failed = 0
+                var failure: String? = null
                 indexes.distinct().forEach { index ->
                     val photo = _uiState.value.photos.getOrNull(index) ?: return@forEach
                     val entry = cache.findEntry(photo) ?: return@forEach
                     runCatching {
-                        val avif = materializeSbsAvif(entry)
-                        saveImageToGallery(context, avif, "${GENERATED_VR_PREFIX}${photo.cacheKey}_${photo.displayName}", "image/avif")
+                        val output = if(exportFormat == "AVIF") materializeSbsAvif(entry) else materializeSbsPng(entry)
+                        saveImageToGallery(context, output, "${GENERATED_VR_PREFIX}${photo.cacheKey}_${photo.displayName}", if(exportFormat == "AVIF") "image/avif" else "image/png")
                         saved++
-                    }.onFailure { failed++ }
+                    }.onFailure { failed++;failure=it.message }
                 }
                 when {
+                    failed > 0 -> lang.t("已保存 $saved 张 $exportFormat，失败 $failed 张：${failure.orEmpty()}", "Saved $saved $exportFormat images, failed $failed: ${failure.orEmpty()}")
                     saved == 0 -> lang.t("没有可保存的已生成 VR 图", "No generated VR images to save")
-                    failed == 0 -> lang.t("已保存 $saved 张到系统图库", "Saved $saved images to system gallery")
-                    else -> lang.t("已保存 $saved 张，失败 $failed 张", "Saved $saved images, failed $failed")
+                    else -> lang.t("已保存 $saved 张 $exportFormat 到系统图库", "Saved $saved $exportFormat images to system gallery")
                 }
             }
             _uiState.update { it.copy(blockingMessage = null, message = message) }
@@ -2100,15 +2105,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             promoteCurrentImageForVr(index, queueContext)
         }
         if (!currentImageFirst.permits(photos[index].cacheKey, cache.findEntry(photos[index], currentVersion) != null)) return
-        val occupiedStates = setOf(VrState.QUEUED, VrState.GENERATING)
         fun eligibleAt(position: Int): Int? {
             val photoIndex = scopeIndices.getOrNull(position) ?: return null
             val photo = photos[photoIndex]
             if (photo.kind != MediaKind.IMAGE) return null
             if (photo.cacheKey in targetKeys) return null
             val itemState = state.states[photo.cacheKey] ?: VrState.NORMAL
-            if (itemState in occupiedStates) return null
-            if (itemState == VrState.PAUSED && synchronized(paused) { photo.cacheKey !in autoPausedKeys }) return null
+            if (!NeighborPriority.canAdmit(itemState, synchronized(paused) {photo.cacheKey in autoPausedKeys})) return null
             if (cache.findEntry(photo, currentVersion) != null) return null
             return photoIndex
         }
@@ -2125,7 +2128,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             if (targets.size >= desiredCount) return false
             val key = photos[photoIndex].cacheKey
             if (!targetKeys.add(key)) return false
-            targets += photoIndex to targets.size + 1
+            val direction = if(state.settings.autoPrefetch) state.viewerTravelDirection else 0
+            targets += photoIndex to NeighborPriority.rank(scopeIndices.indexOf(photoIndex)-scopePosition,direction)
             return true
         }
         fun fillAutoSlot(preferredOffsetStep: Int, distance: Int, fromDistance: Int, toDistance: Int) {
@@ -2189,7 +2193,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 upsertJob(job.photo, job.priority, VrState.PAUSED, 0f, source = job.source, albumId = job.albumId)
             }
         }
-        addLog("image prefetch-window center=${photos[index].displayName} source=${queueContext.source} album=${queueContext.albumId} tier=$window targets=${targets.size} scope=${scopeIndices.size}")
+        addLog("image prefetch-window center=${photos[index].displayName} source=${queueContext.source} album=${queueContext.albumId} tier=$window targets=${targets.size} scope=${scopeIndices.size} direction=${state.viewerTravelDirection}")
         targets.forEach { (targetIndex, priority) -> enqueuePhoto(targetIndex, priority, force = false, current = false, context = queueContext) }
         rebalanceQueueForActiveSource()
         startWorker()
@@ -2335,9 +2339,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun pollAllowedPendingJob(): QueuedJob? = synchronized(imageRuns) {
         val state = _uiState.value
+        val scope = if(state.settings.autoPrefetch && canPrefetch(state)) state.viewerScopeOrderedKeys.withIndex().associate { it.value to it.index } else emptyMap()
+        val center = state.selectedIndex?.let { state.photos.getOrNull(it)?.cacheKey }?.let { scope[it] }
+        fun rank(job:QueuedJob):Int = if(job.writeIntent == null && center != null && job.photo.cacheKey in scope)
+            NeighborPriority.rank(scope.getValue(job.photo.cacheKey)-center,state.viewerTravelDirection) else job.priority
         return synchronized(pending) {
             val job = pending
-                .sortedWith(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
+                .sortedWith(compareBy<QueuedJob> { rank(it) }.thenBy { it.sequence })
                 .firstOrNull { jobAllowedInCurrentContext(it, state) }
             if (job != null) {
                 pending.remove(job)
@@ -3359,6 +3367,7 @@ private class SettingsStore(context: Context) {
             useGpu = prefs.getBoolean("useGpu", false),
             gpuTestMode = runCatching { GpuTestMode.valueOf(prefs.getString("gpuTestMode", GpuTestMode.ACCURATE_UNSET.name) ?: GpuTestMode.ACCURATE_UNSET.name) }.getOrDefault(GpuTestMode.ACCURATE_UNSET),
             forceGpuNoFallback = true,
+            imageExportFormat = prefs.getString("imageExportFormat", "PNG").takeIf {it == "AVIF"} ?: "PNG",
             videoModelThreads = prefs.getInt("videoModelThreads", 4),
             videoUseGpu = prefs.getBoolean("videoUseGpu", false),
             videoDepthWorkers = prefs.getInt("videoDepthWorkers", 2).coerceIn(1, 2),
@@ -3406,6 +3415,7 @@ private class SettingsStore(context: Context) {
             .putString("videoModelId", settings.videoModelId)
             .putBoolean("autoPrefetch", settings.autoPrefetch)
             .putInt("prefetchWindow", settings.prefetchWindow)
+            .putString("imageExportFormat", settings.imageExportFormat)
             .putFloat("depthScale", settings.depthScale)
             .putInt("blurRadius", settings.blurRadius)
             .putInt("fillRadius", settings.fillRadius)
@@ -4347,17 +4357,13 @@ private class VrGenerator(
             val modelMs = System.currentTimeMillis() - depthStart
             mark("model inference ${modelMs}ms")
             val depthPostStart = System.currentTimeMillis()
-            val modelDepthBitmap = depthToBitmap(DepthTensorShape.map(DepthDirection.modelDepth(rawDepth,
-                DepthDirection.reversed(params.edgeMode, params.invertModelDepth, params.invertDepth))))
-            try { FileOutputStream(File(dir, "model_depth.png")).use { modelDepthBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) } }
-            finally { modelDepthBitmap.recycle() }
+            DepthPngWriter.write(DepthTensorShape.map(DepthDirection.modelDepth(rawDepth,
+                DepthDirection.reversed(params.edgeMode, params.invertModelDepth, params.invertDepth))), File(dir,"model_depth.png"))
             var depthMap = prepareDepth(rawDepth, params, original.width, original.height)
             onProgress(0.55f)
 
-            val depthBitmap = depthToBitmap(depthMap).also { ownedBitmaps.add(it) }
             val depthPath = File(dir, "depth.png")
-            FileOutputStream(depthPath).use { depthBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
-            depthBitmap.recycle()
+            DepthPngWriter.write(depthMap,depthPath)
             val depthPostMs = System.currentTimeMillis() - depthPostStart
             mark("depth post ${depthPostMs}ms output=${depthMap.width}x${depthMap.height} source=${original.width}x${original.height} upscale=${params.depthUpscale}; memory/output limits apply")
             onProgress(0.7f)
@@ -4381,9 +4387,7 @@ private class VrGenerator(
                 original = reduced.also { ownedBitmaps.add(it) }
                 depthMap = prepareDepth(rawDepth, params, original.width, original.height)
                 // Diagnostic depth must describe the geometry actually used by the successful retry.
-                val retryDepthBitmap = depthToBitmap(depthMap)
-                try { FileOutputStream(depthPath).use { retryDepthBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) } }
-                finally { retryDepthBitmap.recycle() }
+                DepthPngWriter.write(depthMap,depthPath)
                 makeParallelStereoPair(original, depthMap, params.effectiveScale(original.width, depthMap), params.fillRadius, params.edgeMode)
             }
             ownedBitmaps.add(pair.left)
@@ -5264,7 +5268,7 @@ private class VideoVrGenerator(
             var width = 0
             var height = 0
             val temporalSmoother = DepthTemporalSmoother()
-            frameGenerator.openDepthSession(vrParams, onModelProgress, onRuntimeInfo).use { depthSession ->
+            DeferredResource { frameGenerator.openDepthSession(vrParams, onModelProgress, onRuntimeInfo) }.use { depthSession ->
                 val cachedFirst = readCachedStereoFrame(framesDir, 0, previousFramesDirs)?.also {
                     onRuntimeInfo("frame cache hit frame=0 version=$version")
                 }
@@ -5276,7 +5280,7 @@ private class VideoVrGenerator(
                         } else {
                             first.copy(Bitmap.Config.ARGB_8888, false)
                         }
-                        val generated = frameGenerator.generateVideoSbsBitmap(firstSource, vrParams, depthSession, temporalSmoother)
+                        val generated = frameGenerator.generateVideoSbsBitmap(firstSource, vrParams, depthSession.get(), temporalSmoother)
                         try {
                             writeStereoFrameCache(framesDir, 0, generated.eyes)
                         } catch (error: Throwable) {
@@ -5424,7 +5428,7 @@ private class VideoVrGenerator(
         version: String,
         params: VrGenerationParams,
         videoParams: VideoGenerationParams,
-        depthSession: DepthModelSession,
+        depthSession: DeferredResource<DepthModelSession>,
         temporalSmoother: DepthTemporalSmoother,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit,
@@ -5581,7 +5585,7 @@ private class VideoVrGenerator(
                     },
                     depth = { data, worker ->
                         if (!data.cacheHit) {
-                            val session = if (worker == 0) depthSession else synchronized(extraSessions) {
+                            val session = if (worker == 0) depthSession.get() else synchronized(extraSessions) {
                                 extraSessions.getOrPut(worker) { frameGenerator.openDepthSession(params, onModelProgress, onRuntimeInfo) }
                             }
                             data.startedAt = SystemClock.uptimeMillis()
@@ -7601,7 +7605,9 @@ private fun SettingsScreen(
                 }
                 StudioCard(lang.t("输出尺寸", "Output size")) {
                     SettingInt(lang.t("单眼最大长边", "Maximum eye long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) { onChange(settings.copy(maxLongEdge = it)) }
-                    SettingHelp(lang.t("不是 SBS 总宽。小图不强制放大；内存不足仍可能降采样。日常 JPEG 100 缓存有损，导出才编码无损 AVIF。", "Not total SBS width. Small images are not enlarged; memory pressure may downsample. Daily JPEG 100 cache is lossy; lossless AVIF is encoded on export."))
+                    SettingHelp(lang.t("不是 SBS 总宽。小图不强制放大；内存不足仍可能降采样。日常 JPEG 100 缓存有损。", "Not total SBS width. Small images are not enlarged; memory pressure may downsample. Daily JPEG 100 cache is lossy."))
+                    SettingChoice(lang.t("保存到图库的格式", "Gallery save format"), settings.imageExportFormat, listOf("PNG","AVIF"), { if(it=="PNG") lang.t("PNG · 无额外像素损失", "PNG · no additional pixel loss") else lang.t("AVIF · 严格校验后保存", "AVIF · verified before saving") }) {onChange(settings.copy(imageExportFormat=it))}
+                    SettingHelp(lang.t("PNG 默认保存当前 SBS 缓存，不再引入像素损失，但不能还原 JPEG 已损失的细节。现有 AVIF 编码器实测有色彩问题；像素校验失败会明确报错，不自动更换格式。", "PNG saves the current SBS cache without further pixel loss; it cannot restore prior JPEG loss. The current AVIF encoder showed color errors; pixel validation failures are reported without substituting formats."))
                 }
             }
             "images" -> {
@@ -7612,7 +7618,7 @@ private fun SettingsScreen(
                     SettingChoice(lang.t("前后范围", "Neighbor range"), if (settings.autoPrefetch) "auto" else settings.prefetchWindow.toString(), listOf("auto", "2", "4", "8"), { if (it == "auto") lang.t("自动 · 2 → 4 → 8", "Auto · 2 → 4 → 8") else lang.t("前后各 $it", "$it each side") }) {
                         onChange(settings.copy(autoPrefetch = it == "auto", prefetchWindow = if (it == "auto") 2 else it.toInt()))
                     }
-                    SettingHelp(lang.t("当前图优先，邻图只来自进入时的全部/相册范围。自动档在同档范围内补位，最多前八后八；固定档不反向补位。生成页不新增邻图预加载。", "Current image first. Neighbors stay in the captured All/Album scope. Auto borrows within each tier, up to ±8; fixed tiers do not borrow. Generated never creates neighbor prefetch."))
+                    SettingHelp(lang.t("当前图优先，邻图只来自进入时的全部/相册范围。首次前后均衡；自动档翻页后优先连续方向，并保留反向邻图。仍按 2→4→8 同档补位，最多前八后八；固定档保持前后均衡、不反向补位。生成页不新增邻图预加载。", "Current image first. Neighbors stay in the captured All/Album scope. Initially balanced; Auto favors travel direction while retaining reverse neighbors. Same 2→4→8 tiers, up to ±8; fixed tiers stay balanced without borrowing. Generated never creates neighbor prefetch."))
                     SettingInt(lang.t("后台 worker 数", "Background workers"), settings.generationWorkers, listOf(1, 2, 3)) { onChange(settings.copy(generationWorkers = it)) }
                     SettingHelp(lang.t("重叠解码、合成和写入；GPU 推理仍在拥有者线程串行运行，更多 worker 会增加内存。", "Overlaps decode, composition and writes. GPU inference remains serialized on its owner; more workers consume more memory."))
                 }
@@ -9568,7 +9574,7 @@ private fun replaceOriginalImage(context: Context, photo: PhotoItem, source: Fil
 
 private fun writeJpegCache(bitmap: Bitmap, file: File, quality: Int) {
     file.parentFile?.mkdirs()
-    FileOutputStream(file).use { output ->
+    FileOutputStream(file).buffered(256 * 1024).use { output ->
         check(bitmap.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(1, 100), output)) {
             "JPEG cache encode failed: ${file.absolutePath}"
         }
@@ -9708,17 +9714,25 @@ private fun materializeSbsJpeg(entry: VrCacheEntry, quality: Int = 96): File {
 
 private fun materializeSbsAvif(entry: VrCacheEntry): File {
     val dir = File(entry.paramsPath).parentFile ?: error("Missing cache directory for ${entry.photoKey}")
-    val output = File(dir, "export_sbs.avif")
+    val output = File(dir, "export_sbs_verified.avif")
     if (output.exists()) return output
     val bitmap = composeSbsBitmap(entry)
     val evenBitmap = bitmap.ensureEvenDimensions()
     try {
-        val bytes = HeifCoder().encodeAvif(evenBitmap, quality = 100, preciseMode = PreciseMode.LOSSLESS)
-        output.writeBytes(bytes)
+        LosslessImageExport.avif(evenBitmap,output)
     } finally {
         if (evenBitmap !== bitmap) evenBitmap.recycle()
         bitmap.recycle()
     }
+    return output
+}
+
+private fun materializeSbsPng(entry:VrCacheEntry):File {
+    val dir=File(entry.paramsPath).parentFile ?: error("Missing cache directory")
+    val output=File(dir,"export_sbs.png")
+    if(output.isFile)return output
+    val bitmap=composeSbsBitmap(entry)
+    try {LosslessImageExport.png(bitmap,output)}finally{bitmap.recycle()}
     return output
 }
 

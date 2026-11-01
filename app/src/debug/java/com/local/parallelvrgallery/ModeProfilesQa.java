@@ -16,7 +16,7 @@ final class ModeProfilesQa {
     static AppSettings base(DepthEdgeMode mode) {
         return new AppSettings(AppLanguage.ZH, "depth_anything_v2_small_tflite", "depth_anything_v2_small_tflite",
             false, 2, 50f, 3, 10, true, 6000, 518, 1, 4, true, GpuTestMode.ACCURATE_UNSET, true,
-            4, true, 2, mode, new DepthUpscaleSettings(false, 0, DepthInterpolation.BILINEAR, DepthResizeOrder.SMOOTH_THEN_RESIZE), false, false);
+            4, true, 2, mode, new DepthUpscaleSettings(false, 0, DepthInterpolation.BILINEAR, DepthResizeOrder.SMOOTH_THEN_RESIZE), false, false,"PNG");
     }
 
     static void run(Context context) throws Exception {

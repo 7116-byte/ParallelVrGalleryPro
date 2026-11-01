@@ -30,6 +30,26 @@ public final class StudioGestureInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if(kind.equals("performanceConfirmation")) {
+                PerformancePipelineQa.run(getTargetContext(),"confirmation");
+                result.putString("qa","PASS: final generation confirmation without altering a cached frame");finish(0,result);return;
+            }
+            if(kind.equals("performanceAvif")) {
+                PerformanceAvifQa.run(getTargetContext());
+                result.putString("qa","PASS: AVIF Android/library roundtrip diagnostics recorded");finish(0,result);return;
+            }
+            if(kind.equals("performancePng")) {
+                PerformancePngQa.run(getTargetContext());
+                result.putString("qa","PASS: fast PNG matches every decoded Android pixel of eight actual model/projection maps");finish(0,result);return;
+            }
+            if(kind.equals("performanceBaseline") || kind.equals("performanceOptimized")) {
+                PerformancePipelineQa.run(getTargetContext(),kind.equals("performanceBaseline")?"baseline":"optimized");
+                result.putString("qa","PASS: scoped actual image/video generators benchmarked");finish(0,result);return;
+            }
+            if(kind.equals("performanceFormats")) {
+                PerformanceFormats.run(getTargetContext());
+                result.putString("qa","PASS: QA format timing and decoded pixel error recorded; no gallery or queue access");finish(0,result);return;
+            }
             if(kind.equals("highResolutionPipeline")) {
                 HighResolutionQa.runPipeline(getTargetContext());
                 result.putString("qa","PASS: actual session and six-mode pipeline at 518/770; isolated authorized inputs; no catalog writes");finish(0,result);return;

@@ -4,6 +4,13 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DepthTensorShapeTest {
+    @Test fun exportFormatIsGlobalAndCannotChangeGenerationOrVideoCacheKeys() {
+        val png=AppSettings(imageExportFormat="PNG")
+        val avif=png.copy(imageExportFormat="AVIF")
+        assertEquals(png.toParams().cacheVersion(),avif.toParams().cacheVersion())
+        assertEquals(png.toVideoParams().cacheVersion(),avif.toVideoParams().cacheVersion())
+        for(mode in DepthEdgeMode.values())assertEquals("PNG",ModeVisualProfile.defaults(mode).applyTo(png).imageExportFormat)
+    }
     @Test fun highResolutionModelHasIndependentCacheAndSurvivesVisualModeSwitch() {
         val old = AppSettings()
         val high = old.copy(imageModelId = "depth_anything_v2_small_770_v1", depthResolution = 770)
