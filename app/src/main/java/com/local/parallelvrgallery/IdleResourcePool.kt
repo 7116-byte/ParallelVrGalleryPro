@@ -45,4 +45,12 @@ internal class IdleResourcePool<K, T : Closeable>(private val maxIdle: Int = 1) 
         }
         dispose.forEach { it.close() }
     }
+
+    fun trimIdle(): Int {
+        val dispose = synchronized(this) {
+            entries.filterValues { it.users == 0 }.keys.toList().mapNotNull { entries.remove(it)?.value }
+        }
+        dispose.forEach { it.close() }
+        return dispose.size
+    }
 }

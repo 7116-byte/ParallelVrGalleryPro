@@ -72,3 +72,12 @@ TensorTransfer 输入临时区限一行（518 约 6 KB），不能改回整图�
 用户明确要求预览 JPEG100、保存从原图按所选结果参数重做 PNG，取代上文 v1.7.00 的缓存转 PNG 保存语义。普通保存不得读取旧 export_sbs.png 或 JPEG 眼图，不改当前设置/旧结果/图片队列、不新增邻图预加载。先捕获具体条目和参数；保留 V6–V11 原始眼序、反转、模型、强度和实际尺寸。原图缺失/变化、参数不完整/损坏或内存不足明确失败，不自动换当前参数、不静默降低尺寸。原图眼可直接复用，另一眼按原算法投影；输出 sRGB 8-bit RGBA 无损 PNG，不宣称恢复源文件本身的压缩损失或 HDR 高位深。
 
 导出 staging 位于 export_work，发布 MediaStore pending→可见前同时核验 GenerationGuard、版本与创建时间；失败/取消清理自己的 pending 行与 staging，不能复活已删结果。历史 AVIF 偏好和文件保留，普通保存固定 PNG。当前 25 类、153 项 JVM；头部无 Activity 的 QA 入口仅限 PVG_QA_original1900 授权副本，原始证据私密。视频原帧复用须核验实际共享计数、两种解码路径和图像结果，不能用未触发共享的初测或模型就绪收益冒充提速。
+
+
+## v1.10.00 切页与后台队列
+
+当前先读 docs/background-and-navigation-v1.10.00.md 与 docs/releases/v1.10.00.md。26 类、166 项 JVM，实际结果仍以本次 result.json 为准。设置四页和生成页图片/视频使用受控 HorizontalPager；多选期间禁用横滑，不能让离屏页清空当前操作槽。设置 LazyColumn 卡片、固定标题；不重新引入整页网格缩放叠加过渡。模型预热只在可见、空闲的普通图库执行；退后台释放空闲会话，不能关闭活跃借用。
+
+GalleryRuntime 拥有应用级工作状态；视频服务租约覆盖整批队列，图片工人与原图导出共享租约。视频续跑从任务快照取参数，排队暂停要先捕获再移除。所有视频模型/进度/完成回调核对运行 token，迟到回调不能覆盖暂停。首次队列恢复结束后才显示加载完成。USER / SERVICE_UNAVAILABLE / SYSTEM_LIMIT / PROCESS_RESTART 追加到兼容 TSV，不复活历史暂停或失败。
+
+background_run.txt 只允许明确开始的视频在系统服务 null Intent 重建时恢复，最多 3 次/15 分钟；普通 UI 冷启动仍先暂停。平板 SIGKILL 后没有自动重启，显式恢复路径通过不能写成系统自动恢复通过；厂商清理与强停限制继续报告。Debug BackgroundQaActivity 只处理固定合成视频和授权标记，正式 APK 不含 QA Activity。设备队列必须按 key 合并、保留新用户工作；测试完成恢复原偏好和显示状态，再覆盖正式包。

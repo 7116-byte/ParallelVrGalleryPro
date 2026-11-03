@@ -125,6 +125,8 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.pager.PagerDefaults
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
@@ -219,6 +221,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
@@ -254,12 +258,24 @@ import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 class MainActivity : ComponentActivity() {
+    override fun onStart() {
+        super.onStart()
+        GalleryRuntime.obtain(application).setUiVisible(true)
+    }
+    override fun onStop() {
+        GalleryRuntime.current()?.setUiVisible(false)
+        super.onStop()
+    }
+    override fun onDestroy() {
+        if (!isChangingConfigurations) GalleryRuntime.current()?.onUiOwnerRemoved()
+        super.onDestroy()
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             StudioTheme {
                 Surface(Modifier.fillMaxSize()) {
-                    GalleryApp()
+                    GalleryApp(GalleryRuntime.obtain(application))
                 }
             }
         }
@@ -788,6 +804,7 @@ private data class QueueTag(
     val updatedAt: Long,
     val params: VrGenerationParams? = null,
     val writeIntent: ImageWriteIntent? = null,
+    val pauseReason: String? = null,
 )
 
 private data class VideoQueueTag(
@@ -795,15 +812,18 @@ private data class VideoQueueTag(
     val state: VideoVrState,
     val params: VideoGenerationParams?,
     val updatedAt: Long,
+    val pauseReason: String? = null,
 )
 
-class GalleryViewModel(application: Application) : AndroidViewModel(application) {
+class GalleryViewModel @JvmOverloads constructor(application: Application, private val serviceResumeKeys: Set<String> = emptySet()) : AndroidViewModel(application) {
     private val app = application
     private val repository = PhotoRepository(app)
     private val cache = VrCacheManager(app)
     private val videoCache = VideoVrCacheManager(app)
     private val videoNotifier = VideoGenerationNotifier(app)
     private val videoKeepAlive = VideoGenerationKeepAlive(app)
+    private val backgroundRuns = BackgroundRunLedger(File(app.getExternalFilesDir(null), "queue_index/background_run.txt"))
+    private val uiVisible = MutableStateFlow(false)
     private val modelManager = ModelManager(app)
     private val generator = VrGenerator(app, cache, modelManager)
     private val videoGenerator = VideoVrGenerator(app, videoCache, generator)
@@ -823,7 +843,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val videoRunTokens = mutableMapOf<String, Long>()
     private var sequence = 0L
     private var videoSequence = 0L
+    private val videoControlLock = Any()
+    private var videoQueueLease: Closeable? = null
     private var restoredQueueTags = false
+    @Volatile private var queueRestorationComplete = false
     private val workers = mutableListOf<Job>()
     private val videoWorkers = mutableListOf<Job>()
     private var currentWorker: Job? = null
@@ -834,6 +857,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private var modelWarmupJob: Job? = null
     private var comparisonJob: Job? = null
     private var imageExportJob: Job? = null
+    private var backgroundTrimJob: Job? = null
     private val comparisonRevision = java.util.concurrent.atomic.AtomicLong()
 
     private val _uiState = MutableStateFlow(
@@ -848,9 +872,15 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         modelWarmupJob = viewModelScope.launch(Dispatchers.IO) {
-            _uiState.map { it.settings.toParams() }
-                .distinctUntilChanged { old, new -> old.depthSessionKey() == new.depthSessionKey() }
-                .collectLatest { params ->
+            combine(_uiState, uiVisible) { state, visible ->
+                state.settings.toParams() to (visible && !state.loading && !state.settingsOpen && !state.manageOpen &&
+                    state.selectedIndex == null && state.homeTab != "generated" &&
+                    state.videoStates.values.none(VideoCommandPolicy::canPause) &&
+                    state.states.values.none { it == VrState.QUEUED || it == VrState.GENERATING })
+            }.distinctUntilChanged { old, new -> old.first.depthSessionKey() == new.first.depthSessionKey() && old.second == new.second }
+                .collectLatest { (params, allowed) ->
+                    if (!allowed) return@collectLatest
+                    delay(1200) // Keep cold-start layout and immediate navigation clear of model compilation.
                     fun report(status: String) {
                         _uiState.update {
                             if (it.settings.toParams().depthSessionKey() == params.depthSessionKey()) it.copy(modelWarmupStatus = status) else it
@@ -896,6 +926,79 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         super.onCleared()
     }
 
+    fun setUiVisible(visible: Boolean) {
+        uiVisible.value = visible
+        backgroundTrimJob?.cancel()
+        if (!visible) backgroundTrimJob = viewModelScope.launch {
+            delay(30_000)
+            if (!uiVisible.value) trimIdleGenerationMemory()
+        }
+    }
+
+    fun onUiOwnerRemoved() {
+        closeComparison()
+        if (_uiState.value.selectedIndex != null) closeViewer()
+        _uiState.update { it.copy(settingsOpen = false, manageOpen = false, debugIndex = null) }
+    }
+
+    fun flushWorkForBackground() {
+        AppWorkScopes.video.launch { queueTags.flush(); videoQueueTags.flush() }
+    }
+
+    fun stopServiceIfIdleAfterRestore() {
+        AppWorkScopes.video.launch {
+            _uiState.first { !it.loading }
+            delay(500)
+            if (!videoKeepAlive.active()) app.stopService(Intent(app, VideoGenerationForegroundService::class.java))
+        }
+    }
+
+    fun onForegroundServiceDestroyed() {
+        if (videoKeepAlive.active()) onForegroundUnavailable("后台服务被停止 / Background service stopped")
+    }
+
+    private fun pauseImagesForService(reason: String): Unit = synchronized(imageRuns) {
+        val jobs = (synchronized(pending) { pending.toList() } + synchronized(currentPending) { currentPending.toList() } + claimedImageJobs + runningImageJobs.values)
+            .distinctBy { it.photo.cacheKey }.filter { _uiState.value.states[it.photo.cacheKey] in setOf(VrState.QUEUED, VrState.GENERATING) }
+        val keys = jobs.mapTo(hashSetOf()) { it.photo.cacheKey }
+        imageRuns.invalidate(keys)
+        synchronized(pending) { pending.removeAll { it.photo.cacheKey in keys } }
+        synchronized(currentPending) { currentPending.removeAll { it.photo.cacheKey in keys } }
+        synchronized(paused) {
+            autoPausedKeys.removeAll(keys); sourcePausedKeys.removeAll(keys)
+            jobs.forEach { job ->
+                val saved = job.copy(runToken = imageRuns.token(job.photo.cacheKey))
+                paused[job.photo.cacheKey] = saved
+                queueTags.upsert(saved, VrState.PAUSED, reason)
+                markState(job.photo.cacheKey, VrState.PAUSED)
+                upsertJob(job.photo, job.priority, VrState.PAUSED, 0f, error = reason, source = job.source, albumId = job.albumId)
+            }
+        }
+        imageExportJob?.cancel()
+    }
+
+    fun onForegroundUnavailable(detail: String) {
+        pauseImagesForService("SERVICE_UNAVAILABLE")
+        pauseVideosByKey(_uiState.value.videoStates.filterValues(VideoCommandPolicy::canPause).keys, "SERVICE_UNAVAILABLE")
+        _uiState.update { it.copy(message = "后台服务不可用，任务已暂停；重新打开后可继续 / Background service unavailable: $detail") }
+        synchronized(videoControlLock) { videoQueueLease = null; videoKeepAlive.stopAll() }
+        flushWorkForBackground()
+    }
+
+    fun onBackgroundTimeLimit() {
+        pauseImagesForService("SYSTEM_LIMIT")
+        pauseVideosByKey(_uiState.value.videoStates.filterValues(VideoCommandPolicy::canPause).keys, "SYSTEM_LIMIT")
+        _uiState.update { it.copy(message = "已达系统后台时限，任务已保存并暂停；回到应用后可继续 / System background time limit reached") }
+        synchronized(videoControlLock) { videoQueueLease = null; videoKeepAlive.stopAll() }
+        flushWorkForBackground()
+    }
+
+    fun trimIdleGenerationMemory() {
+        AppWorkScopes.video.launch {
+            if (generator.trimIdleSessions() > 0) _uiState.update { it.copy(modelWarmupStatus = "内存紧张，已释放空闲模型；需要时重新准备 / Idle model released under memory pressure") }
+        }
+    }
+
     fun onPermissionChanged(imageGranted: Boolean, videoGranted: Boolean, notificationGranted: Boolean) {
         _uiState.update { it.copy(hasPermission = imageGranted, hasVideoPermission = videoGranted, hasNotificationPermission = notificationGranted) }
         if (imageGranted) loadPhotos()
@@ -938,7 +1041,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 val latestEntries = latestManaged.groupBy { it.entry.photoKey }.mapValues { (_, items) -> items.maxBy { it.entry.createdAt }.entry }
                 _uiState.update {
                     val readyVideoStates = snapshot.videoEntries.keys.associateWith { VideoVrState.READY }
-                    val activeVideoStates = it.videoStates.filterValues { state -> state != VideoVrState.NORMAL } - readyVideoStates.keys
+                    val activeVideoStates = it.videoStates.filterValues { state -> state in setOf(VideoVrState.QUEUED, VideoVrState.GENERATING, VideoVrState.PAUSED, VideoVrState.FAILED) }
                     val snapshotKeys = snapshot.photos.map { item -> item.cacheKey }.toSet()
                     val activeVideoItems = it.videoJobs
                         .filter { job -> job.state != VideoVrState.READY || job.item.cacheKey !in snapshot.videoEntries }
@@ -950,11 +1053,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         albums = snapshot.albums,
                         entries = latestEntries,
                         states = latestEntries.keys.associateWith { VrState.READY } + it.states.filterValues { value -> value in setOf(VrState.QUEUED, VrState.GENERATING, VrState.PAUSED, VrState.FAILED) },
-                        videoStates = activeVideoStates + readyVideoStates,
+                        videoStates = readyVideoStates + activeVideoStates,
                         videoEntries = snapshot.videoEntries,
                         allOffset = mergedPhotos.count { !it.generatedVirtual },
                         allExhausted = mergedPhotos.count { !it.generatedVirtual } < INITIAL_MEDIA_LIMIT,
-                        loading = false,
+                        loading = !queueRestorationComplete,
                         message = "已加载最近 ${mergedPhotos.count { !it.generatedVirtual }} 项媒体，生成库 ${latestManaged.size + snapshot.videoEntries.size} 项 / Loaded recent media and generated cache",
                         cacheVersions = cache.summaries(),
                         managedCacheItems = latestManaged,
@@ -968,6 +1071,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     restoreQueueTags()
                     restoreVideoQueueTags()
                 }
+                queueRestorationComplete = true
+                _uiState.update { it.copy(loading = false) }
             }
             viewModelScope.launch {
                 val fullAlbums = withContext(Dispatchers.IO) { repository.loadAlbums() }
@@ -1640,8 +1745,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             when (_uiState.value.videoStates[item.cacheKey] ?: VideoVrState.NORMAL) {
                 VideoVrState.QUEUED,
                 VideoVrState.GENERATING -> pauseVideo(item)
-                VideoVrState.PAUSED -> enqueueVideo(item, force = true)
-                VideoVrState.FAILED -> enqueueVideo(item, force = true)
+                VideoVrState.PAUSED -> enqueueVideo(item)
+                VideoVrState.FAILED -> enqueueVideo(item)
                 else -> enqueueVideo(item)
             }
             return
@@ -1702,7 +1807,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     fun retry(index: Int) {
         val item = _uiState.value.photos.getOrNull(index) ?: return
         if (item.kind == MediaKind.VIDEO) {
-            enqueueVideo(item, force = true)
+            enqueueVideo(item)
         } else {
             enqueuePhoto(index, priority = 0, force = true, current = true)
             startCurrentWorker()
@@ -1820,7 +1925,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (requests.isEmpty()) { _uiState.update { it.copy(message = lang.t("没有可保存的已生成 VR 图", "No generated VR images to save")) }; return }
         _uiState.update { it.copy(blockingMessage = lang.t("正在从原图生成无损 PNG", "Rendering lossless PNG from original")) }
         imageExportJob = viewModelScope.launch {
+            var protection: Closeable? = null
             try {
+                protection = videoKeepAlive.acquire()
                 val message = withContext(Dispatchers.IO) {
                 val coroutineJob = kotlin.coroutines.coroutineContext[Job]
                 var saved = 0
@@ -1856,7 +1963,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 }
                 }
                 _uiState.update { it.copy(message = message) }
+            } catch (error: Exception) {
+                if (error is java.util.concurrent.CancellationException) throw error
+                _uiState.update { it.copy(message = "保存失败 / Save failed: ${error.message}") }
             } finally {
+                protection?.close()
                 _uiState.update { it.copy(blockingMessage = null) }
             }
         }
@@ -1901,6 +2012,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             items.forEach {
                 nextVideoRunToken(it.cacheKey)
                 synchronized(videoPending) { videoPending.removeAll { job -> job.item.cacheKey == it.cacheKey } }
+                backgroundRuns.revoke(setOf(it.cacheKey))
                 videoCache.delete(it)
                 videoQueueTags.remove(it.cacheKey)
             }
@@ -2057,6 +2169,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             videos.forEach {
                 nextVideoRunToken(it.cacheKey)
                 synchronized(videoPending) { videoPending.removeAll { job -> job.item.cacheKey == it.cacheKey } }
+                backgroundRuns.revoke(setOf(it.cacheKey))
                 videoCache.delete(it)
                 videoQueueTags.remove(it.cacheKey)
                 synchronized(pausedVideoParams) {
@@ -2524,13 +2637,15 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val restoredJobs = mutableListOf<VideoVrJob>()
         videoQueueTags.load().forEach { tag ->
             val item = videoByKey[tag.videoKey] ?: queuedVideoItemFromKey(tag.videoKey)
-            val entry = videoCache.findEntry(item)
+            val entry = tag.params?.let { videoCache.findEntry(item, it.cacheVersion()) } ?: if (tag.params == null) videoCache.findEntry(item) else null
             if (entry != null) {
                 videoQueueTags.remove(tag.videoKey)
+                backgroundRuns.revoke(setOf(tag.videoKey))
                 restoredStates[tag.videoKey] = VideoVrState.READY
                 return@forEach
             }
-            val restoredState = when (tag.state) {
+            val resume = VideoCommandPolicy.canRestoreAutomatically(tag.videoKey, tag.state, tag.params != null, serviceResumeKeys)
+            val restoredState = if (resume) VideoVrState.QUEUED else when (tag.state) {
                 VideoVrState.READY -> VideoVrState.READY
                 VideoVrState.FAILED -> VideoVrState.FAILED
                 VideoVrState.NORMAL -> VideoVrState.PAUSED
@@ -2539,7 +2654,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 VideoVrState.PAUSED -> VideoVrState.PAUSED
             }
             restoredStates[tag.videoKey] = restoredState
+            if (resume) synchronized(videoPending) {
+                videoPending.add(VideoQueuedJob(item, requireNotNull(tag.params), videoSequence++, nextVideoRunToken(tag.videoKey)))
+            }
             if (restoredState == VideoVrState.PAUSED) {
+                backgroundRuns.revoke(setOf(tag.videoKey))
+                videoQueueTags.upsert(tag.videoKey, VideoVrState.PAUSED, tag.params,
+                    tag.pauseReason ?: "PROCESS_RESTART")
                 synchronized(pausedVideos) { pausedVideos.add(tag.videoKey) }
                 tag.params?.let { params ->
                     synchronized(pausedVideoParams) { pausedVideoParams[tag.videoKey] = params }
@@ -2557,7 +2678,14 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     useGpu = tag.params?.useGpu ?: false,
                     startedAt = null,
                     finishedAt = null,
-                    error = if (restoredState == VideoVrState.FAILED) "上次生成失败" else null,
+                    error = when {
+                        restoredState == VideoVrState.FAILED -> "上次生成失败"
+                        restoredState != VideoVrState.PAUSED -> null
+                        tag.pauseReason == "USER" -> "用户暂停"
+                        tag.pauseReason == "SYSTEM_LIMIT" -> "系统后台时限暂停"
+                        tag.pauseReason == "SERVICE_UNAVAILABLE" -> "后台服务不可用，已暂停"
+                        else -> "进程重启后暂停，可继续"
+                    },
                 )
             }
         }
@@ -2573,11 +2701,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
             addLog("restored ${restoredStates.size} video queue tags")
         }
+        if (synchronized(videoPending) { videoPending.isNotEmpty() }) startVideoWorkers()
     }
 
     private fun startCurrentWorker(): Unit = synchronized(imageRuns) {
         if (currentWorker?.isActive == true) return
         currentWorker = viewModelScope.launch(Dispatchers.IO) {
+            var protection: Closeable? = null
             try {
                 var idleChecks = 0
                 while (true) {
@@ -2590,10 +2720,15 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         break
                     }
                     idleChecks = 0
+                    if (protection == null) {
+                        try { protection = videoKeepAlive.acquire() }
+                        catch (error: RuntimeException) { onForegroundUnavailable(error.message.orEmpty()); break }
+                    }
                     processJob(next)
                     delay(25)
                 }
             } finally {
+                protection?.close()
                 val self = kotlin.coroutines.coroutineContext[Job]
                 synchronized(imageRuns) {
                     if (currentWorker === self) currentWorker = null
@@ -2603,64 +2738,108 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun enqueueVideo(item: GalleryItem, force: Boolean = false) {
-        if (item.kind != MediaKind.VIDEO) return
-        val params = synchronized(pausedVideoParams) {
-            if (force) pausedVideoParams.remove(item.cacheKey) else null
-        } ?: _uiState.value.settings.toVideoParams()
-        synchronized(pausedVideos) { pausedVideos.remove(item.cacheKey) }
-        if (!force && videoCache.findEntry(item) != null) {
-            videoQueueTags.remove(item.cacheKey)
+    fun startVideos(indexes: List<Int>) {
+        if (!queueRestorationComplete) return
+        val state = _uiState.value
+        val selected = indexes.distinct().mapNotNull { state.photos.getOrNull(it) }
+            .filter { it.kind == MediaKind.VIDEO && VideoCommandPolicy.canStart(state.videoStates[it.cacheKey] ?: VideoVrState.NORMAL) }
+        if (selected.isEmpty()) return
+        try { backgroundRuns.authorize(selected.mapTo(linkedSetOf()) { it.cacheKey }) }
+        catch (error: Exception) { _uiState.update { it.copy(message = "无法保存任务状态，未开始生成 / Cannot persist work: ${error.message}") }; return }
+        selected.forEach { enqueueVideo(it, authorize = false) }
+        _uiState.update { it.copy(message = "已开始所选 ${selected.size} 项未完成视频；已完成项跳过 / Started selected unfinished videos") }
+    }
+
+    fun pauseVideos(indexes: List<Int>) {
+        val state = _uiState.value
+        val keys = indexes.distinct().mapNotNull { state.photos.getOrNull(it) }.filter {
+            it.kind == MediaKind.VIDEO && VideoCommandPolicy.canPause(state.videoStates[it.cacheKey] ?: VideoVrState.NORMAL)
+        }.mapTo(linkedSetOf()) { it.cacheKey }
+        pauseVideosByKey(keys, "USER")
+        _uiState.update { it.copy(message = "已暂停所选 ${keys.size} 项视频；保留参数和已完成帧 / Selected videos paused; parameters and completed frames retained") }
+    }
+
+    private fun enqueueVideo(item: GalleryItem, force: Boolean = false, authorize: Boolean = true) = synchronized(videoControlLock) {
+        if (!queueRestorationComplete && serviceResumeKeys.isEmpty()) return@synchronized
+        if (item.kind != MediaKind.VIDEO) return@synchronized
+        val existing = _uiState.value.videoStates[item.cacheKey] ?: VideoVrState.NORMAL
+        if (!force && (existing == VideoVrState.QUEUED || existing == VideoVrState.GENERATING)) return@synchronized
+        val params = if (force) _uiState.value.settings.toVideoParams() else synchronized(pausedVideoParams) { pausedVideoParams[item.cacheKey] }
+            ?: videoQueueTags.load().firstOrNull { it.videoKey == item.cacheKey }?.params ?: _uiState.value.settings.toVideoParams()
+        if (!force && videoCache.findEntry(item, params.cacheVersion()) != null) {
+            videoQueueTags.remove(item.cacheKey); backgroundRuns.revoke(setOf(item.cacheKey))
             _uiState.update { it.copy(videoStates = it.videoStates + (item.cacheKey to VideoVrState.READY)) }
-            return
+            return@synchronized
         }
-        val existing = _uiState.value.videoStates[item.cacheKey]
-        if (!force && (existing == VideoVrState.QUEUED || existing == VideoVrState.GENERATING)) return
+        if (authorize) {
+            try { backgroundRuns.authorize(setOf(item.cacheKey)) }
+            catch (error: Exception) { _uiState.update { it.copy(message = "无法保存任务状态，未开始生成 / Cannot persist work: ${error.message}") }; return@synchronized }
+        }
+        synchronized(pausedVideos) { pausedVideos.remove(item.cacheKey) }
+        synchronized(pausedVideoParams) { pausedVideoParams.remove(item.cacheKey) }
         synchronized(videoPending) {
             videoPending.removeAll { it.item.cacheKey == item.cacheKey }
-            val runToken = nextVideoRunToken(item.cacheKey)
-            videoPending.add(VideoQueuedJob(item, params, videoSequence++, runToken))
+            videoPending.add(VideoQueuedJob(item, params, videoSequence++, nextVideoRunToken(item.cacheKey)))
         }
-        upsertVideoJob(item, VideoVrState.QUEUED, 0f)
+        upsertVideoJob(item, VideoVrState.QUEUED, 0f, modelId = params.vr.depthModel, cacheVersion = params.cacheVersion(), modelThreads = params.modelThreads, depthWorkers = params.depthWorkers, useGpu = params.useGpu)
         videoQueueTags.upsert(item.cacheKey, VideoVrState.QUEUED, params)
         _uiState.update { it.copy(videoStates = it.videoStates + (item.cacheKey to VideoVrState.QUEUED), message = "视频已加入 VR 队列：${item.displayName}") }
-        addLog("video queued ${item.displayName}")
         startVideoWorkers()
     }
 
-    private fun pauseVideo(item: GalleryItem) {
-        if (item.kind != MediaKind.VIDEO) return
-        synchronized(videoPending) {
-            videoPending.removeAll { it.item.cacheKey == item.cacheKey }
+    private fun pauseVideo(item: GalleryItem) = pauseVideosByKey(setOf(item.cacheKey), "USER")
+
+    private fun pauseVideosByKey(keys: Set<String>, reason: String) = synchronized(videoControlLock) {
+        if (keys.isEmpty()) return@synchronized
+        backgroundRuns.revoke(keys)
+        val state = _uiState.value
+        val saved = videoQueueTags.load().associateBy { it.videoKey }
+        keys.forEach { key ->
+            val item = state.photos.firstOrNull { it.cacheKey == key } ?: queuedVideoItemFromKey(key)
+            val queued = synchronized(videoPending) { videoPending.firstOrNull { it.item.cacheKey == key }.also { videoPending.removeAll { job -> job.item.cacheKey == key } } }
+            val params = synchronized(pausedVideoParams) {
+                (queued?.params ?: activeVideoParams[key] ?: pausedVideoParams[key] ?: saved[key]?.params)?.also { pausedVideoParams[key] = it }
+            }
+            synchronized(pausedVideos) { pausedVideos.add(key) }
+            nextVideoRunToken(key)
+            videoQueueTags.upsert(key, VideoVrState.PAUSED, params, reason)
+            _uiState.update { it.copy(videoStates = it.videoStates + (key to VideoVrState.PAUSED)) }
+            val text = when (reason) { "SYSTEM_LIMIT" -> "系统后台时限暂停"; "SERVICE_UNAVAILABLE" -> "后台服务不可用，已暂停"; else -> "用户暂停" }
+            upsertVideoJob(item, VideoVrState.PAUSED, state.videoJobs.firstOrNull { it.item.cacheKey == key }?.progress ?: 0f, error = text)
+            val job = state.videoJobs.firstOrNull { it.item.cacheKey == key }
+            videoNotifier.show(item, job?.currentFrame ?: 0, job?.totalFrames ?: 0, indeterminate = false, status = "已暂停")
         }
-        synchronized(pausedVideos) { pausedVideos.add(item.cacheKey) }
-        nextVideoRunToken(item.cacheKey)
-        val paramsSnapshot = synchronized(pausedVideoParams) {
-            activeVideoParams[item.cacheKey]?.let { pausedVideoParams[item.cacheKey] = it }
-            pausedVideoParams[item.cacheKey]
-        }
-        _uiState.update {
-            it.copy(
-                videoStates = it.videoStates + (item.cacheKey to VideoVrState.PAUSED),
-                message = "视频已暂停生成：${item.displayName}",
-            )
-        }
-        videoQueueTags.upsert(item.cacheKey, VideoVrState.PAUSED, paramsSnapshot)
-        upsertVideoJob(item, VideoVrState.PAUSED, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }?.progress ?: 0f)
-        addLog("video paused ${item.displayName}")
     }
 
-    private fun startVideoWorkers() {
+    private fun startVideoWorkers(): Unit = synchronized(videoControlLock) {
         videoWorkers.removeAll { !it.isActive }
-        repeat((1 - videoWorkers.size).coerceAtLeast(0)) {
-            videoWorkers += AppWorkScopes.video.launch {
+        if (videoWorkers.isNotEmpty() || synchronized(videoPending) { videoPending.isEmpty() }) return@synchronized
+        try { if (videoQueueLease == null) videoQueueLease = videoKeepAlive.acquire() }
+        catch (error: Exception) { onForegroundUnavailable(error.message.orEmpty()); return@synchronized }
+        videoWorkers += AppWorkScopes.video.launch {
+            try {
+                videoQueueTags.flush()
                 while (true) {
                     val next = synchronized(videoPending) { videoPending.poll() } ?: break
                     processVideoJob(next)
                     delay(100)
                 }
+            } catch (error: Exception) {
+                onForegroundUnavailable(error.message.orEmpty())
+            } finally {
+                val self = kotlin.coroutines.coroutineContext[Job]
+                synchronized(videoControlLock) {
+                    videoWorkers.remove(self)
+                    if (synchronized(videoPending) { videoPending.isNotEmpty() }) startVideoWorkers()
+                    else { videoQueueLease?.close(); videoQueueLease = null }
+                }
             }
         }
+    }
+
+    private fun mutateVideoRun(next: VideoQueuedJob, action: () -> Unit): Boolean = synchronized(videoControlLock) {
+        if (!isCurrentVideoRun(next.item.cacheKey, next.runToken)) return@synchronized false
+        action(); true
     }
 
     private fun processVideoJob(next: VideoQueuedJob) {
@@ -2668,36 +2847,35 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             addLog("video stale queued job ignored ${next.item.displayName}")
             return
         }
-        synchronized(pausedVideoParams) { activeVideoParams[next.item.cacheKey] = next.params }
         val vrParams = next.params.toVrParams()
         val effectiveDepthWorkers = if (vrParams.useGpu) 1 else next.params.depthWorkers.coerceIn(1, 2)
         val videoCacheVersion = next.params.cacheVersion()
         var lastRuntimeInfo = "pending"
-        _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.GENERATING)) }
-        videoQueueTags.upsert(next.item.cacheKey, VideoVrState.GENERATING, next.params)
-        upsertVideoJob(
-            next.item,
-            VideoVrState.GENERATING,
-            0.01f,
-            currentFrameMs = 0L,
-            avgFrameMs = 0L,
-            frameLatencyMs = 0L,
-            queueWaitMs = 0L,
-            cacheHitReadMs = 0L,
-            modelId = vrParams.depthModel,
-            cacheVersion = videoCacheVersion,
-            modelThreads = vrParams.modelThreads,
-            depthWorkers = effectiveDepthWorkers,
-            useGpu = vrParams.useGpu,
-            runtimeInfo = lastRuntimeInfo,
-        )
-        videoNotifier.show(next.item, 0, 0, indeterminate = true, status = "准备生成")
+        if (!mutateVideoRun(next) {
+            synchronized(pausedVideoParams) { activeVideoParams[next.item.cacheKey] = next.params }
+            _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.GENERATING)) }
+            videoQueueTags.upsert(next.item.cacheKey, VideoVrState.GENERATING, next.params)
+            upsertVideoJob(
+                next.item,
+                VideoVrState.GENERATING,
+                0.01f,
+                currentFrameMs = 0L,
+                avgFrameMs = 0L,
+                frameLatencyMs = 0L,
+                queueWaitMs = 0L,
+                cacheHitReadMs = 0L,
+                modelId = vrParams.depthModel,
+                cacheVersion = videoCacheVersion,
+                modelThreads = vrParams.modelThreads,
+                depthWorkers = effectiveDepthWorkers,
+                useGpu = vrParams.useGpu,
+                runtimeInfo = lastRuntimeInfo, runToken = next.runToken)
+            videoNotifier.show(next.item, 0, 0, indeterminate = true, status = "准备生成")
+        }) return
         val started = SystemClock.uptimeMillis()
         var totalThroughputMs = 0L
         var measuredGeneratedFrames = 0
-        videoKeepAlive.acquire()
-        val result = try {
-            runCatching {
+        val result = runCatching {
                 videoGenerator.generate(
                     next.item,
                     next.params,
@@ -2706,19 +2884,23 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         if (synchronized(pausedVideos) { pausedVideos.contains(next.item.cacheKey) }) throw VideoPausedException()
                     },
                     onModelProgress = { progress ->
-                        _uiState.update {
-                            it.copy(
-                                modelProgress = progress,
-                                modelStatus = if (progress < 1f) "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%" else "模型已就绪 / Model ready",
-                            )
+                        mutateVideoRun(next) {
+                            _uiState.update {
+                                it.copy(
+                                    modelProgress = progress,
+                                    modelStatus = if (progress < 1f) "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%" else "模型已就绪 / Model ready",
+                                )
+                            }
                         }
                     },
                     onRuntimeInfo = { runtime ->
-                        if (runtime != lastRuntimeInfo && runtime.startsWith("tflite")) {
-                            addLog("video runtime ${next.item.displayName}: $runtime")
+                        mutateVideoRun(next) {
+                            if (runtime != lastRuntimeInfo && runtime.startsWith("tflite")) {
+                                addLog("video runtime ${next.item.displayName}: $runtime")
+                            }
+                            lastRuntimeInfo = runtime
+                            upsertVideoJob(next.item, VideoVrState.GENERATING, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = runtime, runToken = next.runToken)
                         }
-                        lastRuntimeInfo = runtime
-                        upsertVideoJob(next.item, VideoVrState.GENERATING, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = runtime)
                     },
                 ) { progress, frame, total, fps, frameMetrics, frameTimings, pipelineStats ->
                     if (!isCurrentVideoRun(next.item.cacheKey, next.runToken)) {
@@ -2732,94 +2914,105 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         measuredGeneratedFrames++
                     }
                     val avgFrameMs = if (measuredGeneratedFrames > 0) totalThroughputMs / measuredGeneratedFrames else 0L
-                    upsertVideoJob(
-                        next.item,
-                        VideoVrState.GENERATING,
-                        progress,
-                        frame,
-                        total,
-                        fps,
-                        currentFrameMs = frameMetrics.throughputMs,
-                        avgFrameMs = avgFrameMs,
-                        frameLatencyMs = frameMetrics.latencyMs,
-                        queueWaitMs = frameMetrics.queueWaitMs,
-                        cacheHitReadMs = frameMetrics.cacheHitReadMs,
-                        modelId = vrParams.depthModel,
-                        cacheVersion = videoCacheVersion,
-                        modelThreads = vrParams.modelThreads,
-                        depthWorkers = effectiveDepthWorkers,
-                        useGpu = vrParams.useGpu,
-                        runtimeInfo = lastRuntimeInfo,
-                        frameTimings = frameTimings,
-                        pipelineStats = pipelineStats,
-                    )
-                    videoNotifier.show(next.item, frame, total, indeterminate = false, status = "生成中")
+                    mutateVideoRun(next) {
+                        upsertVideoJob(
+                            next.item,
+                            VideoVrState.GENERATING,
+                            progress,
+                            frame,
+                            total,
+                            fps,
+                            currentFrameMs = frameMetrics.throughputMs,
+                            avgFrameMs = avgFrameMs,
+                            frameLatencyMs = frameMetrics.latencyMs,
+                            queueWaitMs = frameMetrics.queueWaitMs,
+                            cacheHitReadMs = frameMetrics.cacheHitReadMs,
+                            modelId = vrParams.depthModel,
+                            cacheVersion = videoCacheVersion,
+                            modelThreads = vrParams.modelThreads,
+                            depthWorkers = effectiveDepthWorkers,
+                            useGpu = vrParams.useGpu,
+                            runtimeInfo = lastRuntimeInfo,
+                            frameTimings = frameTimings,
+                            pipelineStats = pipelineStats, runToken = next.runToken)
+                        videoNotifier.show(next.item, frame, total, indeterminate = false, status = "生成中")
+                    }
                 }
-            }
-        } finally {
-            videoKeepAlive.release()
         }
         if (!isCurrentVideoRun(next.item.cacheKey, next.runToken)) {
             addLog("video stale result ignored ${next.item.displayName}")
             return
         }
-        result.onSuccess { entry ->
-            val elapsed = SystemClock.uptimeMillis() - started
-            _uiState.update {
-                it.copy(
-                    videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.READY),
-                    videoEntries = it.videoEntries + (next.item.cacheKey to entry),
-                    modelProgress = null,
-                    modelStatus = modelStatusText(it.settings),
-                    message = "视频 VR 已生成：${next.item.displayName}（${elapsed}ms）",
-                )
-            }
-            refreshGeneratedLibrary()
-            upsertVideoJob(next.item, VideoVrState.READY, 1f, currentFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.currentFrameMs ?: 0L, avgFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.avgFrameMs ?: 0L, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis())
-            videoQueueTags.remove(next.item.cacheKey)
-            synchronized(pausedVideoParams) {
-                pausedVideoParams.remove(next.item.cacheKey)
-                activeVideoParams.remove(next.item.cacheKey)
-            }
-            videoNotifier.show(next.item, 1, 1, indeterminate = false, status = "已完成")
-            addLog("video ready ${next.item.displayName} ${entry.width}x${entry.height} ${elapsed}ms")
-        }.onFailure { error ->
-            if (error is VideoStaleException) {
-                addLog("video stale failure ignored ${next.item.displayName}")
-            } else if (error is VideoPausedException) {
-                _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.PAUSED), modelProgress = null) }
-                videoQueueTags.upsert(next.item.cacheKey, VideoVrState.PAUSED, next.params)
+        var refresh = false
+        mutateVideoRun(next) {
+            result.onSuccess { entry ->
+                val elapsed = SystemClock.uptimeMillis() - started
+                _uiState.update {
+                    it.copy(
+                        videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.READY),
+                        videoEntries = it.videoEntries + (next.item.cacheKey to entry),
+                        modelProgress = null,
+                        modelStatus = modelStatusText(it.settings),
+                        message = "视频 VR 已生成：${next.item.displayName}（${elapsed}ms）",
+                    )
+                }
+                refresh = true
+                upsertVideoJob(next.item, VideoVrState.READY, 1f, currentFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.currentFrameMs ?: 0L, avgFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.avgFrameMs ?: 0L, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis(), runToken = next.runToken)
+                videoQueueTags.remove(next.item.cacheKey)
+                backgroundRuns.revoke(setOf(next.item.cacheKey))
                 synchronized(pausedVideoParams) {
-                    pausedVideoParams[next.item.cacheKey] = next.params
+                    pausedVideoParams.remove(next.item.cacheKey)
                     activeVideoParams.remove(next.item.cacheKey)
                 }
-                upsertVideoJob(next.item, VideoVrState.PAUSED, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
-                addLog("video paused ${next.item.displayName}")
-            } else {
-                _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.FAILED), modelProgress = null) }
-                videoQueueTags.upsert(next.item.cacheKey, VideoVrState.FAILED, next.params)
-                synchronized(pausedVideoParams) { activeVideoParams.remove(next.item.cacheKey) }
-                upsertVideoJob(next.item, VideoVrState.FAILED, 1f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis(), error = error.message)
-                videoNotifier.failed(next.item, error.message ?: "生成失败")
-                addLog("video failed ${next.item.displayName}: ${error.message}")
+                videoNotifier.show(next.item, 1, 1, indeterminate = false, status = "已完成")
+                addLog("video ready ${next.item.displayName} ${entry.width}x${entry.height} ${elapsed}ms")
+            }.onFailure { error ->
+                if (error is VideoStaleException) {
+                    addLog("video stale failure ignored ${next.item.displayName}")
+                } else if (error is VideoPausedException) {
+                    _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.PAUSED), modelProgress = null) }
+                    videoQueueTags.upsert(next.item.cacheKey, VideoVrState.PAUSED, next.params)
+                    synchronized(pausedVideoParams) {
+                        pausedVideoParams[next.item.cacheKey] = next.params
+                        activeVideoParams.remove(next.item.cacheKey)
+                    }
+                    upsertVideoJob(next.item, VideoVrState.PAUSED, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, runToken = next.runToken)
+                    addLog("video paused ${next.item.displayName}")
+                } else {
+                    _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.FAILED), modelProgress = null) }
+                    backgroundRuns.revoke(setOf(next.item.cacheKey))
+                    videoQueueTags.upsert(next.item.cacheKey, VideoVrState.FAILED, next.params)
+                    synchronized(pausedVideoParams) { activeVideoParams.remove(next.item.cacheKey) }
+                    upsertVideoJob(next.item, VideoVrState.FAILED, 1f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis(), error = error.message, runToken = next.runToken)
+                    videoNotifier.failed(next.item, error.message ?: "生成失败")
+                    addLog("video failed ${next.item.displayName}: ${error.message}")
+                }
             }
         }
+        if (refresh) refreshGeneratedLibrary()
     }
 
     private suspend fun workerLoop() {
-        while (true) {
-            rebalanceQueueForActiveSource()
-            val next = pollAllowedPendingJob()
-            if (next == null) {
-                if (expandAutoPrefetchIfNeeded()) {
-                    delay(50)
-                    continue
+        var protection: Closeable? = null
+        try {
+            while (true) {
+                rebalanceQueueForActiveSource()
+                val next = pollAllowedPendingJob()
+                if (next == null) {
+                    if (expandAutoPrefetchIfNeeded()) {
+                        delay(50)
+                        continue
+                    }
+                    break
                 }
-                break
+                if (protection == null) {
+                    try { protection = videoKeepAlive.acquire() }
+                    catch (error: RuntimeException) { onForegroundUnavailable(error.message.orEmpty()); break }
+                }
+                processJob(next)
+                delay(50)
             }
-            processJob(next)
-            delay(50)
-        }
+        } finally { protection?.close() }
     }
 
     private fun releaseCurrentPrefetch(key: String) = synchronized(imageRuns) {
@@ -3067,7 +3260,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         error: String? = null,
         frameTimings: VideoFrameTimings = VideoFrameTimings(),
         pipelineStats: VideoPipelineStats = VideoPipelineStats(),
-    ) {
+        runToken: Long? = null,
+    ): Unit = synchronized(videoControlLock) {
+        if (runToken != null && !isCurrentVideoRun(item.cacheKey, runToken)) return@synchronized
         _uiState.update { current ->
             val previous = current.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }
             val existing = current.videoJobs.filterNot { it.item.cacheKey == item.cacheKey }
@@ -3102,13 +3297,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun nextVideoRunToken(videoKey: String): Long = synchronized(videoRunTokens) {
+    private fun nextVideoRunToken(videoKey: String): Long = synchronized(videoControlLock) {
         val next = (videoRunTokens[videoKey] ?: 0L) + 1L
         videoRunTokens[videoKey] = next
         next
     }
 
-    private fun isCurrentVideoRun(videoKey: String, token: Long): Boolean = synchronized(videoRunTokens) {
+    private fun isCurrentVideoRun(videoKey: String, token: Long): Boolean = synchronized(videoControlLock) {
         videoRunTokens[videoKey] == token
     }
 
@@ -3654,6 +3849,7 @@ private class QueueTagStore(context: Context) : Closeable {
     private val file = File(root, "image_queue.tsv")
     private val storage = BufferedTextFile(file)
     override fun close() { storage.close() }
+    fun flush() = storage.flush()
 
     @Synchronized
     fun load(): List<QueueTag> {
@@ -3671,12 +3867,13 @@ private class QueueTagStore(context: Context) : Closeable {
                 updatedAt = parts[5].toLongOrNull() ?: 0L,
                 params = parts.getOrNull(6)?.let { decodeVideoParams(it)?.vr },
                 writeIntent = ImageWriteIntent.decode(parts.getOrNull(7)),
+                pauseReason = parts.getOrNull(8)?.takeIf { it.isNotBlank() },
             )
         }.distinctBy { it.photoKey }.toList()
     }
 
     @Synchronized
-    fun upsert(job: QueuedJob, state: VrState) {
+    fun upsert(job: QueuedJob, state: VrState, pauseReason: String? = null) {
         val next = load()
             .filterNot { it.photoKey == job.photo.cacheKey }
             .toMutableList()
@@ -3689,6 +3886,7 @@ private class QueueTagStore(context: Context) : Closeable {
             updatedAt = System.currentTimeMillis(),
             params = job.params,
             writeIntent = job.writeIntent,
+            pauseReason = pauseReason,
         )
         write(next)
     }
@@ -3720,6 +3918,7 @@ private class QueueTagStore(context: Context) : Closeable {
                     tag.updatedAt.toString(),
                     tag.params?.let { VideoGenerationParams(it, it.modelThreads, it.useGpu).encodeForQueue() }.orEmpty(),
                     tag.writeIntent?.encode().orEmpty(),
+                    tag.pauseReason.orEmpty(),
                 ).joinToString("\t")
             },
         )
@@ -3733,6 +3932,7 @@ private class VideoQueueTagStore(context: Context) : Closeable {
     private val file = File(root, "video_queue.tsv")
     private val storage = BufferedTextFile(file)
     override fun close() { storage.close() }
+    fun flush() = storage.flush()
 
     @Synchronized
     fun load(): List<VideoQueueTag> {
@@ -3745,12 +3945,13 @@ private class VideoQueueTagStore(context: Context) : Closeable {
                 state = state,
                 updatedAt = parts[2].toLongOrNull() ?: 0L,
                 params = parts.getOrNull(3)?.let { decodeVideoParams(it) },
+                pauseReason = parts.getOrNull(4)?.takeIf { it.isNotBlank() },
             )
         }.distinctBy { it.videoKey }.toList()
     }
 
     @Synchronized
-    fun upsert(videoKey: String, state: VideoVrState, params: VideoGenerationParams? = null) {
+    fun upsert(videoKey: String, state: VideoVrState, params: VideoGenerationParams? = null, pauseReason: String? = null) {
         val next = load()
             .filterNot { it.videoKey == videoKey }
             .toMutableList()
@@ -3759,6 +3960,7 @@ private class VideoQueueTagStore(context: Context) : Closeable {
             videoKey = videoKey,
             state = state,
             params = params ?: previous?.params,
+            pauseReason = pauseReason,
             updatedAt = System.currentTimeMillis(),
         )
         write(next)
@@ -3777,6 +3979,7 @@ private class VideoQueueTagStore(context: Context) : Closeable {
                     tag.state.name,
                     tag.updatedAt.toString(),
                     tag.params?.encodeForQueue().orEmpty(),
+                    tag.pauseReason.orEmpty(),
                 ).joinToString("\t")
             },
         )
@@ -4021,8 +4224,8 @@ private class VideoVrCacheManager(private val context: Context) {
 
     fun entryDir(item: GalleryItem, version: String): File = File(entryDir(item), version).also { it.mkdirs() }
 
-    fun findEntry(item: GalleryItem): VideoCacheEntry? {
-        val entry = index.get(item.cacheKey) ?: return null
+    fun findEntry(item: GalleryItem, version: String? = null): VideoCacheEntry? {
+        val entry = index.get(item.cacheKey, version?.let { File(File(root, item.cacheKey), it).absolutePath }) ?: return null
         if (File(entry.outputPath).isFile) return entry
         index.removeWhere { it.outputPath == entry.outputPath }
         return null
@@ -4099,85 +4302,6 @@ private class VideoVrCacheManager(private val context: Context) {
     }
 }
 
-class VideoGenerationForegroundService : Service() {
-    override fun onCreate() {
-        super.onCreate()
-        ensureChannel()
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-            return START_NOT_STICKY
-        }
-        startForeground(
-            SERVICE_NOTIFICATION_ID,
-            NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.stat_sys_upload)
-                .setContentTitle("视频 VR 生成运行中")
-                .setContentText("切到后台或锁屏时继续生成")
-                .setOnlyAlertOnce(true)
-                .setOngoing(true)
-                .setProgress(100, 0, true)
-                .build(),
-        )
-        return START_STICKY
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    private fun ensureChannel() {
-        if (Build.VERSION.SDK_INT >= 26) {
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "视频 VR 后台生成", NotificationManager.IMPORTANCE_LOW))
-        }
-    }
-
-    companion object {
-        const val ACTION_START = "com.local.parallelvrgallerypro.video.START"
-        const val ACTION_STOP = "com.local.parallelvrgallerypro.video.STOP"
-        private const val CHANNEL_ID = "video_vr_foreground"
-        private const val SERVICE_NOTIFICATION_ID = 9117
-    }
-}
-
-private class VideoGenerationKeepAlive(context: Context) {
-    private val appContext = context.applicationContext
-    private val wakeLock = (appContext.getSystemService(Context.POWER_SERVICE) as PowerManager)
-        .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ParallelVrGalleryPro:VideoGeneration")
-        .apply { setReferenceCounted(false) }
-    private var activeCount = 0
-
-    @Synchronized
-    fun acquire() {
-        activeCount++
-        if (activeCount == 1) {
-            val intent = Intent(appContext, VideoGenerationForegroundService::class.java)
-                .setAction(VideoGenerationForegroundService.ACTION_START)
-            runCatching {
-                if (Build.VERSION.SDK_INT >= 26) {
-                    ContextCompat.startForegroundService(appContext, intent)
-                } else {
-                    appContext.startService(intent)
-                }
-            }
-            runCatching {
-                if (!wakeLock.isHeld) wakeLock.acquire(12 * 60 * 60 * 1000L)
-            }
-        }
-    }
-
-    @Synchronized
-    fun release() {
-        if (activeCount > 0) activeCount--
-        if (activeCount == 0) {
-            runCatching { if (wakeLock.isHeld) wakeLock.release() }
-            runCatching { appContext.stopService(Intent(appContext, VideoGenerationForegroundService::class.java)) }
-        }
-    }
-}
-
 private class VideoGenerationNotifier(private val context: Context) {
     private val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
@@ -4199,7 +4323,7 @@ private class VideoGenerationNotifier(private val context: Context) {
             .setSubText(if (total > 0) "$progress%" else null)
             .setStyle(NotificationCompat.BigTextStyle().bigText("$text\n${item.displayName}"))
             .setOnlyAlertOnce(true)
-            .setOngoing(status != "已完成")
+            .setOngoing(status != "已完成" && status != "已暂停")
             .setProgress(if (total > 0) total else 100, frame.coerceAtLeast(0), indeterminate)
             .build()
         manager.notify(notificationId(item), notification)
@@ -4337,6 +4461,7 @@ private class VrGenerator @JvmOverloads constructor(
     private val reuseVideoOriginalEye: Boolean = true,
 ) : Closeable {
     private val depthSessions = IdleResourcePool<String, DepthModelSession>(maxIdle = 1)
+    fun trimIdleSessions(): Int = depthSessions.trimIdle()
 
     fun generate(
         photo: PhotoItem,
@@ -6008,7 +6133,7 @@ private sealed class AppScreen {
 
 @OptIn(ExperimentalAnimationApi::class)
 @Composable
-fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
+fun GalleryApp(viewModel: GalleryViewModel) {
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
     var pendingReplaceIndexes by remember { mutableStateOf<List<Int>>(emptyList()) }
@@ -6083,14 +6208,8 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
     }
 
     val pageState = rememberSaveableStateHolder()
-    AnimatedContent(
-        targetState = screen,
-        transitionSpec = {
-            (fadeIn() + scaleIn(initialScale = 0.96f)) togetherWith (fadeOut() + scaleOut(targetScale = 0.96f))
-        },
-        label = "screenTransition",
-    ) { target ->
-        when (target) {
+    Box(Modifier.fillMaxSize()) {
+        when (screen) {
             AppScreen.Comparison -> state.comparison?.let { comparison ->
                 StudioTheme(dark = true) { ModeComparisonScreen(comparison, viewModel::closeComparison) }
             }
@@ -6113,6 +6232,8 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSaveVideos = { viewModel.saveGeneratedVideos(context, it) },
                 onDeleteVideos = viewModel::deleteGeneratedVideos,
                 onRegenerateVideos = viewModel::regenerateVideos,
+                onStartVideos = viewModel::startVideos,
+                onPauseVideos = viewModel::pauseVideos,
                 onSaveImages = { viewModel.saveManagedGeneratedCopies(context, it) },
                 onDeleteImages = viewModel::deleteGeneratedImageEntries,
                 onRegenerateImages = viewModel::regenerateImages,
@@ -6196,6 +6317,8 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSaveVideos = { viewModel.saveGeneratedVideos(context, it) },
                 onDeleteVideos = viewModel::deleteGeneratedVideos,
                 onRegenerateVideos = viewModel::regenerateVideos,
+                onStartVideos = viewModel::startVideos,
+                onPauseVideos = viewModel::pauseVideos,
                 onSaveImages = { viewModel.saveManagedGeneratedCopies(context, it) },
                 onDeleteImages = viewModel::deleteGeneratedImageEntries,
                 onRegenerateImages = viewModel::regenerateImages,
@@ -6223,6 +6346,10 @@ private data class GeneratedSelectionActionsState(
     val onDelete: () -> Unit,
     val onGenerate: (() -> Unit)? = null,
     val imageReplacement: Boolean = false,
+    val onStart: (() -> Unit)? = null,
+    val onPause: (() -> Unit)? = null,
+    val startCount: Int = 0,
+    val pauseCount: Int = 0,
 )
 
 @OptIn(ExperimentalFoundationApi::class, ExperimentalLayoutApi::class)
@@ -6255,6 +6382,8 @@ private fun GalleryScreen(
     onSaveVideos: (List<Int>) -> Unit,
     onDeleteVideos: (List<Int>) -> Unit,
     onRegenerateVideos: (List<Int>) -> Unit,
+    onStartVideos: (List<Int>) -> Unit,
+    onPauseVideos: (List<Int>) -> Unit,
     onSaveImages: (List<ManagedCacheItem>) -> Unit,
     onDeleteImages: (List<ManagedCacheItem>) -> Unit,
     onRegenerateImages: (List<ManagedCacheItem>) -> Unit,
@@ -6346,6 +6475,8 @@ private fun GalleryScreen(
                         onSaveVideos = onSaveVideos,
                         onDeleteVideos = onDeleteVideos,
                         onRegenerateVideos = onRegenerateVideos,
+                        onStartVideos = onStartVideos,
+                        onPauseVideos = onPauseVideos,
                         onSaveImages = onSaveImages,
                         onDeleteImages = onDeleteImages,
                         onRegenerateImages = onRegenerateImages,
@@ -6481,7 +6612,8 @@ private fun GalleryScreen(
             if (actions != null) {
                 ManageSelectionActions(actions.count, lang, actions.onClear, actions.onSelectAll, actions.onSave, actions.onRegenerate, actions.onDelete,
                     confirmChanges = !(state.generatedTab == "images" && state.selectedGeneratedVersion == null),
-                    onGenerate = actions.onGenerate, imageReplacement = actions.imageReplacement)
+                    onGenerate = actions.onGenerate, imageReplacement = actions.imageReplacement,
+                    onStart = actions.onStart, onPause = actions.onPause, startCount = actions.startCount, pauseCount = actions.pauseCount)
             } else if (selectedKeys.isNotEmpty()) {
                 Column(Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
                     Text(lang.t("已选 ${selectedKeys.size} 项 · 仅处理已生成图片", "${selectedKeys.size} selected · generated photos only"), style = MaterialTheme.typography.labelMedium)
@@ -6769,15 +6901,17 @@ private fun RoundedPillTabs(
             Surface(
                 color = if (active) MaterialTheme.colorScheme.primaryContainer else androidx.compose.ui.graphics.Color.Transparent,
                 shape = RoundedCornerShape(24.dp),
-                modifier = Modifier
+                modifier = Modifier.weight(1f)
                     .clip(RoundedCornerShape(24.dp))
-                    .clickable { onSelect(key) },
+                    .clickable { onSelect(key) }
+                    .semantics { this[androidx.compose.ui.semantics.SemanticsProperties.Selected] = active },
             ) {
                 Text(
                     text = label,
                     color = if (active) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
                     fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 9.dp),
+                    maxLines = 2, overflow = TextOverflow.Ellipsis, textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).wrapContentHeight(Alignment.CenterVertically).padding(horizontal = 8.dp, vertical = 9.dp),
                 )
             }
         }
@@ -6981,7 +7115,7 @@ private fun StatusBadge(
     )
 }
 
-@OptIn(ExperimentalFoundationApi::class)
+@OptIn(ExperimentalFoundationApi::class, ExperimentalLayoutApi::class)
 @Composable
 private fun ManageScreen(
     state: UiState,
@@ -7005,6 +7139,8 @@ private fun ManageScreen(
     onSaveVideos: (List<Int>) -> Unit,
     onDeleteVideos: (List<Int>) -> Unit,
     onRegenerateVideos: (List<Int>) -> Unit,
+    onStartVideos: (List<Int>) -> Unit,
+    onPauseVideos: (List<Int>) -> Unit,
     onSaveImages: (List<ManagedCacheItem>) -> Unit,
     onDeleteImages: (List<ManagedCacheItem>) -> Unit,
     onRegenerateImages: (List<ManagedCacheItem>) -> Unit,
@@ -7012,9 +7148,7 @@ private fun ManageScreen(
     onGeneratedSelectionChange: (GeneratedSelectionActionsState?) -> Unit = {},
 ) {
     val lang = state.settings.language
-    val tab = selectedTab
     val config = LocalConfiguration.current
-    val gridColumns = StudioLayout.columns(state.generatedColumns, config.screenWidthDp, config.fontScale, tab == "videos" || state.selectedGeneratedVersion == null)
     var selectedImageKeys by remember { mutableStateOf(setOf<String>()) }
     var selectedVideoKeys by remember { mutableStateOf(setOf<String>()) }
     var selectedVersions by remember { mutableStateOf(setOf<String>()) }
@@ -7026,7 +7160,7 @@ private fun ManageScreen(
         selectedVideoKeys = emptySet()
     }
     val availablePhotoKeys = remember(state.photos) { state.photos.mapTo(hashSetOf()) { it.cacheKey } }
-    LaunchedEffect(tab, state.selectedGeneratedVersion) {
+    LaunchedEffect(selectedTab, state.selectedGeneratedVersion) {
         selectedImageKeys = emptySet()
         selectedVideoKeys = emptySet()
         selectedVersions = emptySet()
@@ -7093,327 +7227,350 @@ private fun ManageScreen(
         if (!embedded) {
             RoundedPillTabs(
                 options = listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")),
-                selected = tab,
+                selected = selectedTab,
                 onSelect = onTabChange,
             )
             Spacer(Modifier.height(8.dp))
         }
-        if (tab == "videos") {
-            val videoGridState = rememberLazyGridState(
-                initialFirstVisibleItemIndex = state.generatedVideoScrollIndex.coerceAtLeast(0),
-                initialFirstVisibleItemScrollOffset = state.generatedVideoScrollOffset.coerceAtLeast(0),
-            )
-            LaunchedEffect(videoGridState) {
-                snapshotFlow { videoGridState.firstVisibleItemIndex to videoGridState.firstVisibleItemScrollOffset }
-                    .collect { (index, offset) -> onGeneratedScroll("videos", index, offset) }
-            }
-            val videos = state.photos.filter { item ->
-                item.kind == MediaKind.VIDEO &&
-                    ((state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL) != VideoVrState.NORMAL ||
-                        state.videoEntries.containsKey(item.cacheKey) ||
-                        state.videoJobs.any { it.item.cacheKey == item.cacheKey })
-            }
-            LaunchedEffect(videos) { selectedVideoKeys = selectedVideoKeys.intersect(videos.mapTo(hashSetOf()) { it.cacheKey }) }
-            val selectedIndexes = videos.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.cacheKey }.takeIf { it >= 0 && item.cacheKey in selectedVideoKeys } }
-            LaunchedEffect(embedded, selectedVideoKeys, selectedIndexes, videos) {
-                if (embedded && selectedVideoKeys.isNotEmpty()) {
-                    onGeneratedSelectionChange(
-                        GeneratedSelectionActionsState(
-                            count = selectedVideoKeys.size,
-                            onClear = { selectedVideoKeys = emptySet() },
-                            onSelectAll = { selectedVideoKeys = videos.mapTo(linkedSetOf()) { it.cacheKey } },
-                            onSave = { onSaveVideos(selectedIndexes); selectedVideoKeys = emptySet() },
-                            onRegenerate = { onRegenerateVideos(selectedIndexes); selectedVideoKeys = emptySet() },
-                            onDelete = { onDeleteVideos(selectedIndexes); selectedVideoKeys = emptySet() },
-                        ),
-                    )
-                } else if (embedded) {
-                    onGeneratedSelectionChange(null)
-                }
-            }
-            if (selectedVideoKeys.isNotEmpty() && !embedded) {
-                ManageSelectionActions(
-                    count = selectedVideoKeys.size,
-                    lang = lang,
-                    onClear = { selectedVideoKeys = emptySet() },
-                    onSelectAll = { selectedVideoKeys = videos.mapTo(linkedSetOf()) { it.cacheKey } },
-                    onSave = { onSaveVideos(selectedIndexes); selectedVideoKeys = emptySet() },
-                    onRegenerate = { onRegenerateVideos(selectedIndexes); selectedVideoKeys = emptySet() },
-                    imageReplacement = false,
-                    onDelete = { onDeleteVideos(selectedIndexes); selectedVideoKeys = emptySet() },
+        LinkedPager(selectedTab, listOf("images", "videos"), onTabChange,
+            Modifier.weight(1f).fillMaxWidth(),
+            swipeEnabled = selectedImageKeys.isEmpty() && selectedVideoKeys.isEmpty() && selectedVersions.isEmpty()) {     tab ->
+                val gridColumns = StudioLayout.columns(state.generatedColumns, config.screenWidthDp, config.fontScale, tab == "videos" || state.selectedGeneratedVersion == null)
+            if (tab == "videos") {
+                val videoGridState = rememberLazyGridState(
+                    initialFirstVisibleItemIndex = state.generatedVideoScrollIndex.coerceAtLeast(0),
+                    initialFirstVisibleItemScrollOffset = state.generatedVideoScrollOffset.coerceAtLeast(0),
                 )
-                Spacer(Modifier.height(8.dp))
-            }
-            if (videos.isEmpty()) {
-                StudioEmptyState(lang.t("还没有视频任务", "No video jobs yet"), lang.t("从全部或相册打开视频，手动加入 VR 队列。视频不会自动加入图片预加载。", "Open a video from All or Albums and add it to the VR queue. Videos are never added by image prefetch."), Modifier.padding(top = contentTopPadding, bottom = contentBottomPadding))
-            } else {
-                Box(Modifier.fillMaxSize()) {
-                    LazyVerticalGrid(
-                        columns = GridCells.Fixed(gridColumns),
-                        state = videoGridState,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(MaterialTheme.colorScheme.background)
-                            .discreteColumnPinch(columns = gridColumns, onColumns = onSetGeneratedColumns)
-                            .generatedGridDragSelection(
-                                gridState = videoGridState,
-                                selectionMode = selectedVideoKeys.isNotEmpty(),
-                                contentStartPadding = 8.dp,
-                            ) { gridIndex ->
-                                videos.getOrNull(gridIndex)?.let { item ->
-                                    if (item.cacheKey in availablePhotoKeys) {
-                                        selectedVideoKeys = selectedVideoKeys + item.cacheKey
-                                    }
-                                }
-                            },
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                            start = 8.dp,
-                            top = if (embedded) contentTopPadding else 8.dp,
-                            end = 8.dp,
-                            bottom = contentBottomPadding,
-                        ),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        items(videos, key = { it.cacheKey }) { item ->
-                            val index = state.photos.indexOfFirst { it.cacheKey == item.cacheKey }
-                            val videoState = state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL
-                            val job = state.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(MaterialTheme.colorScheme.surface)
-                                    .clickable(enabled = index >= 0) {
-                                        if (selectedVideoKeys.isNotEmpty()) {
-                                            selectedVideoKeys = if (item.cacheKey in selectedVideoKeys) selectedVideoKeys - item.cacheKey else selectedVideoKeys + item.cacheKey
-                                        } else onOpenGeneratedVideo(index)
-                                    },
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .aspectRatio(1f),
-                                ) {
-                                    AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
-                                    if (item.cacheKey in selectedVideoKeys) SelectionBadge()
-                                    StatusBadge(videoState.shortLabel(lang), fontSize = 12.sp, modifier = Modifier.align(Alignment.BottomStart))
-                                }
-                                Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text(item.displayName, style = MaterialTheme.typography.labelLarge, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                    Text(VideoProgress.frames(videoState, job?.currentFrame, job?.totalFrames)?.let { VideoProgress.percent(videoState, job?.progress).toString() + "% · " + it } ?: videoState.label(lang), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    if (videoState == VideoVrState.GENERATING || videoState == VideoVrState.QUEUED) LinearProgressIndicator(progress = { (job?.progress ?: 0f).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
-                                    job?.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis) }
-
-                                }
-                            }
-                        }
-                    }
-                    GridScrollbar(videoGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-                    GridToTopButton(videoGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
+                LaunchedEffect(videoGridState) {
+                    snapshotFlow { videoGridState.firstVisibleItemIndex to videoGridState.firstVisibleItemScrollOffset }
+                        .collect { (index, offset) -> onGeneratedScroll("videos", index, offset) }
                 }
-            }
-        } else {
-            if (state.cacheVersions.isEmpty()) {
-                LaunchedEffect(embedded) {
-                    if (embedded) onGeneratedSelectionChange(null)
+                val videos = state.photos.filter { item ->
+                    item.kind == MediaKind.VIDEO &&
+                        ((state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL) != VideoVrState.NORMAL ||
+                            state.videoEntries.containsKey(item.cacheKey) ||
+                            state.videoJobs.any { it.item.cacheKey == item.cacheKey })
                 }
-                StudioEmptyState(lang.t("创作结果会出现在这里", "Your creations will appear here"), lang.t("从全部或相册打开图片会自动开启 VR。结果按参数版本保存，长按可多选；不会改写系统原图。", "Opening a photo from All or Albums enables VR; use its Viewer switch to turn it off. Results are kept by parameter version; long press to select. Originals are unchanged."), Modifier.padding(top = contentTopPadding, bottom = contentBottomPadding))
-            } else {
-                val selectedVersion = state.selectedGeneratedVersion
-                if (selectedVersion == null) {
-                    LaunchedEffect(embedded, selectedVersions, state.cacheVersions) {
-                        if (embedded) onGeneratedSelectionChange(
-                            selectedVersions.takeIf { it.isNotEmpty() }?.let { versions ->
-                                GeneratedSelectionActionsState(
-                                    count = versions.size,
-                                    onClear = { selectedVersions = emptySet() },
-                                    onSelectAll = { selectedVersions = state.cacheVersions.mapTo(linkedSetOf()) { it.version } },
-                                    onSave = null,
-                                    onRegenerate = { versionsToRegenerate = versions },
-                                    onGenerate = { onGenerateImages(GeneratedSelectionScope.regenerationIndexes(state.photos.map { it.cacheKey }, state.managedCacheItems.map { it.entry.photoKey to it.entry.version }, versions)); selectedVersions = emptySet() },
-                                    imageReplacement = true,
-                                    onDelete = { versionsToDelete = versions },
-                                )
-                            },
+                LaunchedEffect(videos) { selectedVideoKeys = selectedVideoKeys.intersect(videos.mapTo(hashSetOf()) { it.cacheKey }) }
+                val selectedIndexes = videos.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.cacheKey }.takeIf { it >= 0 && item.cacheKey in selectedVideoKeys } }
+                val startCount = selectedIndexes.count { VideoCommandPolicy.canStart(state.videoStates[state.photos[it].cacheKey] ?: VideoVrState.NORMAL) }
+                val pauseCount = selectedIndexes.count { VideoCommandPolicy.canPause(state.videoStates[state.photos[it].cacheKey] ?: VideoVrState.NORMAL) }
+                LaunchedEffect(embedded, selectedTab, selectedVideoKeys, selectedIndexes, videos, state.videoStates) {
+                    if (embedded && tab == selectedTab && selectedVideoKeys.isNotEmpty()) {
+                        onGeneratedSelectionChange(
+                            GeneratedSelectionActionsState(
+                                count = selectedVideoKeys.size,
+                                onClear = { selectedVideoKeys = emptySet() },
+                                onSelectAll = { selectedVideoKeys = videos.mapTo(linkedSetOf()) { it.cacheKey } },
+                                onSave = { onSaveVideos(selectedIndexes); selectedVideoKeys = emptySet() },
+                                onRegenerate = { onRegenerateVideos(selectedIndexes); selectedVideoKeys = emptySet() },
+                                onDelete = { onDeleteVideos(selectedIndexes); selectedVideoKeys = emptySet() },
+                                onStart = { onStartVideos(selectedIndexes) }, onPause = { onPauseVideos(selectedIndexes) },
+                                startCount = startCount, pauseCount = pauseCount,
+                            ),
                         )
+                    } else if (embedded && tab == selectedTab) {
+                        onGeneratedSelectionChange(null)
                     }
-                    if (!embedded && selectedVersions.isNotEmpty()) {
-                        ManageSelectionActions(selectedVersions.size, lang,
-                            onClear = { selectedVersions = emptySet() },
-                            onSelectAll = { selectedVersions = state.cacheVersions.mapTo(linkedSetOf()) { it.version } },
-                            onSave = null, onRegenerate = { versionsToRegenerate = selectedVersions },
-                            onDelete = { versionsToDelete = selectedVersions }, confirmChanges = false,
-                            onGenerate = { onGenerateImages(GeneratedSelectionScope.regenerationIndexes(state.photos.map { it.cacheKey }, state.managedCacheItems.map { it.entry.photoKey to it.entry.version }, selectedVersions)); selectedVersions = emptySet() })
-                    }
-                    val versionGridState = rememberLazyGridState(
-                        initialFirstVisibleItemIndex = state.generatedImageScrollIndex.coerceAtLeast(0),
-                        initialFirstVisibleItemScrollOffset = state.generatedImageScrollOffset.coerceAtLeast(0),
+                }
+                if (selectedVideoKeys.isNotEmpty() && !embedded) {
+                    ManageSelectionActions(
+                        count = selectedVideoKeys.size,
+                        lang = lang,
+                        onClear = { selectedVideoKeys = emptySet() },
+                        onSelectAll = { selectedVideoKeys = videos.mapTo(linkedSetOf()) { it.cacheKey } },
+                        onSave = { onSaveVideos(selectedIndexes); selectedVideoKeys = emptySet() },
+                        onRegenerate = { onRegenerateVideos(selectedIndexes); selectedVideoKeys = emptySet() },
+                        imageReplacement = false,
+                        onStart = { onStartVideos(selectedIndexes) }, onPause = { onPauseVideos(selectedIndexes) },
+                        startCount = startCount, pauseCount = pauseCount,
+                        onDelete = { onDeleteVideos(selectedIndexes); selectedVideoKeys = emptySet() },
                     )
-                    LaunchedEffect(versionGridState) {
-                        snapshotFlow { versionGridState.firstVisibleItemIndex to versionGridState.firstVisibleItemScrollOffset }
-                            .collect { (index, offset) -> onGeneratedScroll("images", index, offset) }
-                    }
+                    Spacer(Modifier.height(8.dp))
+                }
+                if (videos.isEmpty()) {
+                    StudioEmptyState(lang.t("还没有视频任务", "No video jobs yet"), lang.t("从全部或相册打开视频，手动加入 VR 队列。视频不会自动加入图片预加载。", "Open a video from All or Albums and add it to the VR queue. Videos are never added by image prefetch."), Modifier.padding(top = contentTopPadding, bottom = contentBottomPadding))
+                } else {
                     Box(Modifier.fillMaxSize()) {
                         LazyVerticalGrid(
                             columns = GridCells.Fixed(gridColumns),
-                            state = versionGridState,
+                            state = videoGridState,
                             modifier = Modifier
                                 .fillMaxSize()
                                 .background(MaterialTheme.colorScheme.background)
                                 .discreteColumnPinch(columns = gridColumns, onColumns = onSetGeneratedColumns)
                                 .generatedGridDragSelection(
-                                    gridState = versionGridState,
-                                    selectionMode = selectedVersions.isNotEmpty(),
-                                    contentStartPadding = 10.dp,
+                                    gridState = videoGridState,
+                                    selectionMode = selectedVideoKeys.isNotEmpty(),
+                                    contentStartPadding = 8.dp,
                                 ) { gridIndex ->
-                                    state.cacheVersions.getOrNull(gridIndex)?.let { selectedVersions += it.version }
+                                    videos.getOrNull(gridIndex - 1)?.let { item ->
+                                        if (item.cacheKey in availablePhotoKeys) {
+                                            selectedVideoKeys = selectedVideoKeys + item.cacheKey
+                                        }
+                                    }
                                 },
                             contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                                start = 10.dp,
-                                top = if (embedded) contentTopPadding else 10.dp,
-                                end = 10.dp,
+                                start = 8.dp,
+                                top = if (embedded) contentTopPadding else 8.dp,
+                                end = 8.dp,
                                 bottom = contentBottomPadding,
                             ),
-                            verticalArrangement = Arrangement.spacedBy(14.dp),
-                            horizontalArrangement = Arrangement.spacedBy(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            items(state.cacheVersions, key = { it.version }) { summary ->
-                                val items = state.managedCacheItems.filter { it.entry.version == summary.version }
-                                val cover = items.maxByOrNull { it.entry.createdAt }
-                                GeneratedVersionTile(
-                                    summary = summary,
-                                    cover = cover,
-                                    lang = lang,
-                                    selected = summary.version in selectedVersions,
-                                    onOpen = {
-                                        if (selectedVersions.isEmpty()) onOpenVersion(summary.version)
-                                        else selectedVersions = if (summary.version in selectedVersions) selectedVersions - summary.version else selectedVersions + summary.version
-                                    },
-                                )
+                            item(key = "video-queue-actions", span = { GridItemSpan(maxLineSpan) }) {
+                                val indexes = videos.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.cacheKey }.takeIf { it >= 0 } }
+                                val starts = indexes.count { VideoCommandPolicy.canStart(state.videoStates[state.photos[it].cacheKey] ?: VideoVrState.NORMAL) }
+                                val pauses = indexes.count { VideoCommandPolicy.canPause(state.videoStates[state.photos[it].cacheKey] ?: VideoVrState.NORMAL) }
+                                Column(Modifier.fillMaxWidth().padding(8.dp)) {
+                                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        OutlinedButton(onClick = { onStartVideos(indexes) }, enabled = starts > 0) { Text(lang.t("全部开始 ($starts)", "Start all ($starts)")) }
+                                        OutlinedButton(onClick = { onPauseVideos(indexes) }, enabled = pauses > 0) { Text(lang.t("全部暂停 ($pauses)", "Pause all ($pauses)")) }
+                                    }
+                                    Text(lang.t("仅当前视频列表；开始会续跑未完成任务，保留各自参数与已有帧。长按可只操作所选。", "This video list only. Resume unfinished jobs with their saved parameters and frames. Long press to act on a selection."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                            items(videos, key = { it.cacheKey }) { item ->
+                                val index = state.photos.indexOfFirst { it.cacheKey == item.cacheKey }
+                                val videoState = state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL
+                                val job = state.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(MaterialTheme.colorScheme.surface)
+                                        .clickable(enabled = index >= 0) {
+                                            if (selectedVideoKeys.isNotEmpty()) {
+                                                selectedVideoKeys = if (item.cacheKey in selectedVideoKeys) selectedVideoKeys - item.cacheKey else selectedVideoKeys + item.cacheKey
+                                            } else onOpenGeneratedVideo(index)
+                                        },
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .aspectRatio(1f),
+                                    ) {
+                                        AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
+                                        if (item.cacheKey in selectedVideoKeys) SelectionBadge()
+                                        StatusBadge(videoState.shortLabel(lang), fontSize = 12.sp, modifier = Modifier.align(Alignment.BottomStart))
+                                    }
+                                    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        Text(item.displayName, style = MaterialTheme.typography.labelLarge, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                        Text(VideoProgress.frames(videoState, job?.currentFrame, job?.totalFrames)?.let { VideoProgress.percent(videoState, job?.progress).toString() + "% · " + it } ?: videoState.label(lang), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        if (videoState == VideoVrState.GENERATING || videoState == VideoVrState.QUEUED) LinearProgressIndicator(progress = { (job?.progress ?: 0f).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                                        job?.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis) }
+
+                                    }
+                                }
                             }
                         }
-                        GridScrollbar(versionGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-                        GridToTopButton(versionGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
+                        GridScrollbar(videoGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
+                        GridToTopButton(videoGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
                     }
+                }
+            } else {
+                if (state.cacheVersions.isEmpty()) {
+                    LaunchedEffect(embedded, selectedTab) {
+                        if (embedded && tab == selectedTab) onGeneratedSelectionChange(null)
+                    }
+                    StudioEmptyState(lang.t("创作结果会出现在这里", "Your creations will appear here"), lang.t("从全部或相册打开图片会自动开启 VR。结果按参数版本保存，长按可多选；不会改写系统原图。", "Opening a photo from All or Albums enables VR; use its Viewer switch to turn it off. Results are kept by parameter version; long press to select. Originals are unchanged."), Modifier.padding(top = contentTopPadding, bottom = contentBottomPadding))
                 } else {
-                    val itemsInVersion = state.managedCacheItems.filter { it.entry.version == selectedVersion }
-                    LaunchedEffect(itemsInVersion) {
-                        selectedImageKeys = selectedImageKeys.intersect(itemsInVersion.mapTo(hashSetOf()) { "${it.entry.photoKey}|${it.entry.version}" })
-                    }
-                    val imageGridState = rememberLazyGridState(
-                        initialFirstVisibleItemIndex = (state.generatedVersionScrollIndexes[selectedVersion] ?: 0).coerceAtLeast(0),
-                        initialFirstVisibleItemScrollOffset = (state.generatedVersionScrollOffsets[selectedVersion] ?: 0).coerceAtLeast(0),
-                    )
-                    LaunchedEffect(selectedVersion, imageGridState) {
-                        snapshotFlow { imageGridState.firstVisibleItemIndex to imageGridState.firstVisibleItemScrollOffset }
-                            .collect { (index, offset) -> onGeneratedVersionScroll(selectedVersion, index, offset) }
-                    }
-                    Column(Modifier.fillMaxSize()) {
-                        if (!embedded) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                OutlinedButton(onClick = onCloseVersion) { Text(lang.t("返回", "Back")) }
-                                Spacer(Modifier.width(10.dp))
-                                Text(
-                                    text = selectedVersion,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f),
-                                )
-                                Spacer(Modifier.width(8.dp))
-                                OutlinedButton(onClick = { versionsToDelete = setOf(selectedVersion) }) { Text(lang.t("删除", "Delete")) }
-                            }
-                            Spacer(Modifier.height(10.dp))
-                        }
-                        val selectedItems = itemsInVersion.filter { "${it.entry.photoKey}|${it.entry.version}" in selectedImageKeys }
-                        val selectedImageIndexes = selectedItems.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }.takeIf { it >= 0 } }.distinct()
-                        LaunchedEffect(embedded, selectedImageKeys, selectedItems, selectedImageIndexes, itemsInVersion) {
-                            if (embedded && selectedImageKeys.isNotEmpty()) {
-                                onGeneratedSelectionChange(
+                    val selectedVersion = state.selectedGeneratedVersion
+                    if (selectedVersion == null) {
+                        LaunchedEffect(embedded, selectedTab, selectedVersions, state.cacheVersions) {
+                            if (embedded && tab == selectedTab) onGeneratedSelectionChange(
+                                selectedVersions.takeIf { it.isNotEmpty() }?.let { versions ->
                                     GeneratedSelectionActionsState(
-                                        count = selectedImageKeys.size,
-                                        onClear = { selectedImageKeys = emptySet() },
-                                        onSelectAll = { selectedImageKeys = itemsInVersion.mapTo(linkedSetOf()) { "${it.entry.photoKey}|${it.entry.version}" } },
-                                        onSave = { onSaveImages(selectedItems); selectedImageKeys = emptySet() },
-                                        onRegenerate = { onRegenerateImages(selectedItems); selectedImageKeys = emptySet() },
-                                        onGenerate = { onGenerateImages(selectedImageIndexes); selectedImageKeys = emptySet() },
+                                        count = versions.size,
+                                        onClear = { selectedVersions = emptySet() },
+                                        onSelectAll = { selectedVersions = state.cacheVersions.mapTo(linkedSetOf()) { it.version } },
+                                        onSave = null,
+                                        onRegenerate = { versionsToRegenerate = versions },
+                                        onGenerate = { onGenerateImages(GeneratedSelectionScope.regenerationIndexes(state.photos.map { it.cacheKey }, state.managedCacheItems.map { it.entry.photoKey to it.entry.version }, versions)); selectedVersions = emptySet() },
                                         imageReplacement = true,
-                                        onDelete = { onDeleteImages(selectedItems); selectedImageKeys = emptySet() },
-                                    ),
-                                )
-                            } else if (embedded) {
-                                onGeneratedSelectionChange(null)
-                            }
-                        }
-                        if (selectedImageKeys.isNotEmpty() && !embedded) {
-                            ManageSelectionActions(
-                                count = selectedImageKeys.size,
-                                lang = lang,
-                                onClear = { selectedImageKeys = emptySet() },
-                                onSelectAll = { selectedImageKeys = itemsInVersion.mapTo(linkedSetOf()) { "${it.entry.photoKey}|${it.entry.version}" } },
-                                onSave = { onSaveImages(selectedItems); selectedImageKeys = emptySet() },
-                                onRegenerate = { onRegenerateImages(selectedItems); selectedImageKeys = emptySet() },
-                                        onGenerate = { onGenerateImages(selectedImageIndexes); selectedImageKeys = emptySet() },
-                                        imageReplacement = true,
-                                onDelete = { onDeleteImages(selectedItems); selectedImageKeys = emptySet() },
+                                        onDelete = { versionsToDelete = versions },
+                                    )
+                                },
                             )
-                            Spacer(Modifier.height(8.dp))
+                        }
+                        if (!embedded && selectedVersions.isNotEmpty()) {
+                            ManageSelectionActions(selectedVersions.size, lang,
+                                onClear = { selectedVersions = emptySet() },
+                                onSelectAll = { selectedVersions = state.cacheVersions.mapTo(linkedSetOf()) { it.version } },
+                                onSave = null, onRegenerate = { versionsToRegenerate = selectedVersions },
+                                onDelete = { versionsToDelete = selectedVersions }, confirmChanges = false,
+                                onGenerate = { onGenerateImages(GeneratedSelectionScope.regenerationIndexes(state.photos.map { it.cacheKey }, state.managedCacheItems.map { it.entry.photoKey to it.entry.version }, selectedVersions)); selectedVersions = emptySet() })
+                        }
+                        val versionGridState = rememberLazyGridState(
+                            initialFirstVisibleItemIndex = state.generatedImageScrollIndex.coerceAtLeast(0),
+                            initialFirstVisibleItemScrollOffset = state.generatedImageScrollOffset.coerceAtLeast(0),
+                        )
+                        LaunchedEffect(versionGridState) {
+                            snapshotFlow { versionGridState.firstVisibleItemIndex to versionGridState.firstVisibleItemScrollOffset }
+                                .collect { (index, offset) -> onGeneratedScroll("images", index, offset) }
                         }
                         Box(Modifier.fillMaxSize()) {
                             LazyVerticalGrid(
                                 columns = GridCells.Fixed(gridColumns),
-                                state = imageGridState,
+                                state = versionGridState,
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .background(MaterialTheme.colorScheme.background)
                                     .discreteColumnPinch(columns = gridColumns, onColumns = onSetGeneratedColumns)
                                     .generatedGridDragSelection(
-                                        gridState = imageGridState,
-                                        selectionMode = selectedImageKeys.isNotEmpty(),
-                                        contentStartPadding = 8.dp,
+                                        gridState = versionGridState,
+                                        selectionMode = selectedVersions.isNotEmpty(),
+                                        contentStartPadding = 10.dp,
                                     ) { gridIndex ->
-                                        itemsInVersion.getOrNull(gridIndex)?.let { item ->
-                                            if (item.photoItem.cacheKey in availablePhotoKeys) {
-                                                selectedImageKeys = selectedImageKeys + "${item.entry.photoKey}|${item.entry.version}"
-                                            }
-                                        }
+                                        state.cacheVersions.getOrNull(gridIndex)?.let { selectedVersions += it.version }
                                     },
                                 contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                                    start = 8.dp,
-                                    top = if (embedded) contentTopPadding else 8.dp,
-                                    end = 8.dp,
+                                    start = 10.dp,
+                                    top = if (embedded) contentTopPadding else 10.dp,
+                                    end = 10.dp,
                                     bottom = contentBottomPadding,
                                 ),
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(14.dp),
+                                horizontalArrangement = Arrangement.spacedBy(14.dp),
                             ) {
-                                items(itemsInVersion, key = { "${it.entry.photoKey}_${it.entry.version}" }) { item ->
-                                    val index = state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }
-                                    val selectionKey = "${item.entry.photoKey}|${item.entry.version}"
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .aspectRatio(1f)
-                                            .background(androidx.compose.ui.graphics.Color(0xff16191c))
-                                            .clickable(
-                                                enabled = index >= 0,
-                                                onClick = {
-                                                    if (selectedImageKeys.isNotEmpty()) {
-                                                        selectedImageKeys = if (selectionKey in selectedImageKeys) selectedImageKeys - selectionKey else selectedImageKeys + selectionKey
-                                                    } else {
-                                                        onOpenGenerated(index, item.entry)
-                                                    }
-                                                },
-                                            ),
-                                    ) {
-                                        GeneratedSbsThumbnail(item.entry, 360, ContentScale.Crop, Modifier.fillMaxSize(), lang)
-                                        if (selectionKey in selectedImageKeys) SelectionBadge()
-                                    }
+                                items(state.cacheVersions, key = { it.version }) { summary ->
+                                    val items = state.managedCacheItems.filter { it.entry.version == summary.version }
+                                    val cover = items.maxByOrNull { it.entry.createdAt }
+                                    GeneratedVersionTile(
+                                        summary = summary,
+                                        cover = cover,
+                                        lang = lang,
+                                        selected = summary.version in selectedVersions,
+                                        onOpen = {
+                                            if (selectedVersions.isEmpty()) onOpenVersion(summary.version)
+                                            else selectedVersions = if (summary.version in selectedVersions) selectedVersions - summary.version else selectedVersions + summary.version
+                                        },
+                                    )
                                 }
                             }
-                            GridScrollbar(imageGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-                            GridToTopButton(imageGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
+                            GridScrollbar(versionGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
+                            GridToTopButton(versionGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
+                        }
+                    } else {
+                        val itemsInVersion = state.managedCacheItems.filter { it.entry.version == selectedVersion }
+                        LaunchedEffect(itemsInVersion) {
+                            selectedImageKeys = selectedImageKeys.intersect(itemsInVersion.mapTo(hashSetOf()) { "${it.entry.photoKey}|${it.entry.version}" })
+                        }
+                        val imageGridState = rememberLazyGridState(
+                            initialFirstVisibleItemIndex = (state.generatedVersionScrollIndexes[selectedVersion] ?: 0).coerceAtLeast(0),
+                            initialFirstVisibleItemScrollOffset = (state.generatedVersionScrollOffsets[selectedVersion] ?: 0).coerceAtLeast(0),
+                        )
+                        LaunchedEffect(selectedVersion, imageGridState) {
+                            snapshotFlow { imageGridState.firstVisibleItemIndex to imageGridState.firstVisibleItemScrollOffset }
+                                .collect { (index, offset) -> onGeneratedVersionScroll(selectedVersion, index, offset) }
+                        }
+                        Column(Modifier.fillMaxSize()) {
+                            if (!embedded) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    OutlinedButton(onClick = onCloseVersion) { Text(lang.t("返回", "Back")) }
+                                    Spacer(Modifier.width(10.dp))
+                                    Text(
+                                        text = selectedVersion,
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    OutlinedButton(onClick = { versionsToDelete = setOf(selectedVersion) }) { Text(lang.t("删除", "Delete")) }
+                                }
+                                Spacer(Modifier.height(10.dp))
+                            }
+                            val selectedItems = itemsInVersion.filter { "${it.entry.photoKey}|${it.entry.version}" in selectedImageKeys }
+                            val selectedImageIndexes = selectedItems.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }.takeIf { it >= 0 } }.distinct()
+                            LaunchedEffect(embedded, selectedTab, selectedImageKeys, selectedItems, selectedImageIndexes, itemsInVersion) {
+                                if (embedded && tab == selectedTab && selectedImageKeys.isNotEmpty()) {
+                                    onGeneratedSelectionChange(
+                                        GeneratedSelectionActionsState(
+                                            count = selectedImageKeys.size,
+                                            onClear = { selectedImageKeys = emptySet() },
+                                            onSelectAll = { selectedImageKeys = itemsInVersion.mapTo(linkedSetOf()) { "${it.entry.photoKey}|${it.entry.version}" } },
+                                            onSave = { onSaveImages(selectedItems); selectedImageKeys = emptySet() },
+                                            onRegenerate = { onRegenerateImages(selectedItems); selectedImageKeys = emptySet() },
+                                            onGenerate = { onGenerateImages(selectedImageIndexes); selectedImageKeys = emptySet() },
+                                            imageReplacement = true,
+                                            onDelete = { onDeleteImages(selectedItems); selectedImageKeys = emptySet() },
+                                        ),
+                                    )
+                                } else if (embedded && tab == selectedTab) {
+                                    onGeneratedSelectionChange(null)
+                                }
+                            }
+                            if (selectedImageKeys.isNotEmpty() && !embedded) {
+                                ManageSelectionActions(
+                                    count = selectedImageKeys.size,
+                                    lang = lang,
+                                    onClear = { selectedImageKeys = emptySet() },
+                                    onSelectAll = { selectedImageKeys = itemsInVersion.mapTo(linkedSetOf()) { "${it.entry.photoKey}|${it.entry.version}" } },
+                                    onSave = { onSaveImages(selectedItems); selectedImageKeys = emptySet() },
+                                    onRegenerate = { onRegenerateImages(selectedItems); selectedImageKeys = emptySet() },
+                                            onGenerate = { onGenerateImages(selectedImageIndexes); selectedImageKeys = emptySet() },
+                                            imageReplacement = true,
+                                    onDelete = { onDeleteImages(selectedItems); selectedImageKeys = emptySet() },
+                                )
+                                Spacer(Modifier.height(8.dp))
+                            }
+                            Box(Modifier.fillMaxSize()) {
+                                LazyVerticalGrid(
+                                    columns = GridCells.Fixed(gridColumns),
+                                    state = imageGridState,
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(MaterialTheme.colorScheme.background)
+                                        .discreteColumnPinch(columns = gridColumns, onColumns = onSetGeneratedColumns)
+                                        .generatedGridDragSelection(
+                                            gridState = imageGridState,
+                                            selectionMode = selectedImageKeys.isNotEmpty(),
+                                            contentStartPadding = 8.dp,
+                                        ) { gridIndex ->
+                                            itemsInVersion.getOrNull(gridIndex)?.let { item ->
+                                                if (item.photoItem.cacheKey in availablePhotoKeys) {
+                                                    selectedImageKeys = selectedImageKeys + "${item.entry.photoKey}|${item.entry.version}"
+                                                }
+                                            }
+                                        },
+                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                                        start = 8.dp,
+                                        top = if (embedded) contentTopPadding else 8.dp,
+                                        end = 8.dp,
+                                        bottom = contentBottomPadding,
+                                    ),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    items(itemsInVersion, key = { "${it.entry.photoKey}_${it.entry.version}" }) { item ->
+                                        val index = state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }
+                                        val selectionKey = "${item.entry.photoKey}|${item.entry.version}"
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .aspectRatio(1f)
+                                                .background(androidx.compose.ui.graphics.Color(0xff16191c))
+                                                .clickable(
+                                                    enabled = index >= 0,
+                                                    onClick = {
+                                                        if (selectedImageKeys.isNotEmpty()) {
+                                                            selectedImageKeys = if (selectionKey in selectedImageKeys) selectedImageKeys - selectionKey else selectedImageKeys + selectionKey
+                                                        } else {
+                                                            onOpenGenerated(index, item.entry)
+                                                        }
+                                                    },
+                                                ),
+                                        ) {
+                                            GeneratedSbsThumbnail(item.entry, 360, ContentScale.Crop, Modifier.fillMaxSize(), lang)
+                                            if (selectionKey in selectedImageKeys) SelectionBadge()
+                                        }
+                                    }
+                                }
+                                GridScrollbar(imageGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
+                                GridToTopButton(imageGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
+                            }
                         }
                     }
                 }
@@ -7532,6 +7689,10 @@ private fun ManageSelectionActions(
     confirmChanges: Boolean = true,
     onGenerate: (() -> Unit)? = null,
     imageReplacement: Boolean = true,
+    onStart: (() -> Unit)? = null,
+    onPause: (() -> Unit)? = null,
+    startCount: Int = 0,
+    pauseCount: Int = 0,
 ) {
     var pending by remember { mutableStateOf<String?>(null) }
     Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)) {
@@ -7541,6 +7702,8 @@ private fun ManageSelectionActions(
         }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = onSelectAll) { Text(lang.t("全选", "Select all")) }
+            onStart?.let { action -> TextButton(onClick = action, enabled = startCount > 0) { Text(lang.t("开始所选 $startCount 项", "Start $startCount selected")) } }
+            onPause?.let { action -> TextButton(onClick = action, enabled = pauseCount > 0) { Text(lang.t("暂停所选 $pauseCount 项", "Pause $pauseCount selected")) } }
             onSave?.let { TextButton(onClick = it) { Text(if (imageReplacement) lang.t("保存无损 PNG", "Save lossless PNG") else lang.t("保存副本", "Save copies")) } }
             onGenerate?.let { action -> TextButton(onClick = { pending = "additional" }) { Text(lang.t("使用新参数生成", "Generate with new parameters")) } }
             onRegenerate?.let { action -> TextButton(onClick = { if (confirmChanges) pending = "regenerate" else action() }) { Text(lang.t("重新生成", "Regenerate")) } }
@@ -7580,6 +7743,24 @@ private fun SelectionBadge() {
     }
 }
 
+
+@Composable
+private fun StudioSettingsPager(
+    options: List<Pair<String, String>>, selected: String, onSelect: (String) -> Unit,
+    header: @Composable () -> Unit,
+    content: androidx.compose.foundation.lazy.LazyListScope.(String) -> Unit,
+) {
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).studioSafeArea().imePadding(), contentAlignment = Alignment.TopCenter) {
+        Column(Modifier.widthIn(max = 840.dp).fillMaxSize()) {
+            Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) { header() }
+            Box(Modifier.padding(horizontal = 16.dp)) { RoundedPillTabs(options, selected, onSelect) }
+            LinkedPager(selected, options.map { it.first }, onSelect, Modifier.weight(1f).fillMaxWidth()) { page ->
+                LazyColumn(Modifier.fillMaxSize(), contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) { content(page) }
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SettingsScreen(
@@ -7607,7 +7788,9 @@ private fun SettingsScreen(
     var defaultSaved by remember(settings.edgeMode) { mutableStateOf(false) }
     var defaultSaveFailed by remember(settings.edgeMode) { mutableStateOf(false) }
     LaunchedEffect(settings) { defaultSaved = false; defaultSaveFailed = false }
-    StudioPage(header = {
+    StudioSettingsPager(
+        options = listOf("general" to lang.t("通用", "General"), "depth" to lang.t("深度与输出", "Depth & output"), "images" to lang.t("图片", "Images"), "video" to lang.t("视频", "Video")),
+        selected = section, onSelect = { section = it }, header = {
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, if (fromDebug) lang.t("返回调试", "Back to diagnostics") else lang.t("返回", "Back")) }
             Column(Modifier.weight(1f)) {
@@ -7615,121 +7798,146 @@ private fun SettingsScreen(
                 Text(lang.t("参数仅影响新任务，已有结果保留", "New jobs use these settings; existing results stay"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-    }) {
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("general" to lang.t("通用", "General"), "depth" to lang.t("深度与输出", "Depth & output"), "images" to lang.t("图片", "Images"), "video" to lang.t("视频", "Video")).forEach { (key, label) ->
-                FilterChip(selected = section == key, onClick = { section = key }, label = { Text(label) })
-            }
-        }
-        when (section) {
+    }) { page ->
+        when (page) {
             "general" -> {
-                StudioCard(lang.t("偏好与权限", "Preferences & access"), lang.t("外观跟随系统的深浅模式", "Appearance follows your system")) {
-                    SettingChoice(lang.t("语言", "Language"), settings.language, AppLanguage.entries.toList(), { if (it == AppLanguage.ZH) "中文" else "English" }) { onChange(settings.copy(language = it)) }
-                    Text(lang.t("图片权限：${if (hasImagePermission(context)) "已允许" else "未允许"} · 视频权限：${if (hasVideoPermission(context)) "已允许" else "未允许"}", "Photos: ${if (hasImagePermission(context)) "allowed" else "not allowed"} · Videos: ${if (hasVideoPermission(context)) "allowed" else "not allowed"}"), style = MaterialTheme.typography.bodySmall)
-                    OutlinedButton(onClick = { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))) }) { Text(lang.t("管理媒体与通知权限", "Manage media & notifications")) }
+                item {
+                    StudioCard(lang.t("偏好与权限", "Preferences & access"), lang.t("外观跟随系统的深浅模式", "Appearance follows your system")) {
+                        SettingChoice(lang.t("语言", "Language"), settings.language, AppLanguage.entries.toList(), { if (it == AppLanguage.ZH) "中文" else "English" }) { onChange(settings.copy(language = it)) }
+                        Text(lang.t("图片权限：${if (hasImagePermission(context)) "已允许" else "未允许"} · 视频权限：${if (hasVideoPermission(context)) "已允许" else "未允许"}", "Photos: ${if (hasImagePermission(context)) "allowed" else "not allowed"} · Videos: ${if (hasVideoPermission(context)) "allowed" else "not allowed"}"), style = MaterialTheme.typography.bodySmall)
+                        OutlinedButton(onClick = { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))) }) { Text(lang.t("管理媒体与通知权限", "Manage media & notifications")) }
+                    }
                 }
-                StudioCard(lang.t("应用更新", "App updates"), "$CURRENT_VERSION_TAG · $CURRENT_VERSION_CODE") {
-                    updateStatus?.let { Text(lang.pickMixed(it), style = MaterialTheme.typography.bodyMedium) }
-                    if (updateDownloading) {
-                        if (updateDownloadProgress < 0) LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) else {
-                            LinearProgressIndicator(progress = { updateDownloadProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
-                            Text("${(updateDownloadProgress * 100).roundToInt()}%", style = MaterialTheme.typography.labelMedium)
+                item {
+                    StudioCard(lang.t("应用更新", "App updates"), "$CURRENT_VERSION_TAG · $CURRENT_VERSION_CODE") {
+                        updateStatus?.let { Text(lang.pickMixed(it), style = MaterialTheme.typography.bodyMedium) }
+                        if (updateDownloading) {
+                            if (updateDownloadProgress < 0) LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) else {
+                                LinearProgressIndicator(progress = { updateDownloadProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                                Text("${(updateDownloadProgress * 100).roundToInt()}%", style = MaterialTheme.typography.labelMedium)
+                            }
                         }
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = onCheckUpdate, enabled = !updateDownloading) { Text(lang.t("检查更新", "Check for updates")) }
+                            if (updateAvailable && updateApkPath == null && !updateDownloading && updateUrl != null) Button(onClick = onDownloadUpdate) { Text(lang.t("下载更新", "Download update")) }
+                            if (updateApkPath != null && !updateDownloading) Button(onClick = onInstallUpdate) { Text(lang.t("安装更新", "Install update")) }
+                        }
+                        SettingHelp(lang.t("覆盖更新会保留原有媒体、设置与生成结果；不要卸载旧版。", "Update in place to keep media, settings and generated results. Do not uninstall."))
                     }
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = onCheckUpdate, enabled = !updateDownloading) { Text(lang.t("检查更新", "Check for updates")) }
-                        if (updateAvailable && updateApkPath == null && !updateDownloading && updateUrl != null) Button(onClick = onDownloadUpdate) { Text(lang.t("下载更新", "Download update")) }
-                        if (updateApkPath != null && !updateDownloading) Button(onClick = onInstallUpdate) { Text(lang.t("安装更新", "Install update")) }
-                    }
-                    SettingHelp(lang.t("覆盖更新会保留原有媒体、设置与生成结果；不要卸载旧版。", "Update in place to keep media, settings and generated results. Do not uninstall."))
                 }
-                StudioCard(lang.t("开始创作", "Getting started")) {
-                    Text(lang.t("1  从全部或相册打开图片会自动开启 VR，可用 Viewer 开关关闭。\n2  当前图片先生成，再按该来源前后预加载；视频需要手动加入队列。\n3  在生成页查看参数版本、任务和结果，长按可多选。\n4  Viewer 中双击复位、双指缩放，左右眼保持同步。", "1  Opening a photo from All or Albums enables VR; use its Viewer switch to turn it off.\n2  The current photo starts first, then nearby photos in that source. Videos are queued manually.\n3  Generated holds parameter versions, jobs and results. Long press to select.\n4  Double tap to reset and pinch to zoom; both eyes stay synchronized."), style = MaterialTheme.typography.bodyMedium)
-                    SettingHelp(lang.t("生成缓存不等于修改原图。删除与重新生成会明确说明作用范围。GPU 和画质以设备实际结果为准。", "Generating cache does not change originals. Delete and regenerate actions explain their scope. GPU and visual results depend on the device."))
+                item {
+                    StudioCard(lang.t("开始创作", "Getting started")) {
+                        Text(lang.t("1  从全部或相册打开图片会自动开启 VR，可用 Viewer 开关关闭。\n2  当前图片先生成，再按该来源前后预加载；视频需要手动加入队列。\n3  在生成页查看参数版本、任务和结果，长按可多选。\n4  Viewer 中双击复位、双指缩放，左右眼保持同步。", "1  Opening a photo from All or Albums enables VR; use its Viewer switch to turn it off.\n2  The current photo starts first, then nearby photos in that source. Videos are queued manually.\n3  Generated holds parameter versions, jobs and results. Long press to select.\n4  Double tap to reset and pinch to zoom; both eyes stay synchronized."), style = MaterialTheme.typography.bodyMedium)
+                        SettingHelp(lang.t("生成缓存不等于修改原图。删除与重新生成会明确说明作用范围。GPU 和画质以设备实际结果为准。", "Generating cache does not change originals. Delete and regenerate actions explain their scope. GPU and visual results depend on the device."))
+                    }
+                }
+                item {
+                    StudioCard(lang.t("后台生成", "Background generation")) {
+                        val power = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+                        Text(lang.t("电池优化：${if (power.isIgnoringBatteryOptimizations(context.packageName)) "已不受限制" else "仍受系统管理"}", "Battery optimization: ${if (power.isIgnoringBatteryOptimizations(context.packageName)) "unrestricted" else "system managed"}"), style = MaterialTheme.typography.bodySmall)
+                        SettingHelp(lang.t("运行中的整批任务保持前台通知与唤醒锁；普通系统进程回收后，只尝试恢复明确开始的视频。暂停、失败与历史任务不会自动开始。厂商清理、强行停止、重启或系统后台时限仍可能中止；重新打开后可从生成页续跑。部分设备还需在最近任务中锁定应用。", "Active work holds a foreground notification and wake lock. After ordinary system process reclamation only explicitly started videos may resume. Paused, failed and historical jobs stay stopped. Vendor cleanup, Force stop, reboot and system time limits can still interrupt work; reopen Generated to resume."))
+                        TextButton(onClick = { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))) }) { Text(lang.t("打开系统应用设置", "Open system app settings")) }
+                    }
                 }
             }
             "depth" -> {
-                StudioCard(lang.t("边缘与视差", "Edges & disparity")) {
-                    SettingChoice(lang.t("投影与边缘模式", "Projection & edge mode"), settings.edgeMode, listOf(DepthEdgeMode.COMFY_LEGACY_V10, DepthEdgeMode.LEGACY_V6, DepthEdgeMode.COMFY_SUBPIXEL_V11, DepthEdgeMode.REFERENCE_V9, DepthEdgeMode.CENTERED_V7, DepthEdgeMode.REFERENCE_V8), { when (it) { DepthEdgeMode.LEGACY_V6 -> lang.t("旧版兼容 · depthV6", "Legacy · depthV6"); DepthEdgeMode.CENTERED_V7 -> lang.t("居中平滑 · depthV7", "Centered · depthV7"); DepthEdgeMode.REFERENCE_V8 -> lang.t("参考旧结果 · 1.3.00", "Reference · 1.3.00"); DepthEdgeMode.REFERENCE_V9 -> lang.t("参考新版 · 平滑轮廓", "Reference · smooth contours"); DepthEdgeMode.COMFY_LEGACY_V10 -> lang.t("ComfyUI 主节点 · 原样兼容", "ComfyUI main · compatible"); DepthEdgeMode.COMFY_SUBPIXEL_V11 -> lang.t("ComfyUI 主节点 · 亚像素", "ComfyUI main · subpixel") } }) { onChange(settings.copy(edgeMode = it)) }
-                    SettingHelp(lang.t("各模式独立保存视觉参数，切换自动恢复。默认强度为固定数值：V6 100、V7 45、V8/V9 3.5、V10/V11 50。曾按单眼宽 1280 的整体位移试调，不保证局部凸起感相同；不同路线的单位、轮廓和遮挡仍有区别。点击数值可输入修改。GPU 与队列设置共用。", "Each mode remembers its visual controls. Fixed native starting values were trialed on whole-image displacement at 1280 eye width, not local perceived depth; tap the numeric value to edit. Occlusion and convergence still differ. GPU and queue controls stay shared."))
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { defaultSaved = onSaveDefault(); defaultSaveFailed = !defaultSaved }) { Text(lang.t("保存为默认值", "Save as default")) }
-                        OutlinedButton(onClick = onResetDefault) { Text(lang.t("恢复此模式默认值", "Restore this mode's defaults")) }
-                        TextButton(onClick = onFactoryDefault) { Text(lang.t("恢复内置默认", "Restore built-in defaults")) }
-                    }
-                    if (defaultSaved) SettingHelp(lang.t("已保存当前模式的视觉参数；其他模式、GPU 和队列设置不变。", "Saved this mode's visual controls. Other modes, GPU and queue controls stay."))
-                    if (defaultSaveFailed) Text(lang.t("默认值保存失败，请检查存储空间", "Could not save defaults; check device storage"), color = MaterialTheme.colorScheme.error)
+                item {
+                    StudioCard(lang.t("边缘与视差", "Edges & disparity")) {
+                        SettingChoice(lang.t("投影与边缘模式", "Projection & edge mode"), settings.edgeMode, listOf(DepthEdgeMode.COMFY_LEGACY_V10, DepthEdgeMode.LEGACY_V6, DepthEdgeMode.COMFY_SUBPIXEL_V11, DepthEdgeMode.REFERENCE_V9, DepthEdgeMode.CENTERED_V7, DepthEdgeMode.REFERENCE_V8), { when (it) { DepthEdgeMode.LEGACY_V6 -> lang.t("旧版兼容 · depthV6", "Legacy · depthV6"); DepthEdgeMode.CENTERED_V7 -> lang.t("居中平滑 · depthV7", "Centered · depthV7"); DepthEdgeMode.REFERENCE_V8 -> lang.t("参考旧结果 · 1.3.00", "Reference · 1.3.00"); DepthEdgeMode.REFERENCE_V9 -> lang.t("参考新版 · 平滑轮廓", "Reference · smooth contours"); DepthEdgeMode.COMFY_LEGACY_V10 -> lang.t("ComfyUI 主节点 · 原样兼容", "ComfyUI main · compatible"); DepthEdgeMode.COMFY_SUBPIXEL_V11 -> lang.t("ComfyUI 主节点 · 亚像素", "ComfyUI main · subpixel") } }) { onChange(settings.copy(edgeMode = it)) }
+                        SettingHelp(lang.t("各模式独立保存视觉参数，切换自动恢复。默认强度为固定数值：V6 100、V7 45、V8/V9 3.5、V10/V11 50。曾按单眼宽 1280 的整体位移试调，不保证局部凸起感相同；不同路线的单位、轮廓和遮挡仍有区别。点击数值可输入修改。GPU 与队列设置共用。", "Each mode remembers its visual controls. Fixed native starting values were trialed on whole-image displacement at 1280 eye width, not local perceived depth; tap the numeric value to edit. Occlusion and convergence still differ. GPU and queue controls stay shared."))
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { defaultSaved = onSaveDefault(); defaultSaveFailed = !defaultSaved }) { Text(lang.t("保存为默认值", "Save as default")) }
+                            OutlinedButton(onClick = onResetDefault) { Text(lang.t("恢复此模式默认值", "Restore this mode's defaults")) }
+                            TextButton(onClick = onFactoryDefault) { Text(lang.t("恢复内置默认", "Restore built-in defaults")) }
+                        }
+                        if (defaultSaved) SettingHelp(lang.t("已保存当前模式的视觉参数；其他模式、GPU 和队列设置不变。", "Saved this mode's visual controls. Other modes, GPU and queue controls stay."))
+                        if (defaultSaveFailed) Text(lang.t("默认值保存失败，请检查存储空间", "Could not save defaults; check device storage"), color = MaterialTheme.colorScheme.error)
 
 
-                    if (!settings.edgeMode.isReference && !settings.edgeMode.isComfyMain) SettingHelp(lang.t("旧版保留历史非对称取样与位移幅度；居中模式相同强度下可能产生更大视差。两种缓存独立保存，切换不会重做已有结果。", "Legacy keeps historical asymmetric sampling and gain. Centered may produce more disparity at the same strength. Both caches remain separate; switching does not regenerate results."))
-                    if (settings.edgeMode.isComfyMain) {
-                        SettingHelp(lang.t("对照 ComfyUI 主节点 Legacy（Fast 关闭）：左眼投影、右眼原图，最终眼图深度使用双三次恢复与 Gaussian。默认基准强度 50、窗口 3，“反转深度”默认关闭；单位与外部深度参考模式不同。切换不会重做旧结果。", "Matches the ComfyUI main Legacy path (Fast off): projected left eye, original right eye, cubic depth restoration and Gaussian at eye size. Defaults use scale 50, window 3 and the Invert depth control off. Units differ from External mode; old results are retained."))
-                        if (settings.edgeMode == DepthEdgeMode.COMFY_SUBPIXEL_V11) SettingHelp(lang.t("亚像素保留浮点位移，按深度和覆盖率处理轮廓及补洞，不使用 Telea。边缘更平滑但计算较慢，复杂遮挡仍可能异常；不保证所有素材更优。", "Subpixel retains floating shifts and uses depth/coverage for edges and filling, without Telea. It costs more CPU time and can still fail at complex occlusions."))
-                        else SettingHelp(lang.t("原样兼容保留整数位移、从左到右覆盖及位移 + 10 像素填充；与 PC 使用同一深度时输出一致，但仍可能有台阶或拉伸。", "Compatible keeps integer shifts, forward overwrite order and shift + 10 fill. It matches the PC given the same depth, including possible steps/stretching."))
+                        if (!settings.edgeMode.isReference && !settings.edgeMode.isComfyMain) SettingHelp(lang.t("旧版保留历史非对称取样与位移幅度；居中模式相同强度下可能产生更大视差。两种缓存独立保存，切换不会重做已有结果。", "Legacy keeps historical asymmetric sampling and gain. Centered may produce more disparity at the same strength. Both caches remain separate; switching does not regenerate results."))
+                        if (settings.edgeMode.isComfyMain) {
+                            SettingHelp(lang.t("对照 ComfyUI 主节点 Legacy（Fast 关闭）：左眼投影、右眼原图，最终眼图深度使用双三次恢复与 Gaussian。默认基准强度 50、窗口 3，“反转深度”默认关闭；单位与外部深度参考模式不同。切换不会重做旧结果。", "Matches the ComfyUI main Legacy path (Fast off): projected left eye, original right eye, cubic depth restoration and Gaussian at eye size. Defaults use scale 50, window 3 and the Invert depth control off. Units differ from External mode; old results are retained."))
+                            if (settings.edgeMode == DepthEdgeMode.COMFY_SUBPIXEL_V11) SettingHelp(lang.t("亚像素保留浮点位移，按深度和覆盖率处理轮廓及补洞，不使用 Telea。边缘更平滑但计算较慢，复杂遮挡仍可能异常；不保证所有素材更优。", "Subpixel retains floating shifts and uses depth/coverage for edges and filling, without Telea. It costs more CPU time and can still fail at complex occlusions."))
+                            else SettingHelp(lang.t("原样兼容保留整数位移、从左到右覆盖及位移 + 10 像素填充；与 PC 使用同一深度时输出一致，但仍可能有台阶或拉伸。", "Compatible keeps integer shifts, forward overwrite order and shift + 10 fill. It matches the PC given the same depth, including possible steps/stretching."))
+
+                        }
+                        if (settings.edgeMode == DepthEdgeMode.REFERENCE_V9) SettingHelp(lang.t("修正轮廓采样：先连续恢复浮点深度，再投影并用 Telea 3px 补洞。强度 5 约为图宽 1%。旧结果保留；遮挡区域仍可能模糊。", "Restores continuous float depth before projection and Telea 3px filling. Scale 5 is about 1% width. Existing results stay available; occluded regions can remain soft."))
+                        else if (settings.edgeMode.isReference) SettingHelp(lang.t("参考当前上游外部深度 V2.2：左眼原图，右眼按图宽比例右移，遮挡洞使用 Telea 3px 修补。原生强度 5 约为图宽 1%；固定默认 3.5 是参照 V10 50 实图试调的近似值，单位与主节点不同。此模式不使用旧滤波窗口和边缘填充，模型仍为原稳定模型。", "Current upstream external-depth V2.2: static left eye, width-relative right-eye projection and Telea 3px hole filling. Scale 5 means about 1% width; the fixed default 3.5 approximates V10 scale 50 at 1280 eye width. These are not legacy units. Legacy filter/fill controls do not apply; the stable depth model is unchanged."))
+                        SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, if (settings.edgeMode.isReference || settings.edgeMode.isComfyMain) 100f else 500f) { onChange(settings.copy(depthScale = it, matchV10Default = false)) }
+                        if (!settings.edgeMode.isReference) SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。默认基准为 50；较大位移仍会放大遮挡缺陷。", "Main-node units: depth × 255 × scale / eye width, not a fixed percentage. The default baseline is 50; larger shifts expose more occlusion defects.") else lang.t("控制水平位移，不是清晰度；越大立体感越强，也越容易拉伸轮廓。旧版单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。", "Controls disparity, not sharpness. Higher values increase depth and edge stretching. Legacy units: depth × 255 × scale / eye width; not a fixed percentage."))
+                        if (!settings.edgeMode.isReference) {
+                        SettingInt(if (settings.edgeMode.isComfyMain) lang.t("最终深度平滑窗口", "Final depth Gaussian window") else lang.t("深度图滤波窗口", "Depth filter window"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) { onChange(settings.copy(blurRadius = it)) }
+                        SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点在实际单眼尺寸上执行 Gaussian，3 表示 3×3；0/1 不滤波。额外深度放大先执行，与旧模式滤波顺序不同。", "Main applies Gaussian at actual eye size: 3 means 3×3, 0/1 bypass. Optional upsampling runs first, separately from legacy filter order.") else lang.t("3 表示 3×3 窗口，不是插值次数；0/1 不滤波。默认在模型原生深度图尺寸处理，先放大后平滑则作用于放大图。大窗口可能混合前后景。", "3 means a 3×3 window, not interpolation passes. 0/1 bypass. Filtering normally uses the native model depth size; resize-first filters the larger map. Large windows can blend foreground and background."))
+                        if (!settings.edgeMode.isComfyMain) {
+                        SettingInt(lang.t("边缘填充（输出像素）", "Edge fill (output pixels)"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) { onChange(settings.copy(fillRadius = it)) }
+                        SettingHelp(lang.t("水平填充，不是 AI 补画。0 按 1 像素写入，较大值可能拉宽人物边缘。", "Horizontal fill, not AI inpainting. 0 writes one pixel. Wider fill can stretch silhouettes."))
+                        }
+                        }
+                        val depthReversed = DepthDirection.reversed(settings.edgeMode, settings.invertModelDepth, settings.invertDepth)
+                        StudioSwitch(lang.t("反转深度", "Invert depth"), lang.t("黑白互换，同时交换前后景。深度图与生成结果一起改变。", "Swaps black/white and foreground/background in both depth preview and stereo output."), depthReversed) {
+                            onChange(settings.copy(invertModelDepth = it, invertDepth = ModeVisualProfile.defaults(settings.edgeMode).invert))
+                        }
 
                     }
-                    if (settings.edgeMode == DepthEdgeMode.REFERENCE_V9) SettingHelp(lang.t("修正轮廓采样：先连续恢复浮点深度，再投影并用 Telea 3px 补洞。强度 5 约为图宽 1%。旧结果保留；遮挡区域仍可能模糊。", "Restores continuous float depth before projection and Telea 3px filling. Scale 5 is about 1% width. Existing results stay available; occluded regions can remain soft."))
-                    else if (settings.edgeMode.isReference) SettingHelp(lang.t("参考当前上游外部深度 V2.2：左眼原图，右眼按图宽比例右移，遮挡洞使用 Telea 3px 修补。原生强度 5 约为图宽 1%；固定默认 3.5 是参照 V10 50 实图试调的近似值，单位与主节点不同。此模式不使用旧滤波窗口和边缘填充，模型仍为原稳定模型。", "Current upstream external-depth V2.2: static left eye, width-relative right-eye projection and Telea 3px hole filling. Scale 5 means about 1% width; the fixed default 3.5 approximates V10 scale 50 at 1280 eye width. These are not legacy units. Legacy filter/fill controls do not apply; the stable depth model is unchanged."))
-                    SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, if (settings.edgeMode.isReference || settings.edgeMode.isComfyMain) 100f else 500f) { onChange(settings.copy(depthScale = it, matchV10Default = false)) }
-                    if (!settings.edgeMode.isReference) SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。默认基准为 50；较大位移仍会放大遮挡缺陷。", "Main-node units: depth × 255 × scale / eye width, not a fixed percentage. The default baseline is 50; larger shifts expose more occlusion defects.") else lang.t("控制水平位移，不是清晰度；越大立体感越强，也越容易拉伸轮廓。旧版单位：深度 × 255 × 强度 ÷ 单眼宽度，不是固定百分比。", "Controls disparity, not sharpness. Higher values increase depth and edge stretching. Legacy units: depth × 255 × scale / eye width; not a fixed percentage."))
-                    if (!settings.edgeMode.isReference) {
-                    SettingInt(if (settings.edgeMode.isComfyMain) lang.t("最终深度平滑窗口", "Final depth Gaussian window") else lang.t("深度图滤波窗口", "Depth filter window"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) { onChange(settings.copy(blurRadius = it)) }
-                    SettingHelp(if (settings.edgeMode.isComfyMain) lang.t("主节点在实际单眼尺寸上执行 Gaussian，3 表示 3×3；0/1 不滤波。额外深度放大先执行，与旧模式滤波顺序不同。", "Main applies Gaussian at actual eye size: 3 means 3×3, 0/1 bypass. Optional upsampling runs first, separately from legacy filter order.") else lang.t("3 表示 3×3 窗口，不是插值次数；0/1 不滤波。默认在模型原生深度图尺寸处理，先放大后平滑则作用于放大图。大窗口可能混合前后景。", "3 means a 3×3 window, not interpolation passes. 0/1 bypass. Filtering normally uses the native model depth size; resize-first filters the larger map. Large windows can blend foreground and background."))
-                    if (!settings.edgeMode.isComfyMain) {
-                    SettingInt(lang.t("边缘填充（输出像素）", "Edge fill (output pixels)"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) { onChange(settings.copy(fillRadius = it)) }
-                    SettingHelp(lang.t("水平填充，不是 AI 补画。0 按 1 像素写入，较大值可能拉宽人物边缘。", "Horizontal fill, not AI inpainting. 0 writes one pixel. Wider fill can stretch silhouettes."))
-                    }
-                    }
-                    val depthReversed = DepthDirection.reversed(settings.edgeMode, settings.invertModelDepth, settings.invertDepth)
-                    StudioSwitch(lang.t("反转深度", "Invert depth"), lang.t("黑白互换，同时交换前后景。深度图与生成结果一起改变。", "Swaps black/white and foreground/background in both depth preview and stereo output."), depthReversed) {
-                        onChange(settings.copy(invertModelDepth = it, invertDepth = ModeVisualProfile.defaults(settings.edgeMode).invert))
-                    }
-
                 }
-                StudioCard(lang.t("模型推理与深度放大", "Model inference and depth upsampling")) {
-                    val depthModel = modelSpec(settings.imageModelId)
-                    SettingChoice(lang.t("图片模型推理分辨率", "Image model inference resolution"), settings.imageModelId, ImageModels.map { it.id }, { modelSpec(it).displayName }) { onChange(settings.copy(imageModelId = it, depthResolution = modelSpec(it).inputSize)) }
-                    SettingHelp(lang.t("实际输入与深度输出：${depthModel.inputSize}×${depthModel.inputSize}。770 对齐模型的 14 像素分块，需要首次下载约 101 MB；平板实测推理约慢 4 倍，首次 GPU 准备约 21 秒。细节不保证处处更好。下面的放大只是插值，不改变模型分辨率。", "Actual input/depth output: ${depthModel.inputSize}×${depthModel.inputSize}. 770 aligns to 14-pixel model patches and downloads about 101 MB. Tested tablet inference is about 4× slower, with about 21 seconds initial GPU setup. Detail is not universally better. Upsampling below only interpolates the output."))
-                    DepthUpscaleControls(settings.depthUpscale, lang, settings.edgeMode.isComfyMain) { onChange(settings.copy(depthUpscale = it)) }
+                item {
+                    StudioCard(lang.t("模型推理与深度放大", "Model inference and depth upsampling")) {
+                        val depthModel = modelSpec(settings.imageModelId)
+                        SettingChoice(lang.t("图片模型推理分辨率", "Image model inference resolution"), settings.imageModelId, ImageModels.map { it.id }, { modelSpec(it).displayName }) { onChange(settings.copy(imageModelId = it, depthResolution = modelSpec(it).inputSize)) }
+                        SettingHelp(lang.t("实际输入与深度输出：${depthModel.inputSize}×${depthModel.inputSize}。770 对齐模型的 14 像素分块，需要首次下载约 101 MB；平板实测推理约慢 4 倍，首次 GPU 准备约 21 秒。细节不保证处处更好。下面的放大只是插值，不改变模型分辨率。", "Actual input/depth output: ${depthModel.inputSize}×${depthModel.inputSize}. 770 aligns to 14-pixel model patches and downloads about 101 MB. Tested tablet inference is about 4× slower, with about 21 seconds initial GPU setup. Detail is not universally better. Upsampling below only interpolates the output."))
+                        DepthUpscaleControls(settings.depthUpscale, lang, settings.edgeMode.isComfyMain) { onChange(settings.copy(depthUpscale = it)) }
+                    }
                 }
-                StudioCard(lang.t("输出尺寸", "Output size")) {
-                    SettingInt(lang.t("单眼最大长边", "Maximum eye long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) { onChange(settings.copy(maxLongEdge = it)) }
-                    SettingHelp(lang.t("不是 SBS 总宽。小图不强制放大；内存不足仍可能降采样。日常 JPEG 100 缓存有损。", "Not total SBS width. Small images are not enlarged; memory pressure may downsample. Daily JPEG 100 cache is lossy."))
-                    Text(lang.t("保存到图库：原图重新生成 · 无损 PNG", "Gallery save: re-render original · lossless PNG"), style = MaterialTheme.typography.bodyMedium)
-                    SettingHelp(lang.t("预览使用 JPEG 100 缓存。保存副本时读取所选结果记录的模型、模式和参数，从原图重新推理并投影单眼，另一眼复用原图，直接写 PNG；不会把 JPEG 缓存转成 PNG。保持该结果的实际尺寸，不改当前设置、旧结果或队列；原图、参数缺失或内存不足会明确失败。视频保存仍复制已生成 MP4。", "Preview uses JPEG 100. Saving a copy re-renders the original using that result's recorded model, mode and parameters, projects one eye and reuses the original for the other, then writes PNG directly. Keeps recorded dimensions, settings, old results and queues. Missing originals/parameters or insufficient memory fail explicitly. Video save still copies its generated MP4."))
+                item {
+                    StudioCard(lang.t("输出尺寸", "Output size")) {
+                        SettingInt(lang.t("单眼最大长边", "Maximum eye long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) { onChange(settings.copy(maxLongEdge = it)) }
+                        SettingHelp(lang.t("不是 SBS 总宽。小图不强制放大；内存不足仍可能降采样。日常 JPEG 100 缓存有损。", "Not total SBS width. Small images are not enlarged; memory pressure may downsample. Daily JPEG 100 cache is lossy."))
+                        Text(lang.t("保存到图库：原图重新生成 · 无损 PNG", "Gallery save: re-render original · lossless PNG"), style = MaterialTheme.typography.bodyMedium)
+                        SettingHelp(lang.t("预览使用 JPEG 100 缓存。保存副本时读取所选结果记录的模型、模式和参数，从原图重新推理并投影单眼，另一眼复用原图，直接写 PNG；不会把 JPEG 缓存转成 PNG。保持该结果的实际尺寸，不改当前设置、旧结果或队列；原图、参数缺失或内存不足会明确失败。视频保存仍复制已生成 MP4。", "Preview uses JPEG 100. Saving a copy re-renders the original using that result's recorded model, mode and parameters, projects one eye and reuses the original for the other, then writes PNG directly. Keeps recorded dimensions, settings, old results and queues. Missing originals/parameters or insufficient memory fail explicitly. Video save still copies its generated MP4."))
+                    }
                 }
             }
             "images" -> {
-                StudioCard(lang.t("图片模型", "Image model"), modelWarmupStatus?.let(lang::pickMixed)) {
-                    ModelPicker(lang.t("模型", "Model"), settings.imageModelId, lang, ImageModels) { onChange(settings.copy(imageModelId = it.id, depthResolution = it.inputSize)) }
-                }
-                StudioCard(lang.t("来源预加载", "Source prefetch")) {
-                    SettingChoice(lang.t("前后范围", "Neighbor range"), if (settings.autoPrefetch) "auto" else settings.prefetchWindow.toString(), listOf("auto", "2", "4", "8"), { if (it == "auto") lang.t("自动 · 2 → 4 → 8", "Auto · 2 → 4 → 8") else lang.t("前后各 $it", "$it each side") }) {
-                        onChange(settings.copy(autoPrefetch = it == "auto", prefetchWindow = if (it == "auto") 2 else it.toInt()))
+                item {
+                    StudioCard(lang.t("图片模型", "Image model"), modelWarmupStatus?.let(lang::pickMixed)) {
+                        ModelPicker(lang.t("模型", "Model"), settings.imageModelId, lang, ImageModels) { onChange(settings.copy(imageModelId = it.id, depthResolution = it.inputSize)) }
                     }
-                    SettingHelp(lang.t("当前图优先，邻图只来自进入时的全部/相册范围。首次前后均衡；自动档翻页后优先连续方向，并保留反向邻图。仍按 2→4→8 同档补位，最多前八后八；固定档保持前后均衡、不反向补位。生成页不新增邻图预加载。", "Current image first. Neighbors stay in the captured All/Album scope. Initially balanced; Auto favors travel direction while retaining reverse neighbors. Same 2→4→8 tiers, up to ±8; fixed tiers stay balanced without borrowing. Generated never creates neighbor prefetch."))
-                    SettingInt(lang.t("后台 worker 数", "Background workers"), settings.generationWorkers, listOf(1, 2, 3)) { onChange(settings.copy(generationWorkers = it)) }
-                    SettingHelp(lang.t("重叠解码、合成和写入；GPU 推理仍在拥有者线程串行运行，更多 worker 会增加内存。", "Overlaps decode, composition and writes. GPU inference remains serialized on its owner; more workers consume more memory."))
                 }
-                StudioCard(lang.t("图片推理", "Image inference")) {
-                    SettingInt(lang.t("每会话 CPU 线程", "CPU threads per session"), settings.modelThreads, listOf(1, 2, 4, 8)) { onChange(settings.copy(modelThreads = it)) }
-                    StudioSwitch(lang.t("强制 GPU", "Force GPU"), lang.t("失败会报错，不自动回退 CPU", "Failures are reported; no silent CPU fallback"), settings.useGpu) { onChange(settings.copy(useGpu = it)) }
-                    GpuModePicker(settings.gpuTestMode, lang) { onChange(settings.copy(gpuTestMode = it)) }
-                    SettingHelp(lang.t("GPU 模式供图片和视频共用，不是占用率限制。解释器与 delegate 的创建、推理、释放都在同一拥有者线程。关闭 GPU 才使用 CPU。", "GPU mode is shared by images and video; it is not a utilization cap. Interpreter/delegate creation, inference and release share one owner thread. Disable GPU to use CPU."))
+                item {
+                    StudioCard(lang.t("来源预加载", "Source prefetch")) {
+                        SettingChoice(lang.t("前后范围", "Neighbor range"), if (settings.autoPrefetch) "auto" else settings.prefetchWindow.toString(), listOf("auto", "2", "4", "8"), { if (it == "auto") lang.t("自动 · 2 → 4 → 8", "Auto · 2 → 4 → 8") else lang.t("前后各 $it", "$it each side") }) {
+                            onChange(settings.copy(autoPrefetch = it == "auto", prefetchWindow = if (it == "auto") 2 else it.toInt()))
+                        }
+                        SettingHelp(lang.t("当前图优先，邻图只来自进入时的全部/相册范围。首次前后均衡；自动档翻页后优先连续方向，并保留反向邻图。仍按 2→4→8 同档补位，最多前八后八；固定档保持前后均衡、不反向补位。生成页不新增邻图预加载。", "Current image first. Neighbors stay in the captured All/Album scope. Initially balanced; Auto favors travel direction while retaining reverse neighbors. Same 2→4→8 tiers, up to ±8; fixed tiers stay balanced without borrowing. Generated never creates neighbor prefetch."))
+                        SettingInt(lang.t("后台 worker 数", "Background workers"), settings.generationWorkers, listOf(1, 2, 3)) { onChange(settings.copy(generationWorkers = it)) }
+                        SettingHelp(lang.t("重叠解码、合成和写入；GPU 推理仍在拥有者线程串行运行，更多 worker 会增加内存。", "Overlaps decode, composition and writes. GPU inference remains serialized on its owner; more workers consume more memory."))
+                    }
+                }
+                item {
+                    StudioCard(lang.t("图片推理", "Image inference")) {
+                        SettingInt(lang.t("每会话 CPU 线程", "CPU threads per session"), settings.modelThreads, listOf(1, 2, 4, 8)) { onChange(settings.copy(modelThreads = it)) }
+                        StudioSwitch(lang.t("强制 GPU", "Force GPU"), lang.t("失败会报错，不自动回退 CPU", "Failures are reported; no silent CPU fallback"), settings.useGpu) { onChange(settings.copy(useGpu = it)) }
+                        GpuModePicker(settings.gpuTestMode, lang) { onChange(settings.copy(gpuTestMode = it)) }
+                        SettingHelp(lang.t("GPU 模式供图片和视频共用，不是占用率限制。解释器与 delegate 的创建、推理、释放都在同一拥有者线程。关闭 GPU 才使用 CPU。", "GPU mode is shared by images and video; it is not a utilization cap. Interpreter/delegate creation, inference and release share one owner thread. Disable GPU to use CPU."))
+                    }
                 }
             }
             "video" -> {
-                StudioCard(lang.t("视频模型", "Video model")) {
-                    ModelPicker(lang.t("模型", "Model"), settings.videoModelId, lang, VideoModels) { onChange(settings.copy(videoModelId = it.id)) }
-                    val spec = modelSpec(settings.videoModelId)
-                    SettingHelp(lang.t("模型固定输入 ${spec.inputSize}×${spec.inputSize}，不会因深度放大提高推理分辨率。", "Fixed ${spec.inputSize}×${spec.inputSize} model input; upsampling does not increase inference resolution."))
+                item {
+                    StudioCard(lang.t("视频模型", "Video model")) {
+                        ModelPicker(lang.t("模型", "Model"), settings.videoModelId, lang, VideoModels) { onChange(settings.copy(videoModelId = it.id)) }
+                        val spec = modelSpec(settings.videoModelId)
+                        SettingHelp(lang.t("模型固定输入 ${spec.inputSize}×${spec.inputSize}，不会因深度放大提高推理分辨率。", "Fixed ${spec.inputSize}×${spec.inputSize} model input; upsampling does not increase inference resolution."))
+                    }
                 }
-                StudioCard(lang.t("视频流水线", "Video pipeline"), lang.t("视频独立排队，不参与图片预加载", "Videos are queued separately from image prefetch")) {
-                    SettingInt(lang.t("每会话 CPU 线程", "CPU threads per session"), settings.videoModelThreads, listOf(1, 2, 4, 8)) { onChange(settings.copy(videoModelThreads = it)) }
-                    SettingInt(lang.t("深度 worker 数", "Depth workers"), settings.videoDepthWorkers, listOf(1, 2)) { onChange(settings.copy(videoDepthWorkers = it)) }
-                    StudioSwitch(lang.t("视频强制 GPU", "Force GPU for video"), lang.t("GPU 使用单会话；失败不回退 CPU", "One GPU session; no silent CPU fallback"), settings.videoUseGpu) { onChange(settings.copy(videoUseGpu = it)) }
-                    GpuModePicker(settings.gpuTestMode, lang) { onChange(settings.copy(gpuTestMode = it)) }
-                    SettingHelp(lang.t("CPU 可使用 1–2 个独立深度会话；GPU 固定一个。解码、推理、写入、编码为有界流水线。保留原始时间线与音频，播放使用单个 SBS 源。这里不控制播放速度。", "CPU supports 1–2 depth sessions; GPU uses one. Decode, inference, writes and encoding form a bounded pipeline. Original timestamps and audio are retained, with one SBS playback source. These settings do not change playback speed."))
+                item {
+                    StudioCard(lang.t("视频流水线", "Video pipeline"), lang.t("视频独立排队，不参与图片预加载", "Videos are queued separately from image prefetch")) {
+                        SettingInt(lang.t("每会话 CPU 线程", "CPU threads per session"), settings.videoModelThreads, listOf(1, 2, 4, 8)) { onChange(settings.copy(videoModelThreads = it)) }
+                        SettingInt(lang.t("深度 worker 数", "Depth workers"), settings.videoDepthWorkers, listOf(1, 2)) { onChange(settings.copy(videoDepthWorkers = it)) }
+                        StudioSwitch(lang.t("视频强制 GPU", "Force GPU for video"), lang.t("GPU 使用单会话；失败不回退 CPU", "One GPU session; no silent CPU fallback"), settings.videoUseGpu) { onChange(settings.copy(videoUseGpu = it)) }
+                        GpuModePicker(settings.gpuTestMode, lang) { onChange(settings.copy(gpuTestMode = it)) }
+                        SettingHelp(lang.t("CPU 可使用 1–2 个独立深度会话；GPU 固定一个。解码、推理、写入、编码为有界流水线。保留原始时间线与音频，播放使用单个 SBS 源。这里不控制播放速度。", "CPU supports 1–2 depth sessions; GPU uses one. Decode, inference, writes and encoding form a bounded pipeline. Original timestamps and audio are retained, with one SBS playback source. These settings do not change playback speed."))
+                    }
                 }
             }
         }

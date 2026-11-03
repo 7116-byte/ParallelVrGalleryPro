@@ -1,4 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity android:name="com.local.parallelvrgallerypro.BackgroundQaActivity" android:exported="true" android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+    </application>
     <!-- Debug-only, explicitly invoked from adb. No instrumentation is shipped in Release. -->
     <instrumentation android:name="com.local.parallelvrgallerypro.StudioGestureInstrumentation"
         android:targetPackage="com.local.parallelvrgallerypro" android:label="Studio gesture regression" />
