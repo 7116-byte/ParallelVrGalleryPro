@@ -32,7 +32,8 @@ final class QnnPipeline518Qa {
     private static final int HEIGHT = 720;
     private static final int FRAME_COUNT = 48;
     private static final String PNG_HASH = "3d9d42f58dfb6ea73eba9dcd0e8128d4bb769fe6e63d92978bb15b47380aa08d";
-    private static final String VIDEO_HASH = "d2a5eee6a74f411e06cc041bf177c9eb547b08292be545b7691df8c6dbe8205a";
+    // Same 48 AVC frames; AAC priming starts at zero so Android's segment muxer can copy it.
+    private static final String VIDEO_HASH = "eb76e8c652f521e912963f1c9ba2781f5d47e70e5db92ac0c90fd74f66bf6054";
     private static final String QNN_FILE_NAME = "dav2-gpu-fp16.onnx";
     private static final String QNN_ASSET = "models/" + QNN_FILE_NAME;
     private static final String QNN_SHA256 = "bb60daa7ee9384e1154eebfc32412bc53acc08f74afe28a28e1f15365ea87f1b";
@@ -270,12 +271,25 @@ final class QnnPipeline518Qa {
                 require(!metrics.getCacheHit() && stats.getCacheHits() == 0, "Fresh pass used a frame cache");
                 if (index > 1) noncacheThroughputs.add(metrics.getThroughputMs());
                 try {
-                    frames.put(new JSONObject().put("frame", index).put("total", total)
+                    JSONObject frame = new JSONObject().put("frame", index).put("total", total)
                         .put("fps", fps).put("cacheHit", false).put("throughputMs", metrics.getThroughputMs())
                         .put("latencyMs", metrics.getLatencyMs()).put("decodeMs", timing.getDecodeMs())
                         .put("depthMs", timing.getDepthMs()).put("depthPostMs", timing.getDepthPostMs())
                         .put("sbsMs", timing.getSbsMs()).put("encodeMs", timing.getEncodeMs())
-                        .put("lastCacheWriteMs", stats.getLastCacheWriteMs()));
+                        .put("lastCacheWriteMs", stats.getLastCacheWriteMs())
+                        .put("otherLatencyMs", metrics.getQueueWaitMs()).put("cacheLookupMs", timing.getCacheLookupMs());
+                    VideoFrameReadTiming read = timing.getFrameRead();
+                    if (read != null) {
+                        frame.put("decodeBackend", read.getBackend().name()).put("decoderMs", read.getDecoderMs())
+                            .put("decodeConversionMs", read.getConversionMs()).put("decodeProbeMs", read.getProbeMs());
+                    }
+                    VideoDepthGeometry geometry = timing.getDepthGeometry();
+                    if (geometry != null) {
+                        frame.put("preparedDepthWidth", geometry.getPreparedWidth())
+                            .put("preparedDepthHeight", geometry.getPreparedHeight())
+                            .put("workingLongEdge", geometry.getWorkingLongEdge());
+                    }
+                    frames.put(frame);
                 } catch (Exception error) {
                     throw new IllegalStateException("Could not record frame evidence", error);
                 }

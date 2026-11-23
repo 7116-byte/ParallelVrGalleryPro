@@ -8,6 +8,19 @@ import android.os.SystemClock
 import java.io.Closeable
 import kotlin.math.abs
 
+enum class VideoDecodeBackend { MEDIACODEC, ANDROID_RETRIEVER }
+
+data class VideoFrameReadTiming(
+    val backend: VideoDecodeBackend,
+    val decoderMs: Long,
+    val conversionMs: Long = 0,
+    val probeMs: Long = 0,
+) {
+    val decodeMs: Long get() = decoderMs + conversionMs
+}
+
+internal data class VideoFrameRead(val bitmap: Bitmap, val timing: VideoFrameReadTiming)
+
 /** The first uncached frame is checked against Android's existing decode path. */
 internal class VideoFrameReader(
     private val context: Context,
@@ -21,8 +34,9 @@ internal class VideoFrameReader(
     private var attempted = false
     private var validated = false
 
-    fun frameAt(index: Int): Bitmap {
+    fun frameAt(index: Int): VideoFrameRead {
         checkActive()
+        val started = SystemClock.uptimeMillis()
         if (!attempted) {
             attempted = true
             try { sequential = SequentialVideoDecoder(context, uri, timeline, checkActive) }
@@ -31,33 +45,73 @@ internal class VideoFrameReader(
                 report("decoder=Android retriever; sequential unavailable: ${error.message}")
             }
         }
-        val decoder = sequential ?: return legacy(index)
+        val decoder = sequential ?: return compatibilityFrame(index, SystemClock.uptimeMillis() - started)
+        val decoderStarted = SystemClock.uptimeMillis()
         val decoded = try { decoder.frameAt(index) } catch (error: Exception) {
             checkActive()
             close()
             report("decoder=Android retriever; sequential fallback at frame=$index: ${error.message}")
-            return legacy(index)
+            return compatibilityFrame(index, SystemClock.uptimeMillis() - started)
         }
-        if (validated) return decoded
-        val referenceStarted = SystemClock.elapsedRealtime()
+        val sequentialMs = SystemClock.uptimeMillis() - decoderStarted
+        val conversionMs = decoder.lastConversionMs.coerceAtMost(sequentialMs)
+        fun sequentialFrame() = VideoFrameRead(
+            decoded,
+            VideoFrameReadTiming(
+                VideoDecodeBackend.MEDIACODEC,
+                decoderMs = sequentialMs - conversionMs,
+                conversionMs = conversionMs,
+                probeMs = (SystemClock.uptimeMillis() - started - sequentialMs).coerceAtLeast(0L),
+            ),
+        )
+        if (validated) {
+            return sequentialFrame()
+        }
+        val referenceStarted = SystemClock.uptimeMillis()
         val reference = try { legacy(index) } catch (error: Throwable) { decoded.recycle(); throw error }
-        val referenceMs = SystemClock.elapsedRealtime() - referenceStarted
-        if (!samePixels(decoded, reference)) {
+        val referenceMs = SystemClock.uptimeMillis() - referenceStarted
+        val fallback = try {
+            when {
+                !samePixels(decoded, reference) -> "sequential color/rotation validation differed"
+                conversionMs > referenceMs * 1.25 + 8 -> "sequential RGB conversion=${conversionMs}ms reference=${referenceMs}ms"
+                else -> null
+            }
+        } catch (error: Throwable) {
             decoded.recycle()
-            close()
-            report("decoder=Android retriever; sequential color/rotation validation differed")
-            return reference
+            reference.recycle()
+            throw error
         }
-        if (decoder.lastConversionMs > referenceMs * 1.25 + 8) {
+        if (fallback != null) {
             decoded.recycle()
-            close()
-            report("decoder=Android retriever; sequential RGB conversion=${decoder.lastConversionMs}ms reference=${referenceMs}ms")
-            return reference
+            try {
+                close()
+                report("decoder=Android retriever; $fallback")
+                return VideoFrameRead(reference, VideoFrameReadTiming(
+                    VideoDecodeBackend.ANDROID_RETRIEVER, referenceMs,
+                    probeMs = (SystemClock.uptimeMillis() - started - referenceMs).coerceAtLeast(0L),
+                ))
+            } catch (error: Throwable) {
+                reference.recycle()
+                throw error
+            }
         }
         reference.recycle()
         validated = true
-        report("decoder=sequential MediaCodec; color/rotation validation passed; source presentation timestamps retained")
-        return decoded
+        try {
+            report("decoder=sequential MediaCodec; color/rotation validation passed; source presentation timestamps retained")
+        } catch (error: Throwable) {
+            decoded.recycle()
+            throw error
+        }
+        return sequentialFrame()
+    }
+
+    private fun compatibilityFrame(index: Int, probeMs: Long): VideoFrameRead {
+        val started = SystemClock.uptimeMillis()
+        val bitmap = legacy(index)
+        return VideoFrameRead(bitmap, VideoFrameReadTiming(
+            VideoDecodeBackend.ANDROID_RETRIEVER, SystemClock.uptimeMillis() - started, probeMs = probeMs,
+        ))
     }
 
     private fun legacy(index: Int): Bitmap {
@@ -76,7 +130,7 @@ internal class VideoFrameReader(
             a.getPixels(rowA, 0, a.width, 0, y, a.width, 1)
             b.getPixels(rowB, 0, b.width, 0, y, b.width, 1)
             for (x in 0 until a.width step maxOf(1, a.width / 64)) {
-                for (shift in intArrayOf(0, 8, 16)) {
+                for (shift in 0..16 step 8) {
                     error += abs(((rowA[x] shr shift) and 255) - ((rowB[x] shr shift) and 255))
                     samples++
                 }

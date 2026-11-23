@@ -14,11 +14,22 @@ internal class YuvRgb(standard: Int, fullRange: Boolean) {
     private val blueU = IntArray(256) { ((it - 128) * chromaScale * 2 * (1 - kb) * unit).roundToInt() }
     private val greenU = IntArray(256) { ((it - 128) * chromaScale * 2 * kb * (1 - kb) / kg * unit).roundToInt() }
     private val greenV = IntArray(256) { ((it - 128) * chromaScale * 2 * kr * (1 - kr) / kg * unit).roundToInt() }
-    fun pixel(y: Int, u: Int, v: Int): Int {
-        val yy = luma[y] + 32768
-        val r = ((yy + redV[v]) shr 16).coerceIn(0, 255)
-        val b = ((yy + blueU[u]) shr 16).coerceIn(0, 255)
-        val g = ((yy - greenU[u] - greenV[v]) shr 16).coerceIn(0, 255)
+    fun pixel(y: Int, u: Int, v: Int): Int =
+        pack(luma[y] + 32768, redV[v], blueU[u], -greenU[u] - greenV[v])
+
+    /** Horizontally adjacent luma samples share their chroma conversion coefficients. */
+    fun pair(y0: Int, y1: Int, u: Int, v: Int, output: IntArray, offset: Int) {
+        val red = redV[v]
+        val blue = blueU[u]
+        val green = -greenU[u] - greenV[v]
+        output[offset] = pack(luma[y0] + 32768, red, blue, green)
+        output[offset + 1] = pack(luma[y1] + 32768, red, blue, green)
+    }
+
+    private fun pack(yy: Int, red: Int, blue: Int, green: Int): Int {
+        val r = ((yy + red) shr 16).coerceIn(0, 255)
+        val b = ((yy + blue) shr 16).coerceIn(0, 255)
+        val g = ((yy + green) shr 16).coerceIn(0, 255)
         return (0xff shl 24) or (r shl 16) or (g shl 8) or b
     }
 }

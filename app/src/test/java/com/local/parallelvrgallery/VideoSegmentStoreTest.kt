@@ -36,7 +36,7 @@ class VideoSegmentStoreTest {
         val legacySbs = legacyFile("frame_000002.jpg")
         val marker = legacyFile("000002.complete")
         val store = open()
-        val diagnostic = VideoDepthGeometry(756, 1344, 1280, 720, 1344, 756, inputRotation = 90)
+        val diagnostic = VideoDepthGeometry(756, 1344, 1280, 720, 1344, 756, inputRotation = 90, workingLongEdge = 1280)
         var checked = 0
         store.begin(store.ranges.first()).use { stage ->
             stage.mediaFile.writeText("encoded MP4")

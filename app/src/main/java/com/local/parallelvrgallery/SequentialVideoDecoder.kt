@@ -47,6 +47,12 @@ internal class SequentialVideoDecoder(
     private var outputEnded = false
     private var lastRequested = -1
     private var rotation = 0
+    private val rows = Yuv420ArgbRows()
+    private val outputInfo = MediaCodec.BufferInfo()
+    private var outputFormat: MediaFormat? = null
+    private var conversion: YuvRgb? = null
+    private var conversionStandard = 0
+    private var conversionFullRange = false
     var lastConversionMs: Long = 0L
         private set
     private var inputFormat: MediaFormat
@@ -64,10 +70,10 @@ internal class SequentialVideoDecoder(
             rotation = inputFormat.intOr(MediaFormat.KEY_ROTATION, 0)
             inputFormat.setInteger(MediaFormat.KEY_ROTATION, 0)
             inputFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-            codec = MediaCodec.createDecoderByType(requireNotNull(inputFormat.getString(MediaFormat.KEY_MIME))).also {
-                it.configure(inputFormat, null, null, 0)
-                it.start()
-            }
+            val decoder = MediaCodec.createDecoderByType(requireNotNull(inputFormat.getString(MediaFormat.KEY_MIME)))
+            codec = decoder
+            decoder.configure(inputFormat, null, null, 0)
+            decoder.start()
         } catch (error: Throwable) { close(); throw error }
     }
 
@@ -76,11 +82,12 @@ internal class SequentialVideoDecoder(
         lastRequested = index
         val target = timeline[index]
         val decoder = checkNotNull(codec)
-        val info = MediaCodec.BufferInfo()
+        val info = outputInfo
         var lastProgress = SystemClock.elapsedRealtime()
         while (!outputEnded) {
             checkActive()
             check(SystemClock.elapsedRealtime() - lastProgress < 15_000) { "Video decoder stalled at frame $index" }
+            var submittedInput = false
             if (!inputEnded) {
                 val inputIndex = decoder.dequeueInputBuffer(0)
                 if (inputIndex >= 0) {
@@ -94,10 +101,12 @@ internal class SequentialVideoDecoder(
                         decoder.queueInputBuffer(inputIndex, 0, size, extractor.sampleTime, flags)
                         extractor.advance()
                     }
+                    submittedInput = true
                     lastProgress = SystemClock.elapsedRealtime()
                 }
             }
-            val outputIndex = decoder.dequeueOutputBuffer(info, 10_000)
+            // Feed immediately available compressed samples before waiting for output.
+            val outputIndex = decoder.dequeueOutputBuffer(info, if (submittedInput && !inputEnded) 0 else 10_000)
             if (outputIndex >= 0) {
                 try {
                     outputEnded = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
@@ -107,42 +116,55 @@ internal class SequentialVideoDecoder(
                     }
                 } finally { decoder.releaseOutputBuffer(outputIndex, false) }
                 lastProgress = SystemClock.elapsedRealtime()
+            } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                outputFormat = decoder.outputFormat
+                lastProgress = SystemClock.elapsedRealtime()
             }
         }
         error("Decoder ended before frame $index")
     }
 
     private fun bitmapFromOutput(decoder: MediaCodec, index: Int): Bitmap {
-        val started = SystemClock.elapsedRealtime()
+        val started = SystemClock.uptimeMillis()
         val image = decoder.getOutputImage(index) ?: error("Decoder does not expose YUV output images")
         val bitmap = image.use {
             require(image.format == ImageFormat.YUV_420_888) { "Unsupported decoder image format ${image.format}" }
             val crop = image.cropRect
             val planes = image.planes
-            val format = decoder.outputFormat
+            val format = outputFormat ?: decoder.outputFormat.also { outputFormat = it }
             val standard = format.intOr(MediaFormat.KEY_COLOR_STANDARD, inputFormat.intOr(MediaFormat.KEY_COLOR_STANDARD, if (crop.height() >= 720) 1 else 4))
             val fullRange = format.intOr(MediaFormat.KEY_COLOR_RANGE, inputFormat.intOr(MediaFormat.KEY_COLOR_RANGE, 2)) == MediaFormat.COLOR_RANGE_FULL
-            val conversion = YuvRgb(standard, fullRange)
-            val pixels = IntArray(crop.width() * crop.height())
-            val buffers = planes.map { it.buffer.duplicate() }
-            val starts = buffers.map { it.position() }
-            for (y in 0 until crop.height()) {
-                if (y % 64 == 0) checkActive()
-                val sy = y + crop.top
-                for (x in 0 until crop.width()) {
-                    val sx = x + crop.left
-                    val yy = buffers[0].get(starts[0] + sy * planes[0].rowStride + sx * planes[0].pixelStride).toInt() and 255
-                    val u = buffers[1].get(starts[1] + (sy / 2) * planes[1].rowStride + (sx / 2) * planes[1].pixelStride).toInt() and 255
-                    val v = buffers[2].get(starts[2] + (sy / 2) * planes[2].rowStride + (sx / 2) * planes[2].pixelStride).toInt() and 255
-                    pixels[y * crop.width() + x] = conversion.pixel(yy, u, v)
+            val rgb = conversion?.takeIf { conversionStandard == standard && conversionFullRange == fullRange }
+                ?: YuvRgb(standard, fullRange).also {
+                    conversionStandard = standard
+                    conversionFullRange = fullRange
+                    conversion = it
                 }
+            val width = crop.width()
+            val height = crop.height()
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            try {
+                fun rowPlane(index: Int) = planes[index].let { Yuv420ArgbRows.Plane(it.buffer, it.rowStride, it.pixelStride) }
+                rows.convert(width, height, crop.left, crop.top, rowPlane(0), rowPlane(1), rowPlane(2), rgb, checkActive) { pixels, top, count ->
+                    bitmap.setPixels(pixels, 0, width, 0, top, width, count)
+                }
+                bitmap
+            } catch (error: Throwable) {
+                bitmap.recycle()
+                throw error
             }
-            Bitmap.createBitmap(pixels, crop.width(), crop.height(), Bitmap.Config.ARGB_8888)
         }
-        if (rotation == 0) return bitmap.also { lastConversionMs = SystemClock.elapsedRealtime() - started }
-        return try {
-            Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, Matrix().apply { postRotate(rotation.toFloat()) }, true)
-        } finally { bitmap.recycle(); lastConversionMs = SystemClock.elapsedRealtime() - started }
+        val oriented = try {
+            if (rotation == 0) bitmap else Bitmap.createBitmap(
+                bitmap, 0, 0, bitmap.width, bitmap.height, Matrix().apply { postRotate(rotation.toFloat()) }, true,
+            )
+        } catch (error: Throwable) {
+            bitmap.recycle()
+            throw error
+        }
+        if (oriented !== bitmap) bitmap.recycle()
+        lastConversionMs = SystemClock.uptimeMillis() - started
+        return oriented
     }
 
     override fun close() {

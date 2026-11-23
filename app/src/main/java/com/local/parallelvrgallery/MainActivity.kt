@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.Activity
 import android.app.Application
 import android.app.Service
+import android.content.ActivityNotFoundException
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
@@ -48,6 +49,7 @@ import android.view.MotionEvent
 import android.view.Surface
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import android.widget.Toast
 import android.widget.VideoView
 import android.opengl.GLSurfaceView
 import androidx.activity.result.IntentSenderRequest
@@ -688,7 +690,8 @@ data class VideoPipelineStats(
 )
 
 data class VideoFrameTimings(
-    val decodeMs: Long = 0L,
+    val frameRead: VideoFrameReadTiming? = null,
+    val cacheLookupMs: Long = 0L,
     val depthMs: Long = 0L,
     val temporalMs: Long = 0L,
     val depthPostMs: Long = 0L,
@@ -699,8 +702,9 @@ data class VideoFrameTimings(
     val inputTransformNanos: Long = 0L,
     val depthRotationNanos: Long = 0L,
 ) {
+    val decodeMs: Long get() = frameRead?.decodeMs ?: 0L
     val totalMs: Long
-        get() = decodeMs + depthMs + temporalMs + depthPostMs + sbsMs + cacheWriteMs + encodeMs
+        get() = decodeMs + (frameRead?.probeMs ?: 0L) + cacheLookupMs + depthMs + temporalMs + depthPostMs + sbsMs + cacheWriteMs + encodeMs
 }
 
 data class GenerationTimings(
@@ -3015,7 +3019,7 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
                 modelThreads = vrParams.modelThreads,
                 depthWorkers = effectiveDepthWorkers,
                 useGpu = vrParams.useGpu,
-                runtimeInfo = lastRuntimeInfo, runToken = next.runToken)
+                runtimeInfo = lastRuntimeInfo, runToken = next.runToken, resetFrameDiagnostics = true)
             videoNotifier.show(next.item, 0, 0, indeterminate = true, status = "准备生成")
         }) return
         val started = SystemClock.uptimeMillis()
@@ -3125,13 +3129,16 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
                     upsertVideoJob(next.item, VideoVrState.PAUSED, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, runToken = next.runToken)
                     addLog("video paused ${next.item.displayName}")
                 } else {
+                    val failure = if (error is OutOfMemoryError) {
+                        "视频生成内存不足。已完成片段保留，释放内存后可重试 / Out of memory. Completed segments were kept. Free memory and retry."
+                    } else error.message
                     _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.FAILED), modelProgress = null) }
                     backgroundRuns.revoke(setOf(next.item.cacheKey))
                     videoQueueTags.upsert(next.item.cacheKey, VideoVrState.FAILED, next.params)
                     synchronized(pausedVideoParams) { activeVideoParams.remove(next.item.cacheKey) }
-                    upsertVideoJob(next.item, VideoVrState.FAILED, 1f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis(), error = error.message, runToken = next.runToken)
-                    videoNotifier.failed(next.item, error.message ?: "生成失败")
-                    addLog("video failed ${next.item.displayName}: ${error.message}")
+                    upsertVideoJob(next.item, VideoVrState.FAILED, 1f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = effectiveDepthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis(), error = failure, runToken = next.runToken)
+                    videoNotifier.failed(next.item, failure ?: "生成失败")
+                    addLog("video failed ${next.item.displayName}: $failure")
                 }
             }
         }
@@ -3410,12 +3417,15 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         frameTimings: VideoFrameTimings? = null,
         pipelineStats: VideoPipelineStats = VideoPipelineStats(),
         runToken: Long? = null,
+        resetFrameDiagnostics: Boolean = false,
     ): Unit = synchronized(videoControlLock) {
         if (runToken != null && !isCurrentVideoRun(item.cacheKey, runToken)) return@synchronized
         _uiState.update { current ->
             val previous = current.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }
             val existing = current.videoJobs.filterNot { it.item.cacheKey == item.cacheKey }
-            val previousTimings = previous?.takeIf { cacheVersion.isBlank() || it.cacheVersion == cacheVersion }?.frameTimings
+            val previousTimings = previous?.takeIf {
+                !resetFrameDiagnostics && (cacheVersion.isBlank() || it.cacheVersion == cacheVersion)
+            }?.frameTimings
             val job = VideoVrJob(
                 item = item,
                 state = state,
@@ -3438,7 +3448,10 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
                 finishedAt = finishedAt,
                 error = error,
                 frameTimings = frameTimings?.withPreviousFrame(previousTimings) ?: previousTimings ?: VideoFrameTimings(),
-                pipelineStats = if (pipelineStats != VideoPipelineStats()) pipelineStats else previous?.pipelineStats ?: VideoPipelineStats(),
+                pipelineStats = when {
+                    resetFrameDiagnostics || pipelineStats != VideoPipelineStats() -> pipelineStats
+                    else -> previous?.pipelineStats ?: VideoPipelineStats()
+                },
             )
             current.copy(
                 videoStates = current.videoStates + (item.cacheKey to state),
@@ -4963,18 +4976,19 @@ private class VrGenerator @JvmOverloads constructor(
         depthSession: DepthModelSession,
         temporalSmoother: DepthTemporalSmoother,
         orientation: QnnVideoOrientation? = null,
+        workingLongEdge: Int = videoWorkingLongEdge(source, params),
     ): VideoSbsResult {
-        val depth = generateVideoDepth(source, params, depthSession, orientation)
+        val depth = generateVideoDepth(source, depthSession, orientation, workingLongEdge)
         return finishVideoSbs(depth, params, temporalSmoother)
     }
 
     fun generateVideoDepth(
         source: Bitmap,
-        params: VrGenerationParams,
         depthSession: DepthModelSession,
-        orientation: QnnVideoOrientation? = null,
+        orientation: QnnVideoOrientation?,
+        workingLongEdge: Int,
     ): VideoDepthResult {
-        val working = resizeVideoSource(source, params)
+        val working = resizeVideoSource(source, workingLongEdge)
         val depthStart = SystemClock.uptimeMillis()
         val inference = try {
             if (orientation == null) depthSession.infer(working)
@@ -4987,18 +5001,19 @@ private class VrGenerator @JvmOverloads constructor(
         return videoDepthResult(working, inference, depthMs)
     }
 
-    private fun resizeVideoSource(source: Bitmap, params: VrGenerationParams): Bitmap {
-        val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge,
-            if (params.matchV10Default) DepthEdgeMode.COMFY_LEGACY_V10 else params.edgeMode)
-        val longEdge = max(source.width, source.height)
-        if (longEdge <= safeMaxLongEdge) return source
-        val scale = safeMaxLongEdge.toFloat() / longEdge
-        return Bitmap.createScaledBitmap(source, max(1, (source.width * scale).roundToInt()),
-            max(1, (source.height * scale).roundToInt()), true)
+    fun videoWorkingLongEdge(source: Bitmap, params: VrGenerationParams): Int {
+        val edgeMode = if (params.matchV10Default) DepthEdgeMode.COMFY_LEGACY_V10 else params.edgeMode
+        return minOf(maxOf(source.width, source.height), memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge, edgeMode))
     }
 
-    fun prepareRotatedVideoInput(source: Bitmap, params: VrGenerationParams, geometry: QnnInputGeometry): Pair<Bitmap, Bitmap> {
-        val working = resizeVideoSource(source, params)
+    private fun resizeVideoSource(source: Bitmap, workingLongEdge: Int): Bitmap {
+        val (width, height) = fitVideoWorkingFrame(source.width, source.height, workingLongEdge)
+        if (source.width == width && source.height == height) return source
+        return Bitmap.createScaledBitmap(source, width, height, true)
+    }
+
+    fun prepareRotatedVideoInput(source: Bitmap, geometry: QnnInputGeometry, workingLongEdge: Int): Pair<Bitmap, Bitmap> {
+        val working = resizeVideoSource(source, workingLongEdge)
         return try {
             working to transformQnnInput(working, geometry)
         } catch (error: Throwable) {
@@ -5191,18 +5206,9 @@ private class VrGenerator @JvmOverloads constructor(
     }
 
     private fun memorySafeMaxLongEdge(width: Int, height: Int, requested: Int, mode: DepthEdgeMode): Int {
-        val longEdge = max(width, height).takeIf { it > 0 } ?: requested
-        val shortEdge = min(width, height).takeIf { it > 0 } ?: longEdge
-        val ratio = shortEdge.toFloat() / longEdge.toFloat()
         val heap = Runtime.getRuntime()
         val heapAvailable = heap.maxMemory() - (heap.totalMemory() - heap.freeMemory())
-        val budget = min(160L * 1024L * 1024L, max(48L * 1024L * 1024L, (heapAvailable * 55L) / 100L))
-        val bytesPerSourcePixel = when { mode.isComfyMain || mode == DepthEdgeMode.REFERENCE_V9 -> 64f; mode == DepthEdgeMode.REFERENCE_V8 -> 48f; else -> 18f }
-        val requestedPixels = requested.toFloat() * requested.toFloat() * ratio
-        val requestedBytes = requestedPixels * bytesPerSourcePixel
-        if (requestedBytes <= budget) return requested
-        val safe = sqrt(budget.toDouble() / (ratio.toDouble() * bytesPerSourcePixel.toDouble())).roundToInt()
-        return safe.coerceIn(768, requested)
+        return memorySafeStereoLongEdge(width, height, requested, mode, heapAvailable)
     }
 
     private fun runDepthModel(
@@ -5735,6 +5741,7 @@ private data class VideoFramePlan(
     val metadataFrameCount: Int?,
     val captureFps: Int?,
     val sourceBitrate: Int?,
+    val decodedBitmapBytes: Long,
 )
 
 class DepthTemporalSmoother(
@@ -5862,6 +5869,10 @@ private class VideoVrGenerator(
             val completed = store?.recover()?.toMutableList() ?: mutableListOf()
             var width = 0
             var height = 0
+            var workingLongEdge = completed.lastOrNull()?.geometry?.workingLongEdge ?: completed.firstOrNull()?.let { first ->
+                recoverVideoWorkingLongEdge(first.width, first.height, first.geometry, vrParams.edgeMode.isComfyMain)
+            }
+            var decodedBitmapBytes = framePlan.decodedBitmapBytes
             val temporalSmoother = DepthTemporalSmoother()
             completed.lastOrNull()?.let { last ->
                 width = last.width
@@ -5874,12 +5885,15 @@ private class VideoVrGenerator(
             }.use { depthSession ->
                 fun encodeRange(target: File, segment: VideoSegmentStore.Range? = null): VideoDepthGeometry? {
                     val firstIndex = segment?.startFrame ?: 0
-                    var firstTimings = VideoFrameTimings()
+                    val firstLoadStarted = SystemClock.uptimeMillis()
                     val cachedFirst = if (segment != null) null else readCachedStereoFrame(framesDir, firstIndex, previousFramesDirs)?.also {
                         onRuntimeInfo("frame cache hit frame=0 version=$version")
                     }
+                    val firstCacheLookupMs = if (segment == null) SystemClock.uptimeMillis() - firstLoadStarted else 0L
+                    var firstTimings = VideoFrameTimings(cacheLookupMs = firstCacheLookupMs)
                     val firstEyes = cachedFirst ?: run {
-                        val first = reader.frameAt(firstIndex)
+                        val read = reader.frameAt(firstIndex)
+                        val first = read.bitmap
                         var ownedEyes: StereoBitmapPair? = null
                         var firstSource: Bitmap? = null
                         try {
@@ -5888,6 +5902,7 @@ private class VideoVrGenerator(
                             } else {
                                 first.copy(Bitmap.Config.ARGB_8888, false)
                             }.also { firstSource = it }
+                            decodedBitmapBytes = maxOf(decodedBitmapBytes, source.allocationByteCount.toLong())
                             if (portraitPair != null && orientationFile != null && orientation == null) {
                                 val input = QnnInputGeometry.forSource(portraitPair.size, source.width, source.height, portraitPair.aspect)
                                 checkActive()
@@ -5904,8 +5919,10 @@ private class VideoVrGenerator(
                             orientation?.let {
                                 mark("qnn video rotation=${it.inferenceInput.rotation} nativeLandscape=${it.useNativeLandscape} input=${it.inferenceInput.tensorWidth}x${it.inferenceInput.tensorHeight}")
                             }
-                            val generated = frameGenerator.generateVideoSbsBitmap(source, vrParams, depthSession.get().value, temporalSmoother, orientation)
-                            firstTimings = generated.timings
+                            val session = depthSession.get().value
+                            val limit = workingLongEdge ?: frameGenerator.videoWorkingLongEdge(source, vrParams).also { workingLongEdge = it }
+                            val generated = frameGenerator.generateVideoSbsBitmap(source, vrParams, session, temporalSmoother, orientation, limit)
+                            firstTimings = generated.timings.copy(frameRead = read.timing, cacheLookupMs = firstCacheLookupMs)
                             try {
                                 if (segment == null) writeStereoFrameCache(framesDir, firstIndex, generated.eyes)
                             } catch (error: Throwable) {
@@ -5923,8 +5940,9 @@ private class VideoVrGenerator(
                         width = even(firstEyes.sbsWidth)
                         height = even(firstEyes.height)
                     }
+                    val limit = workingLongEdge ?: maxOf(firstEyes.left.width, firstEyes.left.height).also { workingLongEdge = it }
                     try {
-                        mark("first frame index=$firstIndex eyes=${firstEyes.left.width}x${firstEyes.left.height} encode=${width}x${height} cached=${cachedFirst != null}")
+                        mark("first frame index=$firstIndex eyes=${firstEyes.left.width}x${firstEyes.left.height} encode=${width}x${height} cached=${cachedFirst != null} workingLongEdge=$limit")
                     } catch (error: Throwable) {
                         firstEyes.recycle()
                         throw error
@@ -5937,6 +5955,7 @@ private class VideoVrGenerator(
                         firstEyes = firstEyes,
                         firstCacheHit = cachedFirst != null,
                         firstTimings = firstTimings,
+                        firstLoadStarted = firstLoadStarted,
                         framesDir = framesDir,
                         fallbackFramesDirs = previousFramesDirs,
                         output = target,
@@ -5948,6 +5967,8 @@ private class VideoVrGenerator(
                         version = version,
                         params = vrParams,
                         videoParams = params,
+                        workingLongEdge = limit,
+                        decodedBitmapBytes = decodedBitmapBytes,
                         depthSession = depthSession,
                         orientation = orientation,
                         temporalSmoother = temporalSmoother,
@@ -6064,6 +6085,8 @@ private class VideoVrGenerator(
             metadataFrameCount = metadataFrameCount,
             captureFps = captureFps,
             sourceBitrate = sourceBitrate,
+            decodedBitmapBytes = 4L * track.format.getInteger(MediaFormat.KEY_WIDTH, 0).coerceAtLeast(0) *
+                track.format.getInteger(MediaFormat.KEY_HEIGHT, 0).coerceAtLeast(0),
         )
     }
 
@@ -6089,6 +6112,7 @@ private class VideoVrGenerator(
         firstEyes: StereoBitmapPair,
         firstCacheHit: Boolean,
         firstTimings: VideoFrameTimings,
+        firstLoadStarted: Long,
         framesDir: File,
         fallbackFramesDirs: List<File>,
         output: File,
@@ -6100,6 +6124,8 @@ private class VideoVrGenerator(
         version: String,
         params: VrGenerationParams,
         videoParams: VideoGenerationParams,
+        workingLongEdge: Int,
+        decodedBitmapBytes: Long,
         depthSession: DeferredResource<IdleResourcePool.Borrowed<DepthModelSession>>,
         orientation: QnnVideoOrientation?,
         temporalSmoother: DepthTemporalSmoother,
@@ -6201,9 +6227,7 @@ private class VideoVrGenerator(
                 var eyes: StereoBitmapPair? = null,
                 var timings: VideoFrameTimings = VideoFrameTimings(),
                 var cacheHit: Boolean = false,
-                var startedAt: Long = 0L,
-                var decodedAt: Long = 0L,
-                var generatedLatencyMs: Long = 0L,
+                var loadStartedAt: Long = 0L,
             )
             val available = Runtime.getRuntime().let { it.maxMemory() - (it.totalMemory() - it.freeMemory()) }
             val systemMemory = android.app.ActivityManager.MemoryInfo().also {
@@ -6213,7 +6237,8 @@ private class VideoVrGenerator(
             val pairBytes = firstEyes.left.allocationByteCount.toLong() + firstEyes.right.allocationByteCount
             val rotatedInput = orientation?.inferenceInput?.takeIf { it.rotation == 90 }
             val modelBytes = rotatedInput?.let { 4L * it.tensorWidth * it.tensorHeight } ?: 0L
-            val inFlightLimit = (memoryBudget / (pairBytes * 2 + modelBytes * 2).coerceAtLeast(1))
+            val unscaledDecodeBytes = (decodedBitmapBytes - firstEyes.left.allocationByteCount).coerceAtLeast(0L)
+            val inFlightLimit = (memoryBudget / (pairBytes * 2 + modelBytes * 2 + unscaledDecodeBytes).coerceAtLeast(1))
                 .coerceIn(1L, if (rotatedInput == null) 4L else 12L).toInt()
             val cacheHits = AtomicInteger(if (firstCacheHit) 1 else 0)
             val depthWorkerCount = if (params.useGpu) 1 else videoParams.depthWorkers.coerceIn(1, 2)
@@ -6242,7 +6267,10 @@ private class VideoVrGenerator(
                 val firstPts = segment?.let { framePlan.timeline[it.startFrame] } ?: 0L
                 activeRenderer.drawStereo(eyes.left, eyes.right, framePlan.timeline[data.index] - firstPts)
                 drain(end = false)
-                val timings = data.timings.copy(encodeMs = SystemClock.uptimeMillis() - encodeStart)
+                val timings = data.timings.copy(
+                    encodeMs = SystemClock.uptimeMillis() - encodeStart,
+                    depthGeometry = data.timings.depthGeometry?.copy(workingLongEdge = workingLongEdge),
+                )
                 if (data.index > 0 && !data.cacheHit && rotatedInput != null) {
                     rotationFrames++
                     inputTransformNanos += timings.inputTransformNanos
@@ -6266,11 +6294,12 @@ private class VideoVrGenerator(
                 val rotationWorkMs = if (data.index > 0 && rotatedInput != null)
                     (timings.inputTransformNanos + timings.depthRotationNanos) / 1_000_000L else 0L
                 val activeMs = timings.depthMs + timings.temporalMs + timings.depthPostMs + timings.sbsMs + rotationWorkMs
-                val latency = if (data.decodedAt > 0L) now - data.decodedAt else 0L
+                val latency = now - data.loadStartedAt
                 val metrics = VideoFrameMetrics(
                     throughputMs = throughput, latencyMs = latency,
-                    queueWaitMs = (latency - activeMs - timings.decodeMs - timings.encodeMs).coerceAtLeast(0L),
-                    cacheHitReadMs = if (data.cacheHit) timings.decodeMs else 0L, cacheHit = data.cacheHit,
+                    queueWaitMs = (latency - activeMs - timings.decodeMs - timings.cacheLookupMs -
+                        (timings.frameRead?.probeMs ?: 0L) - timings.encodeMs).coerceAtLeast(0L),
+                    cacheHitReadMs = if (data.cacheHit) timings.cacheLookupMs else 0L, cacheHit = data.cacheHit,
                 )
                 val stats = VideoPipelineStats(
                     decodeQueue = pipeline.decoded, depthQueue = pipeline.depths, generatedQueue = pipeline.generated,
@@ -6289,12 +6318,16 @@ private class VideoVrGenerator(
                     load = { index ->
                         val data = PipelineFrame(index)
                         try {
-                            val started = SystemClock.uptimeMillis()
-                            data.decodedAt = started
+                            data.loadStartedAt = SystemClock.uptimeMillis()
                             if (segment == null) data.eyes = readCachedStereoFrame(framesDir, index, fallbackFramesDirs)
+                            val cacheLookupMs = if (segment == null) SystemClock.uptimeMillis() - data.loadStartedAt else 0L
                             data.cacheHit = data.eyes != null
-                            if (!data.cacheHit) data.source = reader.frameAt(index) else cacheHits.incrementAndGet()
-                            data.timings = VideoFrameTimings(decodeMs = SystemClock.uptimeMillis() - started)
+                            val read = if (data.cacheHit) {
+                                cacheHits.incrementAndGet()
+                                null
+                            } else reader.frameAt(index)
+                            data.source = read?.bitmap
+                            data.timings = VideoFrameTimings(frameRead = read?.timing, cacheLookupMs = cacheLookupMs)
                             data
                         } catch (error: Throwable) { releaseFrame(data); throw error }
                     },
@@ -6303,10 +6336,9 @@ private class VideoVrGenerator(
                             val session = if (worker == 0 || orientation != null) depthSession.get().value else synchronized(extraSessions) {
                                 extraSessions.getOrPut(worker) { frameGenerator.openDepthSession(params, onModelProgress, onRuntimeInfo) }
                             }
-                            if (data.startedAt == 0L) data.startedAt = SystemClock.uptimeMillis()
                             val source = requireNotNull(data.source)
                             if (rotatedInput == null) {
-                                data.depth = frameGenerator.generateVideoDepth(source, params, session, orientation)
+                                data.depth = frameGenerator.generateVideoDepth(source, session, orientation, workingLongEdge)
                             } else {
                                 val tensor = requireNotNull(data.tensor)
                                 try {
@@ -6325,8 +6357,7 @@ private class VideoVrGenerator(
                             data.source?.let { if (it !== result.eyes.left && it !== result.eyes.right && !it.isRecycled) it.recycle() }
                             data.source = null
                             data.depth = null
-                            data.timings = result.timings.copy(decodeMs = data.timings.decodeMs)
-                            data.generatedLatencyMs = SystemClock.uptimeMillis() - data.startedAt
+                            data.timings = result.timings.copy(frameRead = data.timings.frameRead, cacheLookupMs = data.timings.cacheLookupMs)
                         }
                         !data.cacheHit && segment == null
                     },
@@ -6334,15 +6365,18 @@ private class VideoVrGenerator(
                     encode = ::encodeFrame,
                     dispose = ::releaseFrame,
                     beforeConsume = {
-                        encodeFrame(PipelineFrame(segment?.startFrame ?: 0, eyes = firstEyes, cacheHit = firstCacheHit, timings = firstTimings), FramePipelineStats(0, 0, 0, 0, 0))
+                        encodeFrame(
+                            PipelineFrame(segment?.startFrame ?: 0, eyes = firstEyes, cacheHit = firstCacheHit,
+                                timings = firstTimings, loadStartedAt = firstLoadStarted),
+                            FramePipelineStats(0, 0, 0, 0, 0),
+                        )
                     },
                     prepareInput = rotatedInput?.let { geometry ->
                         { data ->
                             if (!data.cacheHit) {
                                 val source = requireNotNull(data.source)
-                                data.startedAt = SystemClock.uptimeMillis()
                                 val started = System.nanoTime()
-                                val (working, tensor) = frameGenerator.prepareRotatedVideoInput(source, params, geometry)
+                                val (working, tensor) = frameGenerator.prepareRotatedVideoInput(source, geometry, workingLongEdge)
                                 data.inputTransformNanos = System.nanoTime() - started
                                 data.source = working
                                 data.tensor = tensor
@@ -8433,6 +8467,13 @@ private fun SettingsScreen(
                             OutlinedButton(onClick = onCheckUpdate, enabled = !updateDownloading) { Text(lang.t("检查更新", "Check for updates")) }
                             if (updateAvailable && updateApkPath == null && !updateDownloading && updateUrl != null) Button(onClick = onDownloadUpdate) { Text(lang.t("下载更新", "Download update")) }
                             if (updateApkPath != null && !updateDownloading) Button(onClick = onInstallUpdate) { Text(lang.t("安装更新", "Install update")) }
+                            TextButton(onClick = {
+                                try {
+                                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/$GITHUB_REPO")))
+                                } catch (_: ActivityNotFoundException) {
+                                    Toast.makeText(context, lang.t("没有可打开 GitHub 链接的应用", "No app can open the GitHub link"), Toast.LENGTH_SHORT).show()
+                                }
+                            }) { Text(lang.t("GitHub 项目", "GitHub project")) }
                         }
                         SettingHelp(lang.t("覆盖更新会保留原有媒体、设置与生成结果；不要卸载旧版。", "Update in place to keep media, settings and generated results. Do not uninstall."))
                     }
@@ -9211,7 +9252,7 @@ private fun DebugScreen(
                     DebugLine(lang.t("吞吐间隔", "Throughput interval"), "${videoJob?.currentFrameMs ?: 0}ms")
                     DebugLine(lang.t("平均吞吐", "Avg throughput"), "${videoJob?.avgFrameMs ?: 0}ms")
                     DebugLine(lang.t("端到端延迟", "Frame latency"), "${videoJob?.frameLatencyMs ?: 0}ms")
-                    DebugLine(lang.t("队列等待", "Queue wait"), "${videoJob?.queueWaitMs ?: 0}ms")
+                    DebugLine(lang.t("其余耗时（估算）", "Other latency (estimated)"), "${videoJob?.queueWaitMs ?: 0}ms")
                     DebugLine(lang.t("缓存命中读取", "Cache-hit read"), "${videoJob?.cacheHitReadMs ?: 0}ms")
                     val pipeline = videoJob?.pipelineStats ?: VideoPipelineStats()
                     val timings = videoJob?.frameTimings ?: VideoFrameTimings()
@@ -9225,18 +9266,34 @@ private fun DebugScreen(
                     DebugLine(lang.t("等待编码", "Encode waiting"), "${pipeline.waitingFrames}")
                     DebugLine(lang.t("缓存命中", "Cache hits"), "${pipeline.cacheHits}")
                     DebugLine(lang.t("后台写入队列", "Cache write queue"), "${pipeline.cacheWriteQueue}")
-                    DebugLine(lang.t("取帧", "Decode"), "${timings.decodeMs}ms")
+                    val frameRead = timings.frameRead
+                    val decodeLabel = when (frameRead?.backend) {
+                        VideoDecodeBackend.MEDIACODEC -> "MediaCodec"
+                        VideoDecodeBackend.ANDROID_RETRIEVER -> lang.t("Android 兼容", "Android compatibility")
+                        null -> null
+                    }
+                    DebugLine(lang.t("取帧", "Decode"), decodeLabel?.let { "${timings.decodeMs}ms · $it" } ?: "-")
+                    if (frameRead?.backend == VideoDecodeBackend.MEDIACODEC) {
+                        DebugLine(lang.t("解码器 / YUV 转 RGB", "Codec / YUV to RGB"), "${frameRead.decoderMs} / ${frameRead.conversionMs}ms")
+                    }
+                    if (frameRead != null && frameRead.probeMs > 0L) {
+                        DebugLine(lang.t("解码探测", "Decoder probe"), "${frameRead.probeMs}ms")
+                    }
+                    if (frameRead != null && timings.cacheLookupMs > 0L) {
+                        DebugLine(lang.t("逐帧缓存检查", "Frame cache lookup"), "${timings.cacheLookupMs}ms")
+                    }
                     DebugLine(lang.t("深度推理", "Depth"), "${timings.depthMs}ms")
                     DebugLine(lang.t("时序平滑", "Temporal"), "${timings.temporalMs}ms")
                     DebugLine(lang.t("深度后处理", "Depth post"), "${timings.depthPostMs}ms")
                     val recordedEntry = videoEntry?.takeIf { videoJob?.cacheVersion.isNullOrBlank() || it.cacheVersion == videoJob?.cacheVersion }
-                    val geometry = timings.depthGeometry ?: recordedEntry?.depthGeometry
+                    val geometry = timings.depthGeometry ?: recordedEntry?.takeUnless { videoState == VideoVrState.GENERATING }?.depthGeometry
                     DebugLine(lang.t("模型原生深度", "Native model depth"), geometry?.let { "${it.modelWidth}×${it.modelHeight}" } ?: "-")
                     if (geometry != null && (geometry.inputRotation != 0 || geometry.contentWidth != geometry.modelWidth || geometry.contentHeight != geometry.modelHeight)) {
                         val label = if (geometry.inputRotation == 90) lang.t("转回后深度", "Upright depth") else lang.t("裁回后深度", "Cropped depth")
                         DebugLine(label, "${geometry.contentWidth}×${geometry.contentHeight}")
                     }
-                    DebugLine(lang.t("后处理深度", "Prepared depth"), geometry?.let { "${it.preparedWidth}×${it.preparedHeight}" } ?: "-")
+                    DebugLine(lang.t("后处理深度（最近实测）", "Prepared depth (last measured)"), geometry?.let { "${it.preparedWidth}×${it.preparedHeight}" } ?: "-")
+                    geometry?.workingLongEdge?.let { DebugLine(lang.t("该任务单眼长边上限", "Job working eye limit"), "$it px") }
                     DebugLine(lang.t("SBS 成品尺寸", "SBS output size"), recordedEntry?.let { "${it.width}×${it.height}" } ?: "-")
                     DebugLine("SBS", "${timings.sbsMs}ms")
                     DebugLine(lang.t("最近后台写入", "Last async cache write"), "${pipeline.lastCacheWriteMs}ms")

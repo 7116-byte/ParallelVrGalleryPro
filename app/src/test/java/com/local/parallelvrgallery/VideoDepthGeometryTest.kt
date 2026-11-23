@@ -1,6 +1,7 @@
 package com.local.parallelvrgallerypro
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertArrayEquals
 import org.junit.Test
@@ -19,7 +20,7 @@ class VideoDepthGeometryTest {
 
     @Test fun cachedFramesRetainObservedGeometryWithoutCopyingTheInferenceTime() {
         val fresh = VideoFrameTimings(depthMs = 80, depthGeometry = VideoDepthGeometry(1036, 1036, 1280, 720))
-        val cacheHit = VideoFrameTimings(decodeMs = 4, encodeMs = 8)
+        val cacheHit = VideoFrameTimings(cacheLookupMs = 4, encodeMs = 8)
         val display = cacheHit.withPreviousFrame(fresh)
         assertEquals(fresh.depthGeometry, display.depthGeometry)
         assertEquals(0L, display.depthMs)
@@ -54,6 +55,31 @@ class VideoDepthGeometryTest {
         assertNull(VideoDepthGeometry.read(metadata + ("depthContentHeight" to "757")))
         assertNull(VideoDepthGeometry.read(metadata + ("modelInputRotation" to "180")))
         assertNull(VideoDepthGeometry.read(metadata + ("modelInputRotation" to "invalid")))
+    }
+
+    @Test fun largeVideoKeepsTheSameWorkingFrameAfterHeapPressureOrSegmentResume() {
+        val mode = DepthEdgeMode.COMFY_LEGACY_V10
+        val chosen = memorySafeStereoLongEdge(3840, 2160, 6000, mode, 256L * 1024 * 1024)
+        val atHigherPressure = memorySafeStereoLongEdge(3840, 2160, 6000, mode, 64L * 1024 * 1024)
+        val (width, height) = fitVideoWorkingFrame(3840, 2160, chosen)
+        assertNotEquals(width to height, fitVideoWorkingFrame(3840, 2160, atHigherPressure))
+        val saved = VideoDepthGeometry(518, 518, width, height, workingLongEdge = chosen)
+
+        val metadata = saved.metadataLines().associate { it.substringBefore('=') to it.substringAfter('=') }
+        val resumed = recoverVideoWorkingLongEdge(width * 2, height / 2 * 2, VideoDepthGeometry.read(metadata), true)
+        assertEquals(chosen, resumed)
+        assertEquals(width to height, fitVideoWorkingFrame(3840, 2160, resumed))
+        assertEquals(height to width, fitVideoWorkingFrame(2160, 3840, resumed))
+        assertEquals(1280 to 720, fitVideoWorkingFrame(1280, 720, resumed))
+        assertNull(VideoDepthGeometry.read(metadata + ("videoWorkingLongEdge" to "0")))
+    }
+
+    @Test fun oldSegmentsRecoverTheTrackBoundsOrMatchingComfyMeasurement() {
+        val matching = VideoDepthGeometry(518, 518, 723, 1285)
+        assertEquals(1285, recoverVideoWorkingLongEdge(1446, 1284, matching, true))
+        assertEquals(1284, recoverVideoWorkingLongEdge(1446, 1284, matching, false))
+        assertEquals(1284, recoverVideoWorkingLongEdge(1446, 1284, matching.copy(preparedWidth = 724), true))
+        assertEquals(1280, recoverVideoWorkingLongEdge(2560, 720, null, true))
     }
 
     @Test fun equalPixelCountsDoNotMixTemporalDepthAcrossOrientationChanges() {

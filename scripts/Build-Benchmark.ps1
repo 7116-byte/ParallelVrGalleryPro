@@ -27,7 +27,7 @@ try {
     $tools=Join-Path $env:ANDROID_SDK_ROOT 'build-tools/35.0.0'
     $metadata=& "$tools/aapt.exe" dump badging $apk
     if($LASTEXITCODE -ne 0 -or ($metadata | Select-String '^application-debuggable')){throw 'Benchmark must be non-debuggable'}
-    if(!($metadata | Select-String "^package: name='com.local.parallelvrgallerypro'")){throw 'Unexpected benchmark package'}
+    if(!($metadata | Select-String "^package: name='com\.local\.parallelvrgallerypro\.benchmark'")){throw 'Unexpected benchmark package'}
     $tree=& "$tools/aapt.exe" dump xmltree $apk AndroidManifest.xml
     if($LASTEXITCODE -ne 0 -or !($tree | Select-String 'E: instrumentation ')){throw 'Explicit QA instrumentation missing'}
     $cert=& "$tools/apksigner.bat" verify --print-certs $apk
