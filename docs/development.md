@@ -56,6 +56,8 @@ APK 内置 Depth Anything V2 Small 的 FP16 ONNX 和保留末端三层卷积为 
 
 GitHub Release 使用 `app-debug.apk` 和 `app-debug.apk.sha256`。更新器按数字段比较版本，安装前校验应用包名、原发布证书和递增的 `versionCode`。公开下载的文件大小、SHA-256 和签名与本地验收 APK 同时核对。凭证、签名材料和私人媒体均留在本地。
 
+公开发布完成时，核对 `main` 上的源码、对应的 `v{versionName}` 标签，以及 `releases/latest` 返回的稳定版和 APK 资产。确认后把构建、公开下载和设备验收结果写到对应的版本记录。
+
 Debug 入口和 `scripts/Build-Benchmark.ps1` 构建的独立 APK 只用于显式授权的测试副本。性能对照使用相同素材、参数和尺寸，分别记录冷会话、已就绪会话与结果缓存；照片或视频的真实生成时间按完整任务计算。构建、真机、CI、公开下载及 App 内升级分别标记。设备验收只覆盖安装，保留数据、偏好与原有任务。
 
 ## 历史技术记录
