@@ -2897,7 +2897,7 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         try { backgroundRuns.authorize(selected.mapTo(linkedSetOf()) { it.cacheKey }) }
         catch (error: Exception) { _uiState.update { it.copy(message = "无法保存任务状态，未开始生成 / Cannot persist work: ${error.message}") }; return }
         selected.forEach { enqueueVideo(it, authorize = false) }
-        _uiState.update { it.copy(message = "已开始所选 ${selected.size} 项未完成视频；已完成项跳过 / Started selected unfinished videos") }
+        _uiState.update { it.copy(message = "已请求开始 ${selected.size} 项视频，已完成项跳过 / Start requested for ${selected.size} videos. Completed videos skipped.") }
     }
 
     fun pauseVideos(indexes: List<Int>) {
@@ -2906,7 +2906,7 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
             it.kind == MediaKind.VIDEO && VideoCommandPolicy.canPause(state.videoStates[it.cacheKey] ?: VideoVrState.NORMAL)
         }.mapTo(linkedSetOf()) { it.cacheKey }
         pauseVideosByKey(keys, "USER")
-        _uiState.update { it.copy(message = "已暂停所选 ${keys.size} 项视频；保留参数和已完成帧 / Selected videos paused; parameters and completed frames retained") }
+        _uiState.update { it.copy(message = "已暂停 ${keys.size} 项视频，保留参数和已完成帧 / Paused ${keys.size} videos and kept their parameters and completed frames.") }
     }
 
     private fun enqueueVideo(item: GalleryItem, force: Boolean = false, authorize: Boolean = true) = synchronized(videoControlLock) {
@@ -6923,10 +6923,18 @@ private data class GeneratedSelectionActionsState(
     val onDelete: () -> Unit,
     val onGenerate: (() -> Unit)? = null,
     val imageReplacement: Boolean = false,
-    val onStart: (() -> Unit)? = null,
-    val onPause: (() -> Unit)? = null,
-    val startCount: Int = 0,
-    val pauseCount: Int = 0,
+    val videoActions: VideoSelectionActions? = null,
+)
+
+private data class VideoSelectionActions(
+    val onStartSelected: () -> Unit,
+    val onPauseSelected: () -> Unit,
+    val onStartAll: () -> Unit,
+    val onPauseAll: () -> Unit,
+    val selectedStartCount: Int,
+    val selectedPauseCount: Int,
+    val allStartCount: Int,
+    val allPauseCount: Int,
 )
 
 @OptIn(ExperimentalFoundationApi::class, ExperimentalLayoutApi::class)
@@ -7191,7 +7199,7 @@ private fun GalleryScreen(
                 ManageSelectionActions(actions.count, lang, actions.onClear, actions.onSelectAll, actions.onSave, actions.onRegenerate, actions.onDelete,
                     confirmChanges = !(state.generatedTab == "images" && state.selectedGeneratedVersion == null),
                     onGenerate = actions.onGenerate, imageReplacement = actions.imageReplacement,
-                    onStart = actions.onStart, onPause = actions.onPause, startCount = actions.startCount, pauseCount = actions.pauseCount)
+                    videoActions = actions.videoActions)
             } else if (selectedKeys.isNotEmpty()) {
                 Column(Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
                     Text(lang.t("已选 ${selectedKeys.size} 项 · 仅处理已生成图片", "${selectedKeys.size} selected · generated photos only"), style = MaterialTheme.typography.labelMedium)
@@ -7700,7 +7708,6 @@ private fun StatusBadge(
     )
 }
 
-private const val VideoQueueActionsGridKey = "video-queue-actions"
 private val ManagedCacheItem.gridKey: String get() = "${entry.photoKey}_${entry.version}"
 
 @Composable
@@ -7860,29 +7867,47 @@ private fun ManageScreen(
             val reportTabsOverlap = onTabsOverlapChanged.takeIf { embedded && tab == selectedTab }
                 val gridColumns = StudioLayout.columns(state.generatedColumns, config.screenWidthDp, config.fontScale, tab == "videos" || state.selectedGeneratedVersion == null)
             if (tab == "videos") {
-                val videos = state.photos.filter { item ->
-                    item.kind == MediaKind.VIDEO &&
-                        ((state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL) != VideoVrState.NORMAL ||
-                            state.videoEntries.containsKey(item.cacheKey) ||
-                            state.videoJobs.any { it.item.cacheKey == item.cacheKey })
+                val jobsByKey = remember(state.videoJobs) { state.videoJobs.associateBy { it.item.cacheKey } }
+                val jobKeys = jobsByKey.keys
+                val videoIndexes = remember(state.photos, state.videoStates, state.videoEntries, jobKeys) {
+                    state.photos.indices.filter { index ->
+                        val item = state.photos[index]
+                        item.kind == MediaKind.VIDEO &&
+                            ((state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL) != VideoVrState.NORMAL ||
+                                state.videoEntries.containsKey(item.cacheKey) || item.cacheKey in jobKeys)
+                    }
                 }
-                val videoKeys = remember(videos) { listOf(VideoQueueActionsGridKey) + videos.map { it.cacheKey } }
-                LaunchedEffect(videos) { selectedVideoKeys = selectedVideoKeys.intersect(videos.mapTo(hashSetOf()) { it.cacheKey }) }
-                val selectedIndexes = videos.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.cacheKey }.takeIf { it >= 0 && item.cacheKey in selectedVideoKeys } }
-                val startCount = selectedIndexes.count { VideoCommandPolicy.canStart(state.videoStates[state.photos[it].cacheKey] ?: VideoVrState.NORMAL) }
-                val pauseCount = selectedIndexes.count { VideoCommandPolicy.canPause(state.videoStates[state.photos[it].cacheKey] ?: VideoVrState.NORMAL) }
-                LaunchedEffect(embedded, selectedTab, selectedVideoKeys, selectedIndexes, videos, state.videoStates) {
+                val videoKeys = remember(state.photos, videoIndexes) { videoIndexes.map { state.photos[it].cacheKey } }
+                LaunchedEffect(videoKeys) { selectedVideoKeys = selectedVideoKeys.intersect(videoKeys.toSet()) }
+                val selectedIndexes = remember(videoKeys, videoIndexes, selectedVideoKeys) {
+                    videoIndexes.filterIndexed { row, _ -> videoKeys[row] in selectedVideoKeys }
+                }
+                val videoActions = remember(state.photos, state.videoStates, videoIndexes, selectedIndexes, onStartVideos, onPauseVideos) {
+                    if (selectedIndexes.isEmpty()) null else {
+                        val states = videoIndexes.associateWith { state.videoStates[state.photos[it].cacheKey] ?: VideoVrState.NORMAL }
+                        VideoSelectionActions(
+                            onStartSelected = { onStartVideos(selectedIndexes) },
+                            onPauseSelected = { onPauseVideos(selectedIndexes) },
+                            onStartAll = { onStartVideos(videoIndexes) },
+                            onPauseAll = { onPauseVideos(videoIndexes) },
+                            selectedStartCount = selectedIndexes.count { VideoCommandPolicy.canStart(states.getValue(it)) },
+                            selectedPauseCount = selectedIndexes.count { VideoCommandPolicy.canPause(states.getValue(it)) },
+                            allStartCount = states.values.count(VideoCommandPolicy::canStart),
+                            allPauseCount = states.values.count(VideoCommandPolicy::canPause),
+                        )
+                    }
+                }
+                LaunchedEffect(embedded, selectedTab, selectedVideoKeys, selectedIndexes, videoKeys, videoActions) {
                     if (embedded && tab == selectedTab && selectedVideoKeys.isNotEmpty()) {
                         onGeneratedSelectionChange(
                             GeneratedSelectionActionsState(
                                 count = selectedVideoKeys.size,
                                 onClear = { selectedVideoKeys = emptySet() },
-                                onSelectAll = { selectedVideoKeys = videos.mapTo(linkedSetOf()) { it.cacheKey } },
+                                onSelectAll = { selectedVideoKeys = videoKeys.toSet() },
                                 onSave = { onSaveVideos(selectedIndexes); selectedVideoKeys = emptySet() },
                                 onRegenerate = { onRegenerateVideos(selectedIndexes); selectedVideoKeys = emptySet() },
                                 onDelete = { onDeleteVideos(selectedIndexes); selectedVideoKeys = emptySet() },
-                                onStart = { onStartVideos(selectedIndexes) }, onPause = { onPauseVideos(selectedIndexes) },
-                                startCount = startCount, pauseCount = pauseCount,
+                                videoActions = videoActions,
                             ),
                         )
                     } else if (embedded && tab == selectedTab) {
@@ -7894,17 +7919,16 @@ private fun ManageScreen(
                         count = selectedVideoKeys.size,
                         lang = lang,
                         onClear = { selectedVideoKeys = emptySet() },
-                        onSelectAll = { selectedVideoKeys = videos.mapTo(linkedSetOf()) { it.cacheKey } },
+                        onSelectAll = { selectedVideoKeys = videoKeys.toSet() },
                         onSave = { onSaveVideos(selectedIndexes); selectedVideoKeys = emptySet() },
                         onRegenerate = { onRegenerateVideos(selectedIndexes); selectedVideoKeys = emptySet() },
                         imageReplacement = false,
-                        onStart = { onStartVideos(selectedIndexes) }, onPause = { onPauseVideos(selectedIndexes) },
-                        startCount = startCount, pauseCount = pauseCount,
+                        videoActions = videoActions,
                         onDelete = { onDeleteVideos(selectedIndexes); selectedVideoKeys = emptySet() },
                     )
                     Spacer(Modifier.height(8.dp))
                 }
-                if (videos.isEmpty()) {
+                if (videoIndexes.isEmpty()) {
                     StudioEmptyState(lang.t("还没有视频任务", "No video jobs yet"), lang.t("从全部或相册打开视频，手动加入 VR 队列。视频不会自动加入图片预加载。", "Open a video from All or Albums and add it to the VR queue. Videos are never added by image prefetch."), Modifier.padding(top = contentTopPadding, bottom = contentBottomPadding))
                 } else {
                     val videoGridState = rememberGalleryGridState(viewports, GalleryGridScope.GENERATED_VIDEOS, videoKeys)
@@ -7922,10 +7946,8 @@ private fun ManageScreen(
                                     selectionMode = selectedVideoKeys.isNotEmpty(),
                                     contentStartPadding = 8.dp,
                                 ) { gridIndex ->
-                                    videos.getOrNull(gridIndex - 1)?.let { item ->
-                                        if (item.cacheKey in availablePhotoKeys) {
-                                            selectedVideoKeys = selectedVideoKeys + item.cacheKey
-                                        }
+                                    videoKeys.getOrNull(gridIndex)?.let { key ->
+                                        if (key in availablePhotoKeys) selectedVideoKeys = selectedVideoKeys + key
                                     }
                                 },
                             contentPadding = androidx.compose.foundation.layout.PaddingValues(
@@ -7937,27 +7959,15 @@ private fun ManageScreen(
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            item(key = VideoQueueActionsGridKey, span = { GridItemSpan(maxLineSpan) }) {
-                                val indexes = videos.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.cacheKey }.takeIf { it >= 0 } }
-                                val starts = indexes.count { VideoCommandPolicy.canStart(state.videoStates[state.photos[it].cacheKey] ?: VideoVrState.NORMAL) }
-                                val pauses = indexes.count { VideoCommandPolicy.canPause(state.videoStates[state.photos[it].cacheKey] ?: VideoVrState.NORMAL) }
-                                Column(Modifier.fillMaxWidth().padding(8.dp)) {
-                                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        OutlinedButton(onClick = { onStartVideos(indexes) }, enabled = starts > 0) { Text(lang.t("全部开始 ($starts)", "Start all ($starts)")) }
-                                        OutlinedButton(onClick = { onPauseVideos(indexes) }, enabled = pauses > 0) { Text(lang.t("全部暂停 ($pauses)", "Pause all ($pauses)")) }
-                                    }
-                                    Text(lang.t("仅当前视频列表；开始会续跑未完成任务，保留各自参数与已有帧。长按可只操作所选。", "This video list only. Resume unfinished jobs with their saved parameters and frames. Long press to act on a selection."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                            }
-                            items(videos, key = { it.cacheKey }) { item ->
-                                val index = state.photos.indexOfFirst { it.cacheKey == item.cacheKey }
+                            items(videoIndexes, key = { state.photos[it].cacheKey }) { index ->
+                                val item = state.photos[index]
                                 val videoState = state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL
-                                val job = state.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }
+                                val job = jobsByKey[item.cacheKey]
                                 Column(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .background(MaterialTheme.colorScheme.surface)
-                                        .clickable(enabled = index >= 0) {
+                                        .clickable {
                                             if (selectedVideoKeys.isNotEmpty()) {
                                                 selectedVideoKeys = if (item.cacheKey in selectedVideoKeys) selectedVideoKeys - item.cacheKey else selectedVideoKeys + item.cacheKey
                                             } else onOpenGeneratedVideo(index)
@@ -8334,21 +8344,34 @@ private fun ManageSelectionActions(
     confirmChanges: Boolean = true,
     onGenerate: (() -> Unit)? = null,
     imageReplacement: Boolean = true,
-    onStart: (() -> Unit)? = null,
-    onPause: (() -> Unit)? = null,
-    startCount: Int = 0,
-    pauseCount: Int = 0,
+    videoActions: VideoSelectionActions? = null,
 ) {
     var pending by remember { mutableStateOf<String?>(null) }
+    val actionArea = if (videoActions != null) {
+        Modifier.heightIn(max = (LocalConfiguration.current.screenHeightDp * 0.4f).dp)
+            .verticalScroll(rememberScrollState())
+    } else Modifier
     Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(lang.t("当前列表 · 已选 $count 项", "Current list · $count selected"), Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
             SelectionActionIcon(Icons.Default.Close, lang.t("取消选择", "Cancel selection"), onClear)
         }
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        FlowRow(modifier = actionArea, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = onSelectAll) { Text(lang.t("全选", "Select all")) }
-            onStart?.let { action -> TextButton(onClick = action, enabled = startCount > 0) { Text(lang.t("开始所选 $startCount 项", "Start $startCount selected")) } }
-            onPause?.let { action -> TextButton(onClick = action, enabled = pauseCount > 0) { Text(lang.t("暂停所选 $pauseCount 项", "Pause $pauseCount selected")) } }
+            videoActions?.let { actions ->
+                TextButton(onClick = actions.onStartSelected, enabled = actions.selectedStartCount > 0) {
+                    Text(lang.t("开始所选 ${actions.selectedStartCount} 项", "Start ${actions.selectedStartCount} selected"))
+                }
+                TextButton(onClick = actions.onPauseSelected, enabled = actions.selectedPauseCount > 0) {
+                    Text(lang.t("暂停所选 ${actions.selectedPauseCount} 项", "Pause ${actions.selectedPauseCount} selected"))
+                }
+                OutlinedButton(onClick = actions.onStartAll, enabled = actions.allStartCount > 0) {
+                    Text(lang.t("全部开始 (${actions.allStartCount})", "Start all (${actions.allStartCount})"))
+                }
+                OutlinedButton(onClick = actions.onPauseAll, enabled = actions.allPauseCount > 0) {
+                    Text(lang.t("全部暂停 (${actions.allPauseCount})", "Pause all (${actions.allPauseCount})"))
+                }
+            }
             onSave?.let { TextButton(onClick = it) { Text(if (imageReplacement) lang.t("保存无损 PNG", "Save lossless PNG") else lang.t("保存副本", "Save copies")) } }
             onGenerate?.let { action -> TextButton(onClick = action) { Text(lang.t("使用新参数生成", "Generate with new parameters")) } }
             onRegenerate?.let { action -> TextButton(onClick = { if (confirmChanges) pending = "regenerate" else action() }) { Text(lang.t("重新生成", "Regenerate")) } }

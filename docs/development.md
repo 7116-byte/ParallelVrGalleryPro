@@ -1,6 +1,6 @@
 # 开发和构建
 
-当前源码版本为 **1.15.01 / 11501**。行为约束见 [AGENTS.md](../AGENTS.md)，视频取帧与深度诊断见 [v1.15.01 说明](releases/v1.15.01.md)，分段编码最初验收见 [v1.15.00 说明](releases/v1.15.00.md)。项目使用 `com.local.parallelvrgallerypro` 作为包名、命名空间和 Kotlin package，源码目录仍为 `app/src/main/java/com/local/parallelvrgallery`。
+当前源码版本为 **1.15.02 / 11502**。行为约束见 [AGENTS.md](../AGENTS.md)，视频多选见 [v1.15.02 说明](releases/v1.15.02.md)，视频取帧与深度诊断见 [v1.15.01 说明](releases/v1.15.01.md)。项目使用 `com.local.parallelvrgallerypro` 作为包名、命名空间和 Kotlin package，源码目录仍为 `app/src/main/java/com/local/parallelvrgallery`。
 
 ## 普通源码构建
 
