@@ -1,89 +1,66 @@
-# 本机开发与交接
+# 开发和构建
 
-正式项目：`E:\AI-Programme\ParallelVrGalleryPro`。恢复日期：2026-10-31（Asia/Shanghai）。历史恢复基线为 **1.2.00 / 10200**；当前版本为 **1.10.00 / 11000**，详见 [后台与切页技术记录](background-and-navigation-v1.10.00.md)。恢复历史来自离线 bundle，origin 为 `https://github.com/7116-byte/ParallelVrGalleryPro.git`。
+当前源码版本为 **1.15.00 / 11500**。行为约束见 [AGENTS.md](../AGENTS.md)，版本变更及设备验证范围见 [v1.15.00 说明](releases/v1.15.00.md)。项目使用 `com.local.parallelvrgallerypro` 作为包名、命名空间和 Kotlin package，源码目录仍为 `app/src/main/java/com/local/parallelvrgallery`。
 
-先读 [切页与后台队列](background-and-navigation-v1.10.00.md) 及 [1.10.00 验收](releases/v1.10.00.md)，再读 [原图无损保存](original-png-v1.9.00.md) 与 [1.9.00 验收](releases/v1.9.00.md)，再读 [新任务性能](fresh-generation-v1.8.00.md) 和 [1.8.00 验收](releases/v1.8.00.md)，再读 [生成性能与格式实测](performance-v1.7.00.md) 和 [本版验收](releases/v1.7.00.md)，再读 [固定透明顶栏与真实 770 推理](depth-resolution-v1.6.00.md) 及 [v1.6.00 验收](releases/v1.6.00.md)，再读 [人体多点复核](navigation-and-body-v1.5.02.md)，再读 [固定参数、反转与对比](mode-controls-v1.5.01.md)，再读 [主节点技术记录](comfy-main-v1.4.00.md)。历史发布与恢复资料保留；私密资产仍只在 `.local/`。
+## 普通源码构建
 
-模式含义与画质证据需同时阅读 [六模式完整对比](mode-comparison-v1.4.00.md)。V6–V11 是内部算法/缓存标识，分属三组路线；同深度投影一致不代表整条桌面工作流或 JPEG 成品等效，更不构成六模式画质排名。
+安装 JDK 17 和 Android SDK Platform 36，在项目根目录用仓库自带的 Gradle Wrapper 运行。项目固定 Gradle 8.10.2、AGP 8.7.3、Kotlin 2.0.21。Android 最低支持 API 30。
 
-## 日常命令
+```powershell
+.\gradlew.bat --no-daemon testDebugUnitTest lintDebug assembleDebug
+```
 
-在项目根目录双击 `Verify-Restoration.cmd`，或执行：
+Linux 和 macOS 可用 `bash ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug`。首次需要连接依赖仓库。测试报告在 `app/build/test-results/`，Lint 报告在 `app/build/reports/`，调试包在 `app/build/outputs/apk/debug/`。 [CI 工作流](../.github/workflows/android-checks.yml)
+
+调试 APK 使用本机构建签名。需要在同一设备保留已安装正式版的数据时，使用同发布证书的正式 APK。
+
+## 已恢复工作区的离线验收
+
+Windows 已配置恢复资产时，可双击根目录 `Verify-Restoration.cmd`，也可分别执行资产检查与构建。日常增量验收省略 `-Clean`。新增依赖须联网时可显式使用 `-Online`。
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Verify-LocalAssets.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Build.ps1 -Clean
 ```
 
-验收默认离线，执行 clean、testDebugUnitTest、lintDebug、assembleDebug。日常增量验收可省略 `-Clean`。新增依赖确需联网时才使用 `-Online`，本次恢复未升级任何依赖。
+恢复工作区的备份归档、工具链和验证证据集中在 Git 忽略的 `.local/`。可移植环境包含 JDK 17.0.19+10、SDK 36、Build Tools 34.0.0 和 35.0.0、Gradle 依赖以及 QNN 的离线 AAR 和 POM。`Verify-LocalAssets.ps1 -FullArchive` 按迁移清单核对归档。脚本使用项目内工具链，验证结束后恢复调用进程的环境设置。
 
-需要在当前 PowerShell 使用 Git/Java/ADB 时：
+`Build.ps1` 保存本次构建的源码清单、日志、测试计数、Lint 统计、APK 元数据和证书核验。读本次生成的 `result.json` 确认 `passed`，真机验证另行记录。恢复基线为 1.2.00 / 10200，普通版资产及将来删除旧备份的条件见 [恢复验收记录](recovery-acceptance-2026-10-31.md)。
 
-```powershell
-. .\scripts\Use-Environment.ps1
-git status --short --branch
-java -version
-```
+## 推理和缓存
 
-点加载环境只为当前进程配置工具并更新被忽略的 local.properties；App 构建使用 Build.ps1，确保加载原签名 init 脚本。脚本执行完恢复调用进程原环境，不更改系统永久变量、全局密钥或全局 Git 配置。不需要 Android Studio，也不需要访问 U 盘或其他项目。
+APK 内置 Depth Anything V2 Small 的 FP16 ONNX 和保留末端三层卷积为 FP32 的混合精度型号。ONNX Runtime Android QNN 1.29.0 与 Qualcomm QNN Runtime 2.42.0 来自 Maven Central。构建从所用 AAR 打包许可和通知。QNN 后端在已支持的 64 位高通设备上运行，创建、推理和释放都属于同一拥有者线程。QNN 禁止 CPU 回退，TFLite 保留单独的强制 GPU 设置。
 
-一键 .cmd 使用系统 Windows PowerShell 5.1，并仅在子进程内指定系统模块目录，兼容从 PowerShell 7 启动时的模块路径继承差异。keytool 的 Java 参数已按 Windows PowerShell 规则引用。原归档脚本保留作历史，不用于新正式根目录的日常构建。
+图片与视频分别保存型号、名义边长和比例。名义边长为 37–74 格乘以 14 像素。任务、缓存、从原图导出都使用各自记录的模型身份和参数。旧方形 ID 继续有效，旧 `fit` 和 `widetall` 仅迁移当前设置，历史任务和结果继续读取原有 ID。
 
-## 目录与工具
-
-| 路径 | 用途 |
+| 输入比例 | 形状和准备时机 |
 | --- | --- |
-| 根目录 `.git`、app、gradle、docs、tools | 正式项目及原有受版本管理的技术参考 |
-| `.local/recovery/` | 完整备份归档，包括两个版本源码、bundle、原工具链、模型、APK、历史工作副本和历史报告；不要用于日常构建 |
-| `.local/toolchain/` | 从归档另复制的独立可写工具链：JDK、SDK、Gradle 离线依赖、Git、GH、原签名 |
-| `.local/verification/` | 本次备份验证、迁移 SHA-256 清单、Git 检查及验收证据 |
-| `.local/verification/runs/<时间>/` | 每次构建的完整日志、测试 XML、Lint、APK、包信息、证书和 result.json |
-| `.local/verification/latest-run.txt` | 最近一次构建证据目录；失败运行也记录，必须检查 passed 字段 |
+| 固定方形 | 使用名义边长×名义边长。图库空闲时准备当前图片模型的固定尺寸。 |
+| 14 像素分块 | 按素材比例选 14 的倍数作为宽高，像素数受名义边长平方限制，长边至多为名义边长两倍。素材尺寸已知后按实际张量形状准备。 |
+| 双竖版（9:16 / 3:4） | 预先准备两个尺寸，1036 档为 756×1344 和 882×1176。按素材的短长边比选图，横向输入旋转 90°，推理后将浮点深度转回原方向。 |
 
-固定工具版本为 JDK 17.0.19+10、Gradle 8.10.2、AGP 8.7.3、Kotlin 2.0.21、compileSdk 36。SDK 35 与 36、Build Tools 34.0.0 与 35.0.0 都保留，AGP 离线构建实际需要 34.0.0。Gradle 使用 `.local/toolchain/gradle-home`，不使用全局用户缓存。
+启动预热在媒体和持久化队列恢复后，仅准备当前图片模型可提前确定的形状。14 像素分块的不同尺寸共用 ONNX 权重，GPU 编译图按模型、尺寸和运行环境缓存。磁盘中的编译图失效时，从原模型重新编译。设备样本中 1386×770 初次编译约 5.20 秒、磁盘载入约 0.40 秒，原生深度字节一致。
 
-`Verify-LocalAssets.ps1 -FullArchive` 按迁移清单重验完整本地归档，可在断开 U 盘后执行；默认仅检查独立构建与原签名/模型/bundle 的静态资产。迁移清单含原路径、目标路径、文件大小、SHA-256 和核对结果，另有清单自身的 SHA-256。若移动整个项目，校验按 relativePath 重定位归档，不依赖原路径。
+诊断分别记录模型实际输出、裁回深度、后处理深度与 SBS 尺寸。深度放大只作用于后处理。模型来源与 SHA-256 见 `QnnDepthModel.kt` 和 APK 随附的第三方通知。TFLite 可下载资产由 App 按模型校验值验证。
 
-## 签名、版本与 GitHub
+## 结果管理与视频流水线
 
-包名、namespace、Kotlin package 保持 `com.local.parallelvrgallerypro`，旧源码目录名 `parallelvrgallery` 保持。原发布使用 debug 签名，Build.ps1 在构建前核对密钥文件与归档一致并检查证书，在构建后再次核对 APK 证书。证书 SHA-256：
+- 生成相册按完整参数分组，归组仅去掉图片缓存键的 `_take` 副本标记。单个结果使用原图键与完整缓存版本，Viewer 捕获当次进入的结果范围。使用新参数生成会跳过同参数已有成品或任务的原图。重新生成成功后替换所选旧结果。
+- 图片预览缓存保留 JPEG 100。普通保存使用 `OriginalImageExportSpec` 捕获结果参数，从原图重生成无损 PNG。保持该结果的实际单眼尺寸，原图不可用或参数不完整时明确失败。生成及导出发布继续由 `GenerationGuard` 与结果身份保护。
+- 双竖版横屏视频使用独立的输入旋转缩放与深度恢复工位，两级队列各容量 4，总在途帧受内存限制。历史方向记录决定已有任务的推理方向。时序平滑、投影和单源 SBS 编码按原帧序执行。
+- 没有旧逐帧缓存的新任务，每段最多 72 帧，原子提交完整分段与状态校验。续跑读取最后完整段保存的时序深度状态。合并按源 PTS 写入视频样本，复制原音频。只有登记成品后才清理本版本的临时分段或逐帧缓存。 [分段验证范围](releases/v1.15.00.md#已有验证)
 
-`c51c08290903e65d2e99fe35ceffd44b637f04cc5bbdd5ea9ecb8847d4ea7359`
+## 发布和真机验收
 
-不把新系统自动生成的 debug.keystore 用于升级，不覆盖用户全局密钥。APK 文件 SHA-256 可以与旧发布包不同，证书必须相同。后续版本沿用“大版本.新增功能.修复序号”，恢复阶段不升版本。
+正式包用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Build.ps1 -Clean -Variant Release` 生成。签名脚本显式使用历史发布证书对应的本地签名，并核对 APK 包名、版本及证书。Release 禁用调试且不含 QA 入口。版本规则为「大版本.新增功能.修复序号」。
 
-恢复阶段已复用本机 GitHub 登录验证账号 7116-byte，未读取或打印 Token，当时未推送或发布。正式迭代的提交与发布另见 v1.3.00 验收记录。`.local/`、密钥、模型和缓存不入 Git。凭证由本机既有登录管理，归档不含账号登录态。Git 换行处理为仓库级 core.autocrlf=true，原快照字节保存在归档；不要将换行噪音误报为业务变更。
+GitHub Release 使用 `app-debug.apk` 和 `app-debug.apk.sha256`。更新器按数字段比较版本，安装前校验应用包名、原发布证书和递增的 `versionCode`。公开下载的文件大小、SHA-256 和签名与本地验收 APK 同时核对。凭证、签名材料和私人媒体均留在本地。
 
-## 下一次继续开发
+Debug 入口和 `scripts/Build-Benchmark.ps1` 构建的独立 APK 只用于显式授权的测试副本。性能对照使用相同素材、参数和尺寸，分别记录冷会话、已就绪会话与结果缓存；照片或视频的真实生成时间按完整任务计算。构建、真机、CI、公开下载及 App 内升级分别标记。设备验收只覆盖安装，保留数据、偏好与原有任务。
 
-v1.9.00 当前有 25 类、153 项 JVM 测试。模式档案与个人默认只保存视觉参数，共用模型/GPU/队列偏好。旧缓存标识在新选项关闭时不变；自动匹配、模型输入反转和独立副本分别追加 `_eq1050`、`_di1`、`_take…`。图片队列保存明确参数和替换目标，启动先恢复 `image_work` 的发布事务，再扫描成品。不得把替换改回“先删后生成”。
+## 历史技术记录
 
-Debug 的 `kind=modeProfiles` 对指定私密 QA 目录直接做六模式强制 GPU 对照，不启动图库；`kind=comparison` 只在指定 QA 相册检查实际加载完成后的缩放/位置及画面哈希；`kind=imageWrites` 只在合成 S1 副本验证新增、定向替换及实际读取失败。所有入口需要显式 `album/sample`，正式包不含测试入口。对比页必须等待可访问的“对比视口”出现后才注入手势，不能拿加载动画的哈希变化当验收通过。
-
-先检查 AGENTS.md、实际 git diff/status、本次恢复验收记录，再读四份版本文档。`edge-and-queue-v1.1.00.md` 中删除预加载黑名单已被 v1.1.01 撤销，以较新的说明及代码为准。队列、暂停原因、GenerationGuard、GPU 线程归属、强制 GPU、单源 SBS、滤波模式及深度放大缓存规则不得因恢复而改变。
-
-稳定模型在 `.local/recovery/models/depth_anything_v2.tflite`，98,920,480 字节，SHA-256 `B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F`。不内置进 APK，不在恢复阶段运行媒体生成。Qualcomm 实验模型和旧 D 盘 `.pth` 没有作为可运行资产被备份，不得把历史路径当成现存依赖。
-
-JVM 与 Lint 不证明真机画质或流畅度。恢复阶段未安装手机或生成媒体；正式迭代的两台真机测试与限制见 studio-v1.3.00.md。普通版仍是独立项目，其恢复与删除条件见恢复验收记录。
-
-## 正式发布与真机调试（v1.3.00 起）
-
-日常 Debug 验收命令保持不变；正式发布执行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Build.ps1 -Clean -Variant Release`。正式包仍签原证书，但不可调试且不含测试 instrumentation。GitHub 资产名必须保持 app-debug.apk 与 app-debug.apk.sha256，供已发布更新器使用。
-
-Debug 专用原生手势回归入口：`adb -s <serial> shell am instrument -w -e album PVG_QA_<explicit_album> -e sample PVG_QA_<explicit_file> com.local.parallelvrgallerypro/.StudioGestureInstrumentation`。仅在用户明确授权的测试副本上运行；Release 不包含该入口。设备覆盖安装始终用原包名与原证书，不能卸载或清空数据。生成、删除或私人媒体测试仍需先限定范围并得到授权。
-
-新依赖只有 OpenCV Android 4.12.0，用于用户明确请求的参考 V2.2 补洞，不升级原 JDK/Gradle/AGP/Kotlin/TFLite。备份当前可离线构建的环境时，要包含日常工具链中新解析的依赖；不能用只含 1.2.00 的历史归档替代最新环境备份。
-
-## 非调试性能测量
-
-`scripts/Build-Benchmark.ps1 -OutputDirectory .local/bench/<新目录>` 构建带显式 QA 入口、非 debuggable 的 benchmark 包，保留源清单和原证书验证；不能把它发布为正式 APK。可用 `-SourceRoot` 对隔离的历史源码使用同一工具链。基准和对照统一 AOT 模式，记录当前设备/模型是否已经准备，使用新缓存根目录并核对实际推理数。正式发布仍用 Build.ps1 -Variant Release，并验证无 instrumentation。
-
-145 项回归覆盖逐位相同的 TensorTransfer、逐像素相同的 V10 反向覆盖及共享池租借生命周期。视频只借现成匹配会话，否则独立创建并释放，不能淘汰其他图片模型。ViewModel 等视频 worker 结束后再关闭池。原缓存键、模型、图像参数与队列语义保持。
-
-`coldProjection` 是早期基线上的候选算法实验入口；当前生产版也已采用优化覆盖规则，在当前版单独运行不能重新得出历史投影提速。前后性能应使用隔离的对应历史源码；独立原像素循环回归保留在 JVM 测试中。图片 770 与视频 518 不共享会话，不能套用同配置已就绪的 28.7% 收益。
-
-## 从原图保存 PNG（v1.9.00）
-
-普通图片保存只走 OriginalImageExportSpec 和 VrGenerator.exportOriginalPng，禁止退回 materializeSbsPng 或从 JPEG 拼接。捕获选中条目及参数，保留历史模式，不读当前参数；原图不可用或参数校验失败时明确失败。保持条目记录的实际单眼尺寸，不能为保存静默缩图。SbsPngWriter 按 sRGB RGBA 行写 Sub filter / 低压缩 PNG，不增加 JPEG 编码步骤；这保证当前 8-bit 生成管线的像素，不宣称恢复原图固有 JPEG 损失、HDR 或 16-bit 精度。
-
-临时文件仅在扫描范围外 export_work；最终图库发布仍受 GenerationGuard 与选中结果身份检查保护，取消/失败删除 pending 行。预览缓存与队列不被改写。AVIF 旧偏好保留供兼容，普通保存不再读取它；设置明确说明原图重新生成 PNG。视频保存依旧复制已生成 MP4。
+- [队列和后台恢复](background-and-navigation-v1.10.00.md) · [来源预加载与预热](prefetch-and-startup-v1.1.01.md) · [删除与发布一致性](edge-and-queue-v1.1.00.md)
+- [从原图保存 PNG](original-png-v1.9.00.md) · [新任务性能](fresh-generation-v1.8.00.md) · [预加载和格式](performance-v1.7.00.md)
+- [独立 770 推理](depth-resolution-v1.6.00.md) · [人体多点分析](navigation-and-body-v1.5.02.md) · [六种投影算法](mode-comparison-v1.4.00.md) · [ComfyUI 主节点](comfy-main-v1.4.00.md) · [深度放大](depth-upscale-v1.2.00.md)
+- [统一界面](studio-v1.3.00.md) · [恢复验收](recovery-acceptance-2026-10-31.md) · [完整版本记录](../CHANGELOG.md)

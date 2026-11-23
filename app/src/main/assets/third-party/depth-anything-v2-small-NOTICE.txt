@@ -1,0 +1,16 @@
+The dav2-gpu-fp16.onnx and dav2-gpu-mx-fp16-head.onnx models are derived
+from Depth Anything V2 Small by Lihe Yang, Bingyi Kang,
+Zilong Huang, Zhen Zhao, Xiaogang Xu, Jiashi Feng and Hengshuang Zhao.
+The Small model is licensed under Apache License 2.0. See the accompanying
+depth-anything-v2-small-LICENSE.txt.
+
+Original project: https://github.com/DepthAnything/Depth-Anything-V2
+Source ONNX export: https://huggingface.co/onnx-community/depth-anything-v2-small/tree/4472b7362082ad9968fee890ca0f1e5aca36b93d
+
+ParallelEyeConverter modifies dav2-gpu-fp16.onnx to support variable input
+sizes, FP16 weights and computation, and the Android QNN GPU backend.
+Source for this variant: https://github.com/7116-byte/ParallelEyeConverter/blob/7059fb36b76662acd5b643c129259939e3dd4f1b/app/src/main/assets/dav2-gpu-fp16.onnx
+
+ParallelVrGalleryPro also derives dav2-gpu-mx-fp16-head.onnx from the
+source FP32 weights. Its final three depth convolutions retain FP32
+precision while most operators use FP16.

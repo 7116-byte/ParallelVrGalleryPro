@@ -12,6 +12,10 @@ import org.json.*;
 
 /** Real generators scoped to an explicit QA subtree. No Activity, VM, catalog or queues. */
 final class PerformancePipelineQa {
+    static void runQnn518(Context context, String label) throws Exception {
+        QnnPipeline518Qa.run(context, label);
+    }
+
     static void run(Context context, String label) throws Exception {
         File qa=new File(context.getExternalFilesDir(null),"PVG_QA_performance1700");
         if(!new File(qa,"AUTHORIZED").isFile() || !label.matches("baseline|optimized|confirmation"))throw new AssertionError("Explicit QA scope required");
@@ -53,4 +57,8 @@ final class PerformancePipelineQa {
         }finally{images.close();}
     }
     private static void write(File path,JSONArray data)throws Exception{try(FileOutputStream out=new FileOutputStream(path)){out.write(data.toString(2).getBytes(java.nio.charset.StandardCharsets.UTF_8));}}
+
+    static void writeReport(File path, JSONObject data) throws Exception {
+        Files.write(path.toPath(), data.toString(2).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
 }

@@ -1,7 +1,48 @@
+import org.gradle.api.file.ArchiveOperations
+import org.gradle.api.file.FileSystemOperations
+import javax.inject.Inject
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+val qnnNotices by configurations.creating {
+    isCanBeResolved = true
+    isCanBeConsumed = false
+    isTransitive = false
+}
+
+abstract class CollectQnnNotices : DefaultTask() {
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.NONE)
+    abstract val archive: ConfigurableFileCollection
+
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+
+    @get:Inject
+    abstract val archives: ArchiveOperations
+
+    @get:Inject
+    abstract val files: FileSystemOperations
+
+    @TaskAction
+    fun collect() {
+        val names = setOf("LICENSE.pdf", "NOTICE.txt")
+        val notices = archives.zipTree(archive.singleFile).matching { include(names) }
+        check(notices.files.map { it.name }.toSet() == names) { "QNN runtime archive is missing its license or notices" }
+        files.sync {
+            from(notices) { into("third-party/qnn") }
+            into(outputDirectory)
+        }
+    }
+}
+
+val collectQnnNotices by tasks.registering(CollectQnnNotices::class) {
+    archive.from(qnnNotices)
+    outputDirectory.set(layout.buildDirectory.dir("generated/qnn-notices"))
 }
 
 android {
@@ -12,8 +53,8 @@ android {
         applicationId = "com.local.parallelvrgallerypro"
         minSdk = 30
         targetSdk = 35
-        versionCode = 11000
-        versionName = "1.10.00"
+        versionCode = 11500
+        versionName = "1.15.00"
     }
 
     buildFeatures {
@@ -22,19 +63,25 @@ android {
     }
 
     packaging {
+        jniLibs {
+            // The QNN GPU provider opens the absolute path in nativeLibraryDir.
+            useLegacyPackaging = true
+            excludes += setOf("**/libQnnDsp*.so", "**/libQnnHtp*.so")
+        }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
 
     androidResources {
-        noCompress += "tflite"
+        noCompress += listOf("tflite", "onnx")
     }
 
     // Local performance harness: Release runtime flags, explicit QA entry points, never a release asset.
     buildTypes {
         create("benchmark") {
             initWith(getByName("release"))
+            applicationIdSuffix = ".benchmark"
             isDebuggable = false
             signingConfig = signingConfigs.getByName("debug")
             matchingFallbacks += listOf("release")
@@ -43,6 +90,12 @@ android {
     sourceSets.getByName("benchmark") {
         java.srcDir("src/debug/java")
         manifest.srcFile("src/debug/AndroidManifest.xml")
+    }
+}
+
+androidComponents {
+    onVariants { variant ->
+        variant.sources.assets?.addGeneratedSourceDirectory(collectQnnNotices, CollectQnnNotices::outputDirectory)
     }
 }
 
@@ -63,6 +116,8 @@ dependencies {
     implementation("org.tensorflow:tensorflow-lite:2.16.1")
     implementation("org.tensorflow:tensorflow-lite-gpu-api:2.16.1")
     implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android-qnn:1.29.0")
+    qnnNotices("com.qualcomm.qti:qnn-runtime:2.42.0@aar")
     implementation("com.github.awxkee:avif-coder:2.1.4")
     // Targeted addition for the explicitly selected SSS V2.2 Telea inpaint mode.
     implementation("org.opencv:opencv:4.12.0") {

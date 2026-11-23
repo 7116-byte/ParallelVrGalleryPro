@@ -1,6 +1,6 @@
 package com.local.parallelvrgallerypro
 
-/** Explicit model contract, separate from output-image sizing and depth interpolation. */
+/** TFLite input validation and shared square depth output, independent of image output sizing. */
 internal object DepthTensorShape {
     fun inputSize(input: IntArray, output: IntArray): Int {
         require(input.size == 4 && input[0] == 1 && input[3] == 3 && input[1] == input[2]) { "Expected square NHWC RGB model" }
@@ -11,11 +11,8 @@ internal object DepthTensorShape {
     }
 
     fun map(values: FloatArray): DepthMap {
-        val size = when (values.size) {
-            518 * 518 -> 518
-            770 * 770 -> 770
-            else -> error("Unexpected model depth length: ${values.size}")
-        }
+        val size = kotlin.math.sqrt(values.size.toDouble()).toInt()
+        check(size * size == values.size && isQnnFp16Size(size)) { "Unexpected model depth length: ${values.size}" }
         return DepthMap(values, size, size)
     }
 }

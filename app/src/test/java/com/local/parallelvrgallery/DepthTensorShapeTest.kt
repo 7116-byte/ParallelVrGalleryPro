@@ -35,11 +35,12 @@ class DepthTensorShapeTest {
         }
     }
     @Test fun retainsActualDepthSizeAndFloatValuesWithoutResampling() {
-        for (size in listOf(518,770)) {
+        for (size in listOf(518, 532, 770, 840, 1036)) {
             val values = FloatArray(size*size) { it.toFloat() / (size*size) }
             val map = DepthTensorShape.map(values)
             assertEquals(size,map.width);assertEquals(size,map.height);assertSame(values,map.values)
         }
         assertThrows(IllegalStateException::class.java) { DepthTensorShape.map(FloatArray(768*768)) }
+        assertThrows(IllegalStateException::class.java) { DepthTensorShape.map(FloatArray(532*532 - 1)) }
     }
 }

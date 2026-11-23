@@ -19,7 +19,11 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 
@@ -52,6 +56,12 @@ private val StudioDark = darkColorScheme(
     surfaceContainer = Color(0xFF1C2820), surfaceContainerHigh = Color(0xFF26342B),
     outline = Color(0xFF82998A), outlineVariant = Color(0xFF3B4D40),
 )
+
+@Composable
+internal fun studioFloatingTextStyle(style: TextStyle, foreground: Color): TextStyle {
+    val shadow = if (foreground.luminance() > 0.5f) Color.Black else Color.White
+    return style.copy(shadow = Shadow(color = shadow, blurRadius = with(LocalDensity.current) { 3.dp.toPx() }))
+}
 
 @Composable
 fun StudioTheme(dark: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {

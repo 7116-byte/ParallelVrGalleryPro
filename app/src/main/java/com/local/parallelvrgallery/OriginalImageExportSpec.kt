@@ -1,7 +1,12 @@
 package com.local.parallelvrgallerypro
 
 /** A captured result's parameters and geometry, never the current settings or JPEG pixels. */
-internal data class OriginalImageExportSpec(val params: VrGenerationParams, val eyeWidth: Int, val eyeHeight: Int) {
+internal data class OriginalImageExportSpec(
+    val params: VrGenerationParams,
+    val eyeWidth: Int,
+    val eyeHeight: Int,
+    val inputGeometry: QnnInputGeometry? = null,
+) {
     companion object {
         fun restore(values: Map<String, String>, upscale: Map<String, String>?, photoKey: String,
             version: String, outputWidth: Int, outputHeight: Int): OriginalImageExportSpec {
@@ -42,7 +47,24 @@ internal data class OriginalImageExportSpec(val params: VrGenerationParams, val 
                 invertModelDepth = boolean("invertModelDepth", false),
             )
             require(maxOf(width, outputHeight) <= params.maxLongEdge) { "Recorded dimensions exceed output setting" }
-            return OriginalImageExportSpec(params, width, outputHeight)
+            val qnn = qnnModelConfig(params.depthModel)
+            val inputGeometry = qnn?.takeIf { it.aspect != QnnDepthAspect.SQUARE }?.let { config ->
+                val rotation = if (config.aspect == QnnDepthAspect.PORTRAIT_PAIR) integer("modelInputRotation")
+                    else values["modelInputRotation"]?.toInt() ?: 0
+                QnnInputGeometry(
+                    integer("modelInputWidth"), integer("modelInputHeight"),
+                    integer("modelDepthContentWidth"), integer("modelDepthContentHeight"),
+                    integer("modelDepthPadLeft"), integer("modelDepthPadTop"), rotation,
+                ).also {
+                    require(it.matchesLayout(config.size, config.aspect)) { "Invalid recorded QNN input layout" }
+                    if (config.aspect == QnnDepthAspect.PORTRAIT_PAIR) {
+                        require(it == QnnInputGeometry.forSource(config.size, width, outputHeight, config.aspect)) {
+                            "Recorded QNN input layout does not match the original orientation and proportions"
+                        }
+                    }
+                }
+            }
+            return OriginalImageExportSpec(params, width, outputHeight, inputGeometry)
         }
     }
 }

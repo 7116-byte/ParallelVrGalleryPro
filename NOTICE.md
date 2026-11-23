@@ -22,7 +22,7 @@
 
 - 上游项目：https://github.com/DepthAnything/Depth-Anything-V2
 - 用途：当前图片和视频逐帧深度估计模型来源。
-- 说明：模型文件不提交到 Git；App 首次生成前从 Release 资产下载并校验 SHA-256。
+- v1.15.00 随 App 分发两份 Apache-2.0 Small 衍生模型：`dav2-gpu-fp16.onnx` 和 `dav2-gpu-mx-fp16-head.onnx`。后者保留最后三层深度卷积为 FP32。模型来源与修改见 [模型声明](app/src/main/assets/third-party/depth-anything-v2-small-NOTICE.txt) 和 [许可证](app/src/main/assets/third-party/depth-anything-v2-small-LICENSE.txt)。原稳定 TFLite 模型继续通过已发布的模型资产按需下载并校验 SHA-256。
 - v1.6.00 可选 Small 770 模型为本项目从原稳定 518 图转换的独立衍生资产，非上游官方 770 发布。位置编码插值和空间常量调整见 [技术记录](docs/depth-resolution-v1.6.00.md)；Small 与 DINOv2 的 Apache-2.0 授权和修改说明见 [许可证](docs/licenses/Depth-Anything-V2-APACHE-2.0.txt) 与 [来源说明](docs/licenses/Depth-Anything-V2-770-NOTICE.txt)。Release 随模型附完整 LICENSE 文件。
 
 ## Video Depth Anything
@@ -33,6 +33,11 @@
 - 说明：当前 Android 推理链路还需要 TFLite/ONNX/MNN/QNN 等移动端模型资产后才能本地运行；不会把 PyTorch checkpoint 标记为 App 可运行模型。
 - v2.32 转换记录：Small 权重已下载到本机临时目录，SHA-256 为 `13379300B739E659F076A59D52E9801BD8D38C541A7E71F73BBCA4DCFB013609`；因本机缺少 Python/PyTorch/TensorFlow 转换链，未上传模型资产。
 - 许可提醒：官方 Small 模型为 Apache-2.0；Base/Large 为 CC-BY-NC-4.0，后续导入模型时需要按实际权重许可处理。
+
+## ONNX Runtime 与 Qualcomm QNN
+
+- Android 依赖 `com.microsoft.onnxruntime:onnxruntime-android-qnn:1.29.0` 和 `com.qualcomm.qti:qnn-runtime:2.42.0` 来自 Maven Central，用于在兼容设备上执行 QNN GPU 推理。[ONNX Runtime](https://central.sonatype.com/artifact/com.microsoft.onnxruntime/onnxruntime-android-qnn/1.29.0) · [Qualcomm QNN](https://central.sonatype.com/artifact/com.qualcomm.qti/qnn-runtime/2.42.0)
+- APK 随附 [ONNX Runtime 许可证](app/src/main/assets/third-party/onnxruntime-LICENSE.txt) 和 [第三方声明](app/src/main/assets/third-party/onnxruntime-ThirdPartyNotices.txt)。QNN 运行库以 App 内的一部分分发，其 AI Stack 许可与声明原样打包在 `assets/third-party/qnn/LICENSE.pdf`、`NOTICE.txt`。[QNN runtime AAR](https://central.sonatype.com/artifact/com.qualcomm.qti/qnn-runtime/2.42.0)
 
 ## SamSeenX/ComfyUI_SSStereoscope
 

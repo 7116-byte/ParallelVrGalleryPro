@@ -16,13 +16,14 @@ import android.view.accessibility.AccessibilityNodeInfo;
 
 /** Real multi-pointer input on an explicitly named QA album; debug builds only. */
 public final class StudioGestureInstrumentation extends Instrumentation {
-    private String album, sample, kind;
+    private String album, sample, kind, label;
     private boolean compatibilityDialogInput;
     @Override public void onCreate(Bundle args) {
         super.onCreate(args);
         album = args.getString("album", ""); sample = args.getString("sample", "");
         kind = args.getString("kind", "gestures");
-        if (!album.startsWith("PVG_QA_") || !sample.startsWith("PVG_QA_")) {
+        label = args.getString("label", "");
+        if (!kind.equals("qnnPipeline518") && (!album.startsWith("PVG_QA_") || !sample.startsWith("PVG_QA_"))) {
             Bundle result = new Bundle(); result.putString("error", "Explicit QA album/sample required"); finish(1, result); return;
         }
         start();
@@ -30,6 +31,20 @@ public final class StudioGestureInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if (kind.equals("qnnPipeline518")) {
+                PerformancePipelineQa.runQnn518(getTargetContext(), label);
+                String evidence;
+                switch (label) {
+                    case "export": evidence = "exported synthetic QA evidence"; break;
+                    case "qnnDefault": evidence = "isolated fresh QNN defaults, strict preparation without inference and preference preservation"; break;
+                    case "qnn770": evidence = "bundled strict QNN 770 image and preparation"; break;
+                    case "qnn1036": evidence = "bundled strict QNN 1036 image and video, exact video PTS and AAC samples"; break;
+                    default: evidence = "fresh forced-GPU 518 images and video, exact video PTS and AAC samples";
+                }
+                result.putString("qa", "PASS: " + evidence);
+                finish(0, result);
+                return;
+            }
             if(kind.equals("originalRetriever")){OriginalExportQa.retrieverOwnership(getTargetContext());result.putString("qa","PASS: retriever opaque pixels, six modes, exact shared eyes and ownership lifetime");finish(0,result);return;}
             if(kind.equals("originalExportMore")){OriginalExportQa.moreImages(getTargetContext());result.putString("qa","PASS: three portraits, official crop, real 770 and failure paths");finish(0,result);return;}
             if(kind.equals("originalExport")){OriginalExportQa.images(getTargetContext());result.putString("qa","PASS: original PNG rendering and publication");finish(0,result);return;}

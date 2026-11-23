@@ -17,7 +17,7 @@ import android.graphics.BitmapRegionDecoder
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ImageDecoder
-import android.graphics.Rect
+import android.graphics.Rect as BitmapRect
 import android.graphics.SurfaceTexture
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -121,9 +121,9 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.layout.wrapContentHeight
@@ -151,7 +151,9 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -161,6 +163,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -186,6 +189,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.draw.clip
@@ -195,9 +199,13 @@ import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -217,7 +225,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
@@ -404,7 +414,10 @@ data class VideoGenerationParams(
     val useGpu: Boolean = false,
     val depthWorkers: Int = 2,
 ) {
-    fun toVrParams(): VrGenerationParams = vr.copy(modelThreads = modelThreads, useGpu = useGpu, forceGpuNoFallback = useGpu)
+    fun toVrParams(): VrGenerationParams {
+        val gpu = useGpu || qnnModelConfig(vr.depthModel) != null
+        return vr.copy(modelThreads = modelThreads, useGpu = gpu, forceGpuNoFallback = gpu)
+    }
 }
 
 enum class AppLanguage {
@@ -422,8 +435,8 @@ enum class GpuTestMode {
 
 data class AppSettings(
     val language: AppLanguage = AppLanguage.ZH,
-    val imageModelId: String = "depth_anything_v2_small_tflite",
-    val videoModelId: String = "depth_anything_v2_small_tflite",
+    val imageModelId: String = DEFAULT_TFLITE_MODEL_ID,
+    val videoModelId: String = DEFAULT_TFLITE_MODEL_ID,
     val autoPrefetch: Boolean = true,
     val prefetchWindow: Int = 2,
     val depthScale: Float = 40f,
@@ -446,6 +459,9 @@ data class AppSettings(
     val invertModelDepth: Boolean = false,
     val imageExportFormat: String = "PNG",
 ) {
+    private val imageQnn: Boolean get() = qnnModelConfig(imageModelId) != null
+    private val imageGpu: Boolean get() = useGpu || imageQnn
+
     fun toParams(): VrGenerationParams = VrGenerationParams(
         depthModel = imageModelId,
         depthScale = depthScale,
@@ -453,22 +469,27 @@ data class AppSettings(
         fillRadius = fillRadius,
         invertDepth = invertDepth,
         maxLongEdge = maxLongEdge,
-        modelThreads = modelThreads,
-        useGpu = useGpu,
-        gpuTestMode = gpuTestMode,
-        forceGpuNoFallback = useGpu,
+        modelThreads = if (imageQnn) 1 else modelThreads,
+        useGpu = imageGpu,
+        gpuTestMode = if (imageQnn) GpuTestMode.AUTO else gpuTestMode,
+        forceGpuNoFallback = imageGpu,
         edgeMode = edgeMode,
         depthUpscale = depthUpscale,
         matchV10Default = matchV10Default,
         invertModelDepth = invertModelDepth,
     )
 
-    fun toVideoParams(): VideoGenerationParams = VideoGenerationParams(
-        vr = toParams().copy(depthModel = videoModelId, useGpu = videoUseGpu, forceGpuNoFallback = videoUseGpu),
-        modelThreads = videoModelThreads,
-        useGpu = videoUseGpu,
-        depthWorkers = videoDepthWorkers,
-    )
+    fun toVideoParams(): VideoGenerationParams {
+        val qnn = qnnModelConfig(videoModelId) != null
+        val gpu = videoUseGpu || qnn
+        return VideoGenerationParams(
+            vr = toParams().copy(depthModel = videoModelId, useGpu = gpu,
+                gpuTestMode = if (qnn) GpuTestMode.AUTO else gpuTestMode, forceGpuNoFallback = gpu),
+            modelThreads = if (qnn) 1 else videoModelThreads,
+            useGpu = gpu,
+            depthWorkers = if (qnn) 1 else videoDepthWorkers,
+        )
+    }
 }
 
 data class ModelSpec(
@@ -485,9 +506,18 @@ data class ModelSpec(
     val noteEn: String = "",
 )
 
+private const val DEFAULT_TFLITE_MODEL_ID = "depth_anything_v2_small_tflite"
+private const val HIGH_TFLITE_MODEL_ID = "depth_anything_v2_small_770_v1"
+
+// Earlier versions saved the stable TFLite ID even when the user kept the default.
+// Resolve the saved choice before applying the active aspect preference migration.
+internal fun preferredDepthModelId(savedId: String?, legacyId: String?, qnnAvailable: Boolean): String =
+    activeDepthModelId(savedId?.takeIf { it.isNotBlank() } ?: legacyId?.takeIf { it.isNotBlank() }
+        ?: if (qnnAvailable) QNN_FP16_MODEL_ID else DEFAULT_TFLITE_MODEL_ID)
+
 private val ImageModels = listOf(
     ModelSpec(
-        id = "depth_anything_v2_small_tflite",
+        id = DEFAULT_TFLITE_MODEL_ID,
         displayName = "Depth Anything V2 Small TFLite 518（稳定）",
         inputSize = 518,
         fileName = "depth_anything_v2.tflite",
@@ -499,7 +529,7 @@ private val ImageModels = listOf(
         sha256 = "B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F",
     ),
     ModelSpec(
-        id = "depth_anything_v2_small_770_v1",
+        id = HIGH_TFLITE_MODEL_ID,
         displayName = "Depth Anything V2 Small 770（高分辨率）",
         inputSize = 770,
         fileName = "depth_anything_v2_small_770_v1.tflite",
@@ -519,9 +549,29 @@ private val ImageModels = listOf(
         ),
         sha256 = "727E025EAB1DB3650C6FED86AA8D7932B994D8746E41A7A5773E663DE740859F",
     ),
-)
+) + QnnDepthVariant.entries.flatMap { variant ->
+    (QNN_FP16_MIN_TOKENS..QNN_FP16_MAX_TOKENS).flatMap { count ->
+        val size = count * QNN_FP16_PATCH_SIZE
+        QnnDepthAspect.entries.map { aspect ->
+            val dimensions = when (aspect) {
+                QnnDepthAspect.SQUARE -> "$size"
+                QnnDepthAspect.FIT -> "${size}² · padded"
+                QnnDepthAspect.ALIGNED -> "${size}² · 14 px patches"
+                QnnDepthAspect.WIDE_TALL, QnnDepthAspect.PORTRAIT_PAIR -> qnnFixedPairSizes(size, aspect)
+            }
+            ModelSpec(
+                id = qnnModelId(QnnModelConfig(variant, size, aspect)),
+                displayName = "Depth Anything V2 · QNN GPU ${variant.displayPrecision} · $dimensions",
+                inputSize = size,
+                fileName = variant.assetName.substringAfterLast('/'),
+                url = variant.source,
+                sha256 = variant.sha256,
+            )
+        }
+    }
+}
 
-private val VideoModels = ImageModels.filter { it.inputSize == 518 } + listOf(
+private val VideoModels = ImageModels.filter { it.inputSize == 518 || hasQnnModelPrefix(it.id) } + listOf(
     ModelSpec(
         id = "video_depth_anything_small_pending",
         displayName = "Video Depth Anything Small（视频专用，待导入）",
@@ -570,7 +620,9 @@ data class CacheVersionSummary(
 data class ManagedCacheItem(
     val photoItem: PhotoItem,
     val entry: VrCacheEntry,
-)
+) {
+    val resultKey: Pair<String, String> get() = entry.photoKey to entry.version
+}
 
 data class VideoCacheEntry(
     val videoKey: String,
@@ -581,6 +633,9 @@ data class VideoCacheEntry(
     val durationMs: Long,
     val fps: Int,
     val createdAt: Long,
+    val modelId: String = "",
+    val cacheVersion: String = "",
+    val depthGeometry: VideoDepthGeometry? = null,
 )
 
 data class VrJob(
@@ -628,6 +683,8 @@ data class VideoPipelineStats(
     val cacheHits: Int = 0,
     val cacheWriteQueue: Int = 0,
     val lastCacheWriteMs: Long = 0L,
+    val preparedInputQueue: Int = 0,
+    val uprightDepthQueue: Int = 0,
 )
 
 data class VideoFrameTimings(
@@ -638,8 +695,9 @@ data class VideoFrameTimings(
     val sbsMs: Long = 0L,
     val cacheWriteMs: Long = 0L,
     val encodeMs: Long = 0L,
-    val depthWidth: Int = 0,
-    val depthHeight: Int = 0,
+    val depthGeometry: VideoDepthGeometry? = null,
+    val inputTransformNanos: Long = 0L,
+    val depthRotationNanos: Long = 0L,
 ) {
     val totalMs: Long
         get() = decodeMs + depthMs + temporalMs + depthPostMs + sbsMs + cacheWriteMs + encodeMs
@@ -689,28 +747,23 @@ data class UiState(
     val manageViewerKeys: Set<String> = emptySet(),
     val viewerScopeKeys: Set<String> = emptySet(),
     val viewerScopeOrderedKeys: List<String> = emptyList(),
+    val viewerGeneratedResults: List<Pair<String, String>>? = null,
+    val viewerResultVersion: String? = null,
     val viewerQueueSource: String? = null,
     val viewerQueueAlbumId: String? = null,
     val galleryAnchorIndex: Int = 0,
-    val galleryScrollIndex: Int = 0,
-    val galleryScrollOffset: Int = 0,
-    val galleryAnchorSlot: Int = 0,
+    val galleryAnchorKey: String? = null,
     val settingsOpen: Boolean = false,
     val manageOpen: Boolean = false,
     val homeTab: String = "all",
     val generatedTab: String = "images",
     val selectedGeneratedVersion: String? = null,
+    val additionalImageSources: List<String> = emptyList(),
     val allColumns: Int = 5,
     val albumListColumns: Int = 5,
     val albumDetailColumns: Int = 5,
     val generatedColumns: Int = 5,
     val expandedGeneratedVersions: Set<String> = emptySet(),
-    val generatedImageScrollIndex: Int = 0,
-    val generatedImageScrollOffset: Int = 0,
-    val generatedVersionScrollIndexes: Map<String, Int> = emptyMap(),
-    val generatedVersionScrollOffsets: Map<String, Int> = emptyMap(),
-    val generatedVideoScrollIndex: Int = 0,
-    val generatedVideoScrollOffset: Int = 0,
     val allOffset: Int = 0,
     val allLoading: Boolean = false,
     val allExhausted: Boolean = false,
@@ -750,6 +803,21 @@ data class UiState(
     val updateApkPath: String? = null,
 )
 
+private fun UiState.allGalleryAnchorIndex(): Int = galleryAnchorKey
+    ?.let { key -> photos.indexOfFirst { it.cacheKey == key }.takeIf { it >= 0 } }
+    ?: galleryAnchorIndex
+
+private fun UiState.viewerEntry(photo: PhotoItem): VrCacheEntry? {
+    val version = viewerResultVersion ?: return entries[photo.cacheKey]
+    return managedCacheItems.firstOrNull { it.entry.photoKey == photo.cacheKey && it.entry.version == version }?.entry
+}
+
+internal fun UiState.canWarmImageModel(visible: Boolean, queueRestored: Boolean): Boolean =
+    visible && queueRestored && hasPermission && !loading && !allLoading && !albumLoading &&
+        !settingsOpen && !manageOpen && selectedIndex == null && homeTab != "generated" &&
+        blockingMessage == null && videoStates.values.none(VideoCommandPolicy::canPause) &&
+        states.values.none { it == VrState.QUEUED || it == VrState.GENERATING }
+
 private data class MediaSnapshot(
     val photos: List<PhotoItem>,
     val imageCount: Int,
@@ -779,6 +847,12 @@ private sealed class TimelineCell {
     data class Header(val day: Long, val label: String) : TimelineCell()
     data class Media(val item: PhotoItem) : TimelineCell()
     data class Footer(val loaded: Int, val total: Int, val text: String? = null) : TimelineCell()
+
+    val gridKey: String get() = when (this) {
+        is Header -> "header_$day"
+        is Media -> item.cacheKey
+        is Footer -> "footer_${loaded}_${total}_${text.orEmpty()}"
+    }
 }
 
 enum class QueueSource {
@@ -873,36 +947,72 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
     init {
         modelWarmupJob = viewModelScope.launch(Dispatchers.IO) {
             combine(_uiState, uiVisible) { state, visible ->
-                state.settings.toParams() to (visible && !state.loading && !state.settingsOpen && !state.manageOpen &&
-                    state.selectedIndex == null && state.homeTab != "generated" &&
-                    state.videoStates.values.none(VideoCommandPolicy::canPause) &&
-                    state.states.values.none { it == VrState.QUEUED || it == VrState.GENERATING })
+                state.settings.toParams() to state.canWarmImageModel(visible, queueRestorationComplete)
             }.distinctUntilChanged { old, new -> old.first.depthSessionKey() == new.first.depthSessionKey() && old.second == new.second }
                 .collectLatest { (params, allowed) ->
                     if (!allowed) return@collectLatest
                     delay(1200) // Keep cold-start layout and immediate navigation clear of model compilation.
+                    val key = params.depthSessionKey()
+                    fun stillIdle(): Boolean = _uiState.value.let {
+                        it.canWarmImageModel(uiVisible.value, queueRestorationComplete) &&
+                            it.settings.toParams().depthSessionKey() == key
+                    }
+                    if (!stillIdle()) return@collectLatest
+                    val warmupContext = currentCoroutineContext()
+                    fun checkCurrent() {
+                        warmupContext.ensureActive()
+                        if (!stillIdle()) throw java.util.concurrent.CancellationException("Image warmup no longer idle")
+                    }
+                    var lastWarmupStatus: String? = null
                     fun report(status: String) {
+                        lastWarmupStatus = status
                         _uiState.update {
-                            if (it.settings.toParams().depthSessionKey() == params.depthSessionKey()) it.copy(modelWarmupStatus = status) else it
+                            if (it.settings.toParams().depthSessionKey() == key) it.copy(modelWarmupStatus = status) else it
                         }
                     }
                     if (!modelManager.hasLocalModel(params.depthModel)) {
-                        report("模型未下载，首次生成时下载 / Model downloads on first generation")
+                        val status = if (hasQnnModelPrefix(params.depthModel)) modelManager.statusText(params.depthModel)
+                            else "模型未下载，首次生成时下载 / Model downloads on first generation"
+                        report(status)
+                        return@collectLatest
+                    }
+                    val qnn = qnnModelConfig(params.depthModel)
+                    val qnnShapes = qnn?.let { QnnInputGeometry.warmupGeometries(it.size, it.aspect) }
+                    if (qnnShapes?.isEmpty() == true) {
+                        report("按素材比例准备推理尺寸 / Model shape is prepared for each source aspect")
                         return@collectLatest
                     }
                     val started = SystemClock.uptimeMillis()
                     report("正在后台初始化图片模型 / Preparing image model in background")
-                    addLog("model warmup start ${params.depthSessionKey()}")
+                    addLog("model warmup start $key")
+                    android.util.Log.i("PvgDepthWarmup", "Gallery loaded, preparing model=${params.depthModel}")
                     try {
-                        generator.prepareImageSession(params) { addLog("model warmup $it") }
+                        generator.prepareImageSession(params, qnnShapes.orEmpty(), ::checkCurrent, onShapeReady = { count, total ->
+                            if (count == total) {
+                                val elapsed = SystemClock.uptimeMillis() - started
+                                val ratios = if (qnn?.aspect == QnnDepthAspect.PORTRAIT_PAIR) "9:16 / 3:4" else "16:9 / 9:16"
+                                report("$ratios 已在内存就绪（${elapsed}ms）/ $ratios ready in memory")
+                            } else {
+                                report("正在后台预热图片模型（$count/$total）/ Preparing image model in background ($count/$total)")
+                            }
+                            android.util.Log.i("PvgDepthWarmup", "Prepared shape $count/$total model=${params.depthModel}")
+                        }) { addLog("model warmup $it") }
+                        checkCurrent()
                         val elapsed = SystemClock.uptimeMillis() - started
-                        report("图片模型已在内存就绪（${elapsed}ms）/ Image model ready in memory")
-                        addLog("model warmup ready ${params.depthSessionKey()} ${elapsed}ms")
+                        if (qnnShapes?.size != 2) report("图片模型已在内存就绪（${elapsed}ms）/ Image model ready in memory")
+                        addLog("model warmup ready $key ${elapsed}ms")
+                        android.util.Log.i("PvgDepthWarmup", "Model ready=${params.depthModel} elapsedMs=$elapsed")
                     } catch (error: java.util.concurrent.CancellationException) {
+                        _uiState.update {
+                            if (it.settings.toParams().depthSessionKey() == key && it.modelWarmupStatus == lastWarmupStatus) {
+                                it.copy(modelWarmupStatus = null)
+                            } else it
+                        }
                         throw error
                     } catch (error: Throwable) {
                         report("模型预加载失败，生成时可重试 / Model preload failed: ${error.shortMessage()}")
-                        addLog("model warmup failed ${params.depthSessionKey()}: ${error.shortMessage()}")
+                        addLog("model warmup failed $key: ${error.shortMessage()}")
+                        android.util.Log.w("PvgDepthWarmup", "Model preparation failed=${params.depthModel}: ${error.shortMessage()}")
                     }
                 }
         }
@@ -1057,6 +1167,7 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
                         videoEntries = snapshot.videoEntries,
                         allOffset = mergedPhotos.count { !it.generatedVirtual },
                         allExhausted = mergedPhotos.count { !it.generatedVirtual } < INITIAL_MEDIA_LIMIT,
+                        albumOffsets = emptyMap(),
                         loading = !queueRestorationComplete,
                         message = "已加载最近 ${mergedPhotos.count { !it.generatedVirtual }} 项媒体，生成库 ${latestManaged.size + snapshot.videoEntries.size} 项 / Loaded recent media and generated cache",
                         cacheVersions = cache.summaries(),
@@ -1104,19 +1215,12 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         }
     }
 
-    fun openPhoto(index: Int, firstVisibleIndex: Int = index, firstVisibleOffset: Int = 0) {
-        openPhoto(index, firstVisibleIndex, firstVisibleOffset, emptyList())
-    }
-
-    fun openScopedPhoto(index: Int, scopeKeys: List<String>, firstVisibleIndex: Int = index, firstVisibleOffset: Int = 0) {
-        openPhoto(index, firstVisibleIndex, firstVisibleOffset, scopeKeys)
-    }
-
-    private fun openPhoto(index: Int, firstVisibleIndex: Int, firstVisibleOffset: Int, scopeKeys: List<String>) = synchronized(imageRuns) {
+    fun openScopedPhoto(index: Int, scopeKeys: List<String>) = synchronized(imageRuns) {
         val item = _uiState.value.photos.getOrNull(index)
         currentImageFirst.select(item?.cacheKey)
         pauseWaitingImageJobs()
         val queueContext = activeQueueContext(_uiState.value)
+        val allSource = isAllGallerySource(queueContext.source.name)
         val orderedKeys = scopeKeys.ifEmpty {
             _uiState.value.photos.filter {
                 !it.generatedVirtual && (queueContext.source != QueueSource.ALBUM || it.bucketId == queueContext.albumId)
@@ -1125,10 +1229,8 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         _uiState.update {
             it.copy(
                 selectedIndex = index,
-                galleryAnchorIndex = index,
-                galleryScrollIndex = firstVisibleIndex,
-                galleryScrollOffset = firstVisibleOffset,
-                galleryAnchorSlot = (index - firstVisibleIndex).coerceAtLeast(0),
+                galleryAnchorIndex = if (allSource) index else it.galleryAnchorIndex,
+                galleryAnchorKey = if (allSource) item?.cacheKey else it.galleryAnchorKey,
                 vrMode = true,
                 viewerOrigin = ViewerOrigin.NORMAL,
                 viewerTravelDirection = 0,
@@ -1145,35 +1247,28 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         if (item?.kind == MediaKind.IMAGE) enqueueWindow(index, includeCurrent = true)
     }
 
-    fun openGeneratedPhoto(index: Int, entry: VrCacheEntry? = null) = synchronized(imageRuns) {
+    fun openGeneratedPhoto(index: Int, entry: VrCacheEntry) = synchronized(imageRuns) {
         currentImageFirst.select(null)
-        val photo = _uiState.value.photos.getOrNull(index)
         _uiState.update {
-            val version = entry?.version ?: it.selectedGeneratedVersion
-            val scopedItems = if (version != null) {
-                it.managedCacheItems.filter { item -> item.entry.version == version }
-            } else {
-                it.managedCacheItems
-            }
-            val keys = scopedItems.map { item -> item.photoItem.cacheKey }.toSet()
-            val scopedEntries = scopedItems.associate { item -> item.photoItem.cacheKey to item.entry }
+            val album = generatedAlbumKey(entry.version)
+            val results = it.managedCacheItems.filter { item -> generatedAlbumKey(item.entry.version) == album }
+            val keys = results.map { item -> item.entry.photoKey }.distinct()
             val origin = if (it.manageOpen) ViewerOrigin.MANAGE_MODAL else ViewerOrigin.GENERATED_TAB
             it.copy(
                 selectedIndex = index,
-                galleryAnchorIndex = index,
-                galleryScrollIndex = max(0, index - it.galleryAnchorSlot),
                 manageOpen = false,
                 homeTab = if (origin == ViewerOrigin.GENERATED_TAB) "generated" else it.homeTab,
                 generatedTab = "images",
-                selectedGeneratedVersion = entry?.version ?: it.selectedGeneratedVersion,
+                selectedGeneratedVersion = album,
                 viewerOrigin = origin,
                 vrMode = false,
-                manageViewerKeys = keys + listOfNotNull(photo?.cacheKey),
-                viewerScopeKeys = keys + listOfNotNull(photo?.cacheKey),
-                viewerScopeOrderedKeys = (scopedItems.map { item -> item.photoItem.cacheKey } + listOfNotNull(photo?.cacheKey)).distinct(),
+                manageViewerKeys = keys.toSet(),
+                viewerScopeKeys = keys.toSet(),
+                viewerScopeOrderedKeys = keys,
+                viewerGeneratedResults = results.map { item -> item.resultKey },
+                viewerResultVersion = entry.version,
                 viewerQueueSource = QueueSource.GENERATED.name,
                 viewerQueueAlbumId = null,
-                entries = if (photo != null && entry != null) it.entries + scopedEntries + (photo.cacheKey to entry) else it.entries,
                 message = null,
             )
         }
@@ -1191,8 +1286,6 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
             val origin = if (it.manageOpen) ViewerOrigin.MANAGE_MODAL else ViewerOrigin.GENERATED_TAB
             it.copy(
                 selectedIndex = index,
-                galleryAnchorIndex = index,
-                galleryScrollIndex = max(0, index - it.galleryAnchorSlot),
                 manageOpen = false,
                 homeTab = if (origin == ViewerOrigin.GENERATED_TAB) "generated" else it.homeTab,
                 generatedTab = "videos",
@@ -1213,7 +1306,6 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         val wasNormalViewer = _uiState.value.viewerOrigin == ViewerOrigin.NORMAL
         currentImageFirst.select(null)
         _uiState.update {
-            val currentIndex = it.selectedIndex ?: it.galleryAnchorIndex
             val returnToManage = it.viewerOrigin == ViewerOrigin.MANAGE_MODAL
             val returnToGeneratedTab = it.viewerOrigin == ViewerOrigin.GENERATED_TAB
             it.copy(
@@ -1225,11 +1317,12 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
                 manageViewerKeys = emptySet(),
                 viewerScopeKeys = emptySet(),
                 viewerScopeOrderedKeys = emptyList(),
+                viewerGeneratedResults = null,
+                viewerResultVersion = null,
                 viewerQueueSource = null,
                 viewerQueueAlbumId = null,
                 vrMode = if (wasNormalViewer) false else it.vrMode,
                 prefetchSlotState = PrefetchSlotState(),
-                galleryAnchorIndex = currentIndex,
             )
         }
         if (!wasNormalViewer) {
@@ -1244,7 +1337,7 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
                 homeTab = tab,
                 manageOpen = false,
                 vrMode = if (it.selectedIndex == null) false else it.vrMode,
-                selectedGeneratedVersion = if (tab == "generated") it.selectedGeneratedVersion else null,
+                selectedGeneratedVersion = null,
             )
         }
         rebalanceQueueForActiveSource()
@@ -1276,24 +1369,6 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         }
     }
 
-    fun setGeneratedScroll(tab: String, index: Int, offset: Int) {
-        _uiState.update {
-            when (tab) {
-                "videos" -> it.copy(generatedVideoScrollIndex = index.coerceAtLeast(0), generatedVideoScrollOffset = offset.coerceAtLeast(0))
-                else -> it.copy(generatedImageScrollIndex = index.coerceAtLeast(0), generatedImageScrollOffset = offset.coerceAtLeast(0))
-            }
-        }
-    }
-
-    fun setGeneratedVersionScroll(version: String, index: Int, offset: Int) {
-        _uiState.update {
-            it.copy(
-                generatedVersionScrollIndexes = it.generatedVersionScrollIndexes + (version to index.coerceAtLeast(0)),
-                generatedVersionScrollOffsets = it.generatedVersionScrollOffsets + (version to offset.coerceAtLeast(0)),
-            )
-        }
-    }
-
     fun toggleGeneratedVersion(version: String) {
         _uiState.update {
             val expanded = it.expandedGeneratedVersions
@@ -1303,7 +1378,7 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
 
     fun openAlbum(bucketId: String) {
         _uiState.update { it.copy(homeTab = "albums", selectedAlbumId = bucketId, manageOpen = false) }
-        loadAlbumPage(bucketId, reset = true)
+        if (bucketId !in _uiState.value.albumOffsets) loadAlbumPage(bucketId, reset = true)
         rebalanceQueueForActiveSource()
         startWorker()
     }
@@ -1699,12 +1774,14 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
             settingsStore.profile(requested.edgeMode).applyTo(requested)
         } else requested
         settingsStore.save(settings)
+        val modelChanged = before.toParams().depthSessionKey() != settings.toParams().depthSessionKey()
         _uiState.update {
             it.copy(
                 settings = settings,
                 activePrefetchWindow = if (settings.autoPrefetch) 2 else settings.prefetchWindow,
                 prefetchSlotState = PrefetchSlotState(),
                 modelStatus = modelStatusText(settings),
+                modelWarmupStatus = if (modelChanged) null else it.modelWarmupStatus,
             )
         }
         _uiState.value.selectedIndex?.let { refreshWindow(it) }
@@ -1724,14 +1801,30 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         updateSettings(settingsStore.defaultProfile(settings.edgeMode).applyTo(settings))
     }
 
-    fun onPagerIndexChanged(index: Int) = synchronized(imageRuns) {
+    fun onPagerIndexChanged(index: Int, version: String?) = synchronized(imageRuns) {
         val before = _uiState.value
+        if (before.viewerGeneratedResults != null) {
+            if (before.selectedIndex != null && (before.selectedIndex != index || before.viewerResultVersion != version)) {
+                _uiState.update { it.copy(selectedIndex = index, viewerResultVersion = version) }
+            }
+            return
+        }
         if (before.selectedIndex == null || before.selectedIndex == index || index !in viewerScopeIndices(before)) return
         currentImageFirst.select(before.photos.getOrNull(index)?.cacheKey)
         if (before.viewerOrigin == ViewerOrigin.NORMAL && before.vrMode) pauseWaitingImageJobs()
         val scope = viewerScopeIndices(before)
         val direction = NeighborPriority.direction(scope.indexOf(before.selectedIndex), scope.indexOf(index))
-        _uiState.update { it.copy(selectedIndex = index, galleryAnchorIndex = index, viewerTravelDirection = direction, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow, prefetchSlotState = PrefetchSlotState()) }
+        val allSource = isAllGallerySource(before.viewerQueueSource)
+        _uiState.update {
+            it.copy(
+                selectedIndex = index,
+                galleryAnchorIndex = if (allSource) index else it.galleryAnchorIndex,
+                galleryAnchorKey = if (allSource) before.photos.getOrNull(index)?.cacheKey else it.galleryAnchorKey,
+                viewerTravelDirection = direction,
+                activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow,
+                prefetchSlotState = PrefetchSlotState(),
+            )
+        }
         val state = _uiState.value
         if (state.viewerOrigin != ViewerOrigin.NORMAL) return
         if (state.vrMode && state.photos.getOrNull(index)?.kind == MediaKind.IMAGE) {
@@ -1815,10 +1908,12 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
     }
 
     fun exportDebug(context: Context, index: Int) {
-        val photo = _uiState.value.photos.getOrNull(index) ?: return
+        val state = _uiState.value
+        val photo = state.photos.getOrNull(index) ?: return
+        val version = state.viewerResultVersion
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
-                val entry = cache.findEntry(photo) ?: return@withContext null
+                val entry = cache.findEntry(photo, version) ?: return@withContext null
                 DebugExporter(context, cache).export(photo, entry)
             }
             if (result == null) {
@@ -1836,8 +1931,11 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         }
     }
 
-    fun openDebug(index: Int) {
-        _uiState.update { it.copy(debugIndex = index) }
+    fun openDebug(index: Int, version: String?) {
+        _uiState.update {
+            if (version == null) it.copy(debugIndex = index)
+            else it.copy(debugIndex = index, selectedIndex = index, viewerResultVersion = version)
+        }
     }
 
     fun startComparison(index: Int) {
@@ -1889,17 +1987,12 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         _uiState.update { it.copy(manageOpen = false) }
     }
 
-    fun deleteCacheVersion(version: String) {
-        deleteCacheVersions(listOf(version))
-    }
-
-    fun deleteCacheVersions(versions: List<String>) {
-        val selected = versions.toSet()
-        if (selected.isEmpty()) return
-        deleteImageWork(
-            entries = _uiState.value.managedCacheItems.filter { it.entry.version in selected },
-            versions = selected,
-        )
+    fun deleteGeneratedAlbums(albums: List<String>) = synchronized(imageRuns) {
+        if (albums.isEmpty()) return
+        val selected = albums.toSet()
+        val entries = _uiState.value.managedCacheItems.filter { generatedAlbumKey(it.entry.version) in selected }
+        if (entries.isEmpty()) return
+        deleteImageWork(entries, selected)
     }
 
     fun saveGeneratedCopy(context: Context, index: Int) {
@@ -1908,7 +2001,7 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
 
     fun saveGeneratedCopies(context: Context, indexes: List<Int>) {
         val state = _uiState.value
-        val version = state.selectedGeneratedVersion.takeIf { state.homeTab == "generated" || state.viewerOrigin != ViewerOrigin.NORMAL }
+        val version = state.viewerResultVersion
         val selected = indexes.distinct().mapNotNull { index ->
             state.photos.getOrNull(index)?.let { photo -> cache.findEntry(photo, version)?.let { ManagedCacheItem(photo, it) } }
         }
@@ -2032,22 +2125,29 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         if (entries.isNotEmpty()) deleteImageWork(entries)
     }
 
-    private fun deleteImageWork(entries: List<ManagedCacheItem>, versions: Set<String> = emptySet()) {
+    private fun deleteImageWork(entries: List<ManagedCacheItem>, albums: Set<String> = emptySet()) {
         // Invalidate synchronously: a worker finishing during the IO dispatch cannot resurrect a deletion.
-        val selectedIdentities = entries.mapTo(hashSetOf()) { it.entry.photoKey to it.entry.version }
+        val selectedIdentities = entries.mapTo(hashSetOf()) { it.resultKey }
+        val versions = if (albums.isEmpty()) emptySet() else entries.mapTo(hashSetOf()) { it.entry.version }
         val (keys, deletingAll) = synchronized(imageRuns) {
+            val currentParams = _uiState.value.settings.toParams()
             val jobs = synchronized(pending) { pending.toList() } +
                 synchronized(currentPending) { currentPending.toList() } +
                 synchronized(paused) { paused.values.toList() } + claimedImageJobs + runningImageJobs.values.toList()
-            val deletingAll = _uiState.value.managedCacheItems.all { item ->
-                item.entry.version in versions || (item.entry.photoKey to item.entry.version) in selectedIdentities
+            val deletingAll = albums.isEmpty() && _uiState.value.managedCacheItems.all { item ->
+                item.resultKey in selectedIdentities
             }
             val affected = entries.mapTo(mutableSetOf()) { it.entry.photoKey }
             if (deletingAll) {
                 affected += _uiState.value.jobs.map { it.photoItem.cacheKey }
                 affected += queueTags.load().map { it.photoKey }
             }
-            jobs.filter { deletingAll || it.params?.cacheVersion() in versions }.mapTo(affected) { it.photo.cacheKey }
+            if (albums.isNotEmpty()) {
+                jobs.filter { generatedAlbumKey((it.params ?: currentParams).cacheVersion()) in albums }
+                    .mapTo(affected) { it.photo.cacheKey }
+                queueTags.load().filter { generatedAlbumKey((it.params ?: currentParams).cacheVersion()) in albums }
+                    .mapTo(affected) { it.photoKey }
+            }
             imageRuns.invalidate(affected)
             clearImageQueueForKeys(affected)
             _uiState.update { it.copy(blockingMessage = it.settings.language.t("删除中", "Deleting")) }
@@ -2068,7 +2168,9 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
                             states = (it.states - keys) + currentEntries.keys.associateWith { VrState.READY },
                             cacheVersions = cache.summaries(),
                             managedCacheItems = remaining,
-                            selectedGeneratedVersion = it.selectedGeneratedVersion?.takeUnless { version -> version in versions },
+                            selectedGeneratedVersion = it.selectedGeneratedVersion?.takeIf { album ->
+                                remaining.any { item -> generatedAlbumKey(item.entry.version) == album }
+                            },
                             blockingMessage = null,
                             message = it.settings.language.t("已删除 ${entries.size} 张图片缓存，相关任务已取消", "Deleted ${entries.size} image caches and cancelled their jobs"),
                         )
@@ -2121,8 +2223,7 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
     fun regenerateViewedImage(index: Int) {
         val state = _uiState.value
         val photo = state.photos.getOrNull(index) ?: return
-        val entry = state.managedCacheItems.firstOrNull { it.entry.photoKey == photo.cacheKey && it.entry.version == state.selectedGeneratedVersion }?.entry
-            ?: state.entries[photo.cacheKey] ?: return
+        val entry = state.viewerEntry(photo) ?: return
         regenerateImages(listOf(ManagedCacheItem(photo, entry)))
     }
 
@@ -2133,22 +2234,67 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         submitManualImages(selectedByKey.mapNotNull { (key, _) -> state.photos.firstOrNull { it.cacheKey == key } }, selectedByKey)
     }
 
-    fun generateAdditionalImages(indexes: List<Int>) {
-        val photos = indexes.distinct().mapNotNull { _uiState.value.photos.getOrNull(it) }
-            .filter { it.kind == MediaKind.IMAGE && !it.generatedVirtual }
-        submitManualImages(photos, emptyMap())
+    fun requestAdditionalImages(indexes: List<Int>) {
+        _uiState.update { state ->
+            val sources = indexes.mapNotNull { state.photos.getOrNull(it) }
+                .filter { it.kind == MediaKind.IMAGE && !it.generatedVirtual }
+                .map { it.cacheKey }.distinct()
+            if (sources.isEmpty()) state.copy(message = state.settings.language.t("没有可用原图", "No original photos available"))
+            else state.copy(additionalImageSources = sources)
+        }
     }
 
-    private fun submitManualImages(photos: List<PhotoItem>, selected: Map<String, List<ManagedCacheItem>>) {
+    fun cancelAdditionalImages() {
+        _uiState.update { it.copy(additionalImageSources = emptyList()) }
+    }
+
+    fun confirmAdditionalImages(): Unit = synchronized(imageRuns) {
+        val state = _uiState.value
+        val requested = state.settings.toParams()
+        val pendingJobs = synchronized(pending) { pending.toList() } +
+            synchronized(currentPending) { currentPending.toList() } +
+            synchronized(paused) { paused.values.toList() } + claimedImageJobs + runningImageJobs.values
+        val pendingResults = pendingJobs.filter { imageRuns.isCurrent(it.photo.cacheKey, it.runToken) }
+            .map { it.photo.cacheKey to (it.params ?: requested).cacheVersion() }
+        val version = requested.cacheVersion()
+        val photos = additionalImageSourceKeys(
+            state.additionalImageSources,
+            version,
+            state.managedCacheItems.map { it.resultKey },
+            pendingResults,
+        ).mapNotNull { key -> state.photos.firstOrNull { it.cacheKey == key && !it.generatedVirtual } }
+            .filter { cache.findEntry(it, version) == null }
+        val showAlbums = state.homeTab == "generated" || state.manageOpen || state.viewerOrigin != ViewerOrigin.NORMAL
+        if (showAlbums && state.selectedIndex != null) closeViewer()
+        _uiState.update {
+            it.copy(
+                additionalImageSources = emptyList(),
+                homeTab = if (showAlbums) "generated" else it.homeTab,
+                generatedTab = if (showAlbums) "images" else it.generatedTab,
+                selectedGeneratedVersion = if (showAlbums) null else it.selectedGeneratedVersion,
+                manageOpen = if (showAlbums) false else it.manageOpen,
+                message = if (photos.isEmpty()) it.settings.language.t(
+                    "这套参数的图片已存在或正在排队",
+                    "These photos already have results for these parameters or are queued",
+                ) else it.message,
+            )
+        }
+        if (photos.isNotEmpty()) submitManualImages(photos, emptyMap(), requested)
+    }
+
+    private fun submitManualImages(
+        photos: List<PhotoItem>,
+        selected: Map<String, List<ManagedCacheItem>>,
+        requested: VrGenerationParams = _uiState.value.settings.toParams(),
+    ) {
         if (photos.isEmpty()) { _uiState.update { it.copy(message = "没有可用原图，未修改旧结果") }; return }
-        val requested = _uiState.value.settings.toParams()
         synchronized(imageRuns) {
             val keys = photos.mapTo(mutableSetOf()) { it.cacheKey }
             imageRuns.invalidate(keys)
             clearImageQueueForKeys(keys)
             photos.distinctBy { it.cacheKey }.forEachIndexed { order, photo ->
                 val targets = selected[photo.cacheKey].orEmpty().map { CacheReplacementTarget(it.entry.version, it.entry.createdAt) }.distinct()
-                val existingTarget = cache.findEntry(photo, requested.cacheVersion())
+                val existingTarget = if (targets.isNotEmpty()) cache.findEntry(photo, requested.cacheVersion()) else null
                 // A pre-existing unselected target version is historical too: use a distinct slot.
                 val params = if (existingTarget != null && targets.none { it.version == existingTarget.version })
                     requested.copy(resultVariant = java.util.UUID.randomUUID().toString().take(8)) else requested
@@ -3066,6 +3212,8 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
                 }
             } || alreadyReady || sourceChanged) return
             val started = System.currentTimeMillis()
+            val model = qnnModelConfig(params.depthModel)
+            val modelReadyProgress = if (model != null && model.aspect != QnnDepthAspect.SQUARE) 0.55f else 0.12f
             val result = runCatching {
                 generator.generate(
                     next.photo,
@@ -3085,7 +3233,7 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
                                     modelStatus = if (progress < 1f) {
                                         "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%"
                                     } else {
-                                        "模型已就绪 / Model ready"
+                                        "模型文件已就绪 / Model file ready"
                                     },
                                 )
                             }
@@ -3093,7 +3241,8 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
                     },
                 ) { progress ->
                     imageRuns.ifCurrent(next.photo.cacheKey, next.runToken) {
-                        if (progress == 0.12f) {
+                        if (progress == modelReadyProgress &&
+                            model?.aspect != QnnDepthAspect.WIDE_TALL && model?.aspect != QnnDepthAspect.PORTRAIT_PAIR) {
                             _uiState.update {
                                 if (it.settings.toParams().depthSessionKey() == params.depthSessionKey())
                                     it.copy(modelWarmupStatus = "图片模型已在内存就绪 / Image model ready in memory") else it
@@ -3114,7 +3263,7 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
                     upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis(), source = next.source, albumId = next.albumId)
                     addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
                     val currentState = _uiState.value
-                    val selected = currentState.selectedIndex ?: currentState.galleryAnchorIndex
+                    val selected = currentState.selectedIndex ?: currentState.allGalleryAnchorIndex()
                     val doneIndex = currentState.photos.indexOfFirst { it.cacheKey == next.photo.cacheKey }
                     val generationInfo = LastGenerationInfo(relativeIndexInViewerScope(currentState, doneIndex, selected), System.currentTimeMillis() - started)
                     _uiState.update {
@@ -3258,7 +3407,7 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         runtimeInfo: String = "",
         finishedAt: Long? = null,
         error: String? = null,
-        frameTimings: VideoFrameTimings = VideoFrameTimings(),
+        frameTimings: VideoFrameTimings? = null,
         pipelineStats: VideoPipelineStats = VideoPipelineStats(),
         runToken: Long? = null,
     ): Unit = synchronized(videoControlLock) {
@@ -3266,6 +3415,7 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
         _uiState.update { current ->
             val previous = current.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }
             val existing = current.videoJobs.filterNot { it.item.cacheKey == item.cacheKey }
+            val previousTimings = previous?.takeIf { cacheVersion.isBlank() || it.cacheVersion == cacheVersion }?.frameTimings
             val job = VideoVrJob(
                 item = item,
                 state = state,
@@ -3287,7 +3437,7 @@ class GalleryViewModel @JvmOverloads constructor(application: Application, priva
                 startedAt = previous?.startedAt ?: System.currentTimeMillis(),
                 finishedAt = finishedAt,
                 error = error,
-                frameTimings = if (frameTimings.totalMs > 0L) frameTimings else previous?.frameTimings ?: VideoFrameTimings(),
+                frameTimings = frameTimings?.withPreviousFrame(previousTimings) ?: previousTimings ?: VideoFrameTimings(),
                 pipelineStats = if (pipelineStats != VideoPipelineStats()) pipelineStats else previous?.pipelineStats ?: VideoPipelineStats(),
             )
             current.copy(
@@ -3564,6 +3714,7 @@ private fun imagePrefetchSummary(state: UiState, index: Int, lang: AppLanguage):
 
 private class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+    private val qnnAvailable = QnnFp16DepthRuntime.hasGpuBackend(context)
 
     fun load(): AppSettings {
         // v1.1.00's global deletion blacklist incorrectly disabled normal source prefetch.
@@ -3578,11 +3729,14 @@ private class SettingsStore(context: Context) {
                 .apply()
             false
         }
-        val oldModelId = prefs.getString("modelId", "depth_anything_v2_small_tflite") ?: "depth_anything_v2_small_tflite"
+        migrateModelPreferences()
+        val legacyModelId = prefs.getString("modelId", null)
+        val imageModelId = preferredDepthModelId(prefs.getString("imageModelId", null), legacyModelId, qnnAvailable)
+        val videoModelId = preferredDepthModelId(prefs.getString("videoModelId", null), legacyModelId, qnnAvailable)
         val existing = AppSettings(
             language = runCatching { AppLanguage.valueOf(prefs.getString("language", AppLanguage.ZH.name) ?: AppLanguage.ZH.name) }.getOrDefault(AppLanguage.ZH),
-            imageModelId = prefs.getString("imageModelId", oldModelId) ?: oldModelId,
-            videoModelId = prefs.getString("videoModelId", oldModelId) ?: oldModelId,
+            imageModelId = imageModelId,
+            videoModelId = videoModelId,
             autoPrefetch = prefs.getBoolean("autoPrefetch", true),
             prefetchWindow = prefs.getInt("prefetchWindow", 2),
             depthScale = prefs.getFloat("depthScale", 40f),
@@ -3590,7 +3744,7 @@ private class SettingsStore(context: Context) {
             fillRadius = prefs.getInt("fillRadius", 10),
             invertDepth = invertDepth,
             maxLongEdge = prefs.getInt("maxLongEdge", 6000),
-            depthResolution = modelSpec(prefs.getString("imageModelId", oldModelId) ?: oldModelId).inputSize,
+            depthResolution = modelSpec(imageModelId).inputSize,
             generationWorkers = prefs.getInt("generationWorkers", 1),
             modelThreads = prefs.getInt("modelThreads", 4),
             useGpu = prefs.getBoolean("useGpu", false),
@@ -3634,14 +3788,28 @@ private class SettingsStore(context: Context) {
         prefs.edit().remove("modeDefault.${mode.name}").apply()
     }
 
+    private fun migrateModelPreferences() {
+        val replacements = listOf("modelId", "imageModelId", "videoModelId").mapNotNull { key ->
+            val savedId = prefs.getString(key, null) ?: return@mapNotNull null
+            val activeId = activeDepthModelId(savedId)
+            if (activeId == savedId) null else key to activeId
+        }
+        if (replacements.isEmpty()) return
+        val edit = prefs.edit()
+        for ((key, id) in replacements) edit.putString(key, id)
+        edit.apply()
+    }
+
     fun save(settings: AppSettings) {
+        val imageModelId = activeDepthModelId(settings.imageModelId)
+        val videoModelId = activeDepthModelId(settings.videoModelId)
         prefs.edit()
             .putBoolean("modeProfilesV1", true)
             .putString("modeProfile.${settings.edgeMode.name}", ModeVisualProfile.capture(settings).encode())
             .putString("language", settings.language.name)
-            .putString("modelId", settings.imageModelId)
-            .putString("imageModelId", settings.imageModelId)
-            .putString("videoModelId", settings.videoModelId)
+            .putString("modelId", imageModelId)
+            .putString("imageModelId", imageModelId)
+            .putString("videoModelId", videoModelId)
             .putBoolean("autoPrefetch", settings.autoPrefetch)
             .putInt("prefetchWindow", settings.prefetchWindow)
             .putString("imageExportFormat", settings.imageExportFormat)
@@ -4056,8 +4224,13 @@ private class VrCacheManager(private val context: Context) {
     }
 
     fun summaries(): List<CacheVersionSummary> {
-        return index.summaries().map { (version, value) ->
-            CacheVersionSummary(version = version, kind = "图片 / Images", count = value.first, bytes = value.second)
+        return index.summaries().entries.groupBy { generatedAlbumKey(it.key) }.map { (album, versions) ->
+            CacheVersionSummary(
+                version = album,
+                kind = "图片 / Images",
+                count = versions.sumOf { it.value.first },
+                bytes = versions.sumOf { it.value.second },
+            )
         }.sortedBy { it.version }
     }
 
@@ -4269,6 +4442,9 @@ private class VideoVrCacheManager(private val context: Context) {
             durationMs = values["durationMs"]?.toLongOrNull() ?: 0L,
             fps = values["fps"]?.toIntOrNull() ?: 30,
             createdAt = output.lastModified(),
+            modelId = values["depthModel"].orEmpty(),
+            cacheVersion = values["cacheVersion"].orEmpty(),
+            depthGeometry = VideoDepthGeometry.read(values),
         )
     }
 
@@ -4358,6 +4534,14 @@ private class ModelManager(private val context: Context) {
     private val modelsDir = File(context.getExternalFilesDir(null), "models").also { it.mkdirs() }
 
     fun statusText(modelId: String = AvailableModels.first().id): String {
+        if (hasQnnModelPrefix(modelId)) {
+            return when {
+                qnnModelConfig(modelId) == null -> "QNN 模型设置无效 / Invalid QNN model settings"
+                !QnnFp16DepthRuntime.hasGpuBackend(context) -> "QNN GPU 不可用 / QNN GPU unavailable"
+                hasLocalModel(modelId) -> "模型资产已内置 / Model asset bundled"
+                else -> "缺少内置 QNN 模型 / Bundled QNN model missing"
+            }
+        }
         val spec = modelSpec(modelId)
         if (!spec.downloadable) return "模型待导入 / Model asset required"
         val modelFile = File(modelsDir, spec.fileName)
@@ -4368,9 +4552,18 @@ private class ModelManager(private val context: Context) {
         }
     }
 
-    fun hasLocalModel(modelId: String): Boolean = File(modelsDir, modelSpec(modelId).fileName).isFile
+    fun hasLocalModel(modelId: String): Boolean {
+        if (hasQnnModelPrefix(modelId)) {
+            val config = qnnModelConfig(modelId) ?: return false
+            return QnnFp16DepthRuntime.hasGpuBackend(context) &&
+                runCatching { context.assets.openFd(config.variant.assetName).close() }.isSuccess
+        }
+        return File(modelsDir, modelSpec(modelId).fileName).isFile
+    }
 
+    @Synchronized
     fun ensureModel(modelId: String, onProgress: (Float) -> Unit, allowDownload: Boolean = true): File {
+        check(!hasQnnModelPrefix(modelId)) { "QNN 模型由内置资源加载 / QNN models load from bundled assets" }
         val spec = modelSpec(modelId)
         if (!spec.downloadable) {
             error("${spec.displayName} 需要先导入移动端模型资产 / Mobile model asset required")
@@ -4423,7 +4616,7 @@ private class ModelManager(private val context: Context) {
                     error("SHA-256 mismatch: $hash")
                 }
                 if (modelFile.exists()) modelFile.delete()
-                tmp.renameTo(modelFile)
+                check(tmp.renameTo(modelFile)) { "Could not publish verified model" }
                 onProgress(1f)
                 return modelFile
             }.onFailure { error ->
@@ -4490,7 +4683,7 @@ private class VrGenerator @JvmOverloads constructor(
             sessionLease = borrowDepthSession(params, onModelProgress) { mark(it) }
             checkCurrent()
             val depthSession = sessionLease.value
-            mark("model session ready key=${params.depthSessionKey()}")
+            mark("model session acquired key=${params.depthSessionKey()}")
             onProgress(0.12f)
 
             val decodeMaxLongEdge = memorySafeMaxLongEdge(photo.width, photo.height, params.maxLongEdge, if (params.matchV10Default) DepthEdgeMode.COMFY_LEGACY_V10 else params.edgeMode)
@@ -4508,16 +4701,17 @@ private class VrGenerator @JvmOverloads constructor(
             checkCurrent()
 
             val depthStart = System.currentTimeMillis()
-            val rawDepth = depthSession.run(original, priority) {
+            val inference = depthSession.infer(original, priority) {
                 checkCurrent()
                 // The owner thread has accepted the current inference before neighbors are admitted.
                 onProgress(0.30f)
             }
+            val rawDepth = inference.map
             checkCurrent()
             val modelMs = System.currentTimeMillis() - depthStart
-            mark("model inference ${modelMs}ms")
+            mark("model inference ${modelMs}ms tensor=${inference.inputWidth}x${inference.inputHeight} content=${rawDepth.width}x${rawDepth.height}")
             val depthPostStart = System.currentTimeMillis()
-            DepthPngWriter.write(DepthTensorShape.map(DepthDirection.modelDepth(rawDepth,
+            DepthPngWriter.write(rawDepth.copy(values = DepthDirection.modelDepth(rawDepth.values,
                 DepthDirection.reversed(params.edgeMode, params.invertModelDepth, params.invertDepth))), File(dir,"model_depth.png"))
             var depthMap = prepareDepth(rawDepth, params, original.width, original.height)
             onProgress(0.55f)
@@ -4584,7 +4778,7 @@ private class VrGenerator @JvmOverloads constructor(
                 totalMs = totalBeforeFinalLog,
             )
             val writeParamsStart = System.currentTimeMillis()
-            paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, timings, depthMap), Charsets.UTF_8)
+            paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, timings, depthMap, inference), Charsets.UTF_8)
             val writeParamsFirstMs = System.currentTimeMillis() - writeParamsStart
             val writeMsBeforeLog = System.currentTimeMillis() - writeStart
             val finalTimingsBeforeLog = timings.copy(
@@ -4593,7 +4787,7 @@ private class VrGenerator @JvmOverloads constructor(
                 totalMs = System.currentTimeMillis() - start,
             )
             val rewriteParamsStart = System.currentTimeMillis()
-            paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, finalTimingsBeforeLog, depthMap), Charsets.UTF_8)
+            paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, finalTimingsBeforeLog, depthMap, inference), Charsets.UTF_8)
             val writeParamsMs = writeParamsFirstMs + (System.currentTimeMillis() - rewriteParamsStart)
             val logWriteStart = System.currentTimeMillis()
             mark("write leftJpegQ$IMAGE_EYE_JPEG_QUALITY=${stereoWrite.leftMs}ms rightJpegQ$IMAGE_EYE_JPEG_QUALITY=${stereoWrite.rightMs}ms params=${writeParamsMs}ms")
@@ -4607,7 +4801,7 @@ private class VrGenerator @JvmOverloads constructor(
                 writeMs = writeMs,
                 totalMs = System.currentTimeMillis() - start,
             )
-            paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, finalTimings, depthMap), Charsets.UTF_8)
+            paramsPath.writeText(params.toJson(photo, original, outputWidth, outputHeight, finalTimings, depthMap, inference), Charsets.UTF_8)
             original.recycle()
             pair.recycle()
 
@@ -4656,7 +4850,7 @@ private class VrGenerator @JvmOverloads constructor(
                 }
                 checkCurrent()
                 onProgress(0.3f, "按该结果参数推理 / Inferring with recorded parameters")
-                val raw = lease.value.run(source, 0, ::checkCurrent)
+                val raw = lease.value.infer(source, 0, spec.inputGeometry, ::checkCurrent).map
                 checkCurrent()
                 val depth = prepareDepth(raw, params, source.width, source.height)
                 onProgress(0.65f, "投影单眼 / Projecting one eye")
@@ -4691,7 +4885,7 @@ private class VrGenerator @JvmOverloads constructor(
         try {
             onProgress(0.05f, "推理当前图片；不创建队列")
             val raw = borrowDepthSession(base.toParams(), {}, { android.util.Log.i("ModeComparison", it) }).use { lease ->
-                lease.value.run(source, 0) { checkCurrent() }
+                lease.value.infer(source, 0) { checkCurrent() }.map
             }
             checkCurrent()
             DepthEdgeMode.entries.forEachIndexed { index, mode ->
@@ -4719,7 +4913,7 @@ private class VrGenerator @JvmOverloads constructor(
                     val h = max(1, (source.height * factor).roundToInt())
                     return depthToBitmap(DepthResampling.resize(map, w, h, DepthInterpolation.BILINEAR))
                 }
-                val modelPreview = preview(DepthTensorShape.map(DepthDirection.modelDepth(raw,
+                val modelPreview = preview(raw.copy(values = DepthDirection.modelDepth(raw.values,
                     DepthDirection.reversed(mode, params.invertModelDepth, params.invertDepth)))).also { owned += it }
                 val projectionPreview = preview(depth).also { owned += it }
                 result += ModeComparisonImage(mode, left, right, params, params.effectiveScale(modeSource.width, depth), SystemClock.uptimeMillis() - started, modelPreview, projectionPreview)
@@ -4750,10 +4944,10 @@ private class VrGenerator @JvmOverloads constructor(
         }
         try {
             val rawDepth = if (depthSession != null) {
-                depthSession.run(working)
+                depthSession.infer(working).map
             } else {
                 openDepthSession(params, onModelProgress, onRuntimeInfo).use { session ->
-                    session.run(working)
+                    session.infer(working).map
                 }
             }
             val depthMap = prepareDepth(rawDepth, params, working.width, working.height)
@@ -4763,13 +4957,14 @@ private class VrGenerator @JvmOverloads constructor(
         }
     }
 
-    fun generateVideoSbsBitmap(
+    @JvmOverloads fun generateVideoSbsBitmap(
         source: Bitmap,
         params: VrGenerationParams,
         depthSession: DepthModelSession,
         temporalSmoother: DepthTemporalSmoother,
+        orientation: QnnVideoOrientation? = null,
     ): VideoSbsResult {
-        val depth = generateVideoDepth(source, params, depthSession)
+        val depth = generateVideoDepth(source, params, depthSession, orientation)
         return finishVideoSbs(depth, params, temporalSmoother)
     }
 
@@ -4777,34 +4972,83 @@ private class VrGenerator @JvmOverloads constructor(
         source: Bitmap,
         params: VrGenerationParams,
         depthSession: DepthModelSession,
+        orientation: QnnVideoOrientation? = null,
     ): VideoDepthResult {
-        val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge, if (params.matchV10Default) DepthEdgeMode.COMFY_LEGACY_V10 else params.edgeMode)
-        val working = if (max(source.width, source.height) > safeMaxLongEdge) {
-            val scale = safeMaxLongEdge.toFloat() / max(source.width, source.height).toFloat()
-            Bitmap.createScaledBitmap(source, max(1, (source.width * scale).roundToInt()), max(1, (source.height * scale).roundToInt()), true)
-        } else {
-            source
-        }
+        val working = resizeVideoSource(source, params)
         val depthStart = SystemClock.uptimeMillis()
-        val rawDepth = try { depthSession.run(working) } catch (error: Throwable) {
+        val inference = try {
+            if (orientation == null) depthSession.infer(working)
+            else depthSession.inferVideo(working, orientation)
+        } catch (error: Throwable) {
             if (working !== source) working.recycle()
             throw error
         }
         val depthMs = SystemClock.uptimeMillis() - depthStart
-        return VideoDepthResult(
-            source = working,
-            rawDepth = rawDepth,
-            timings = VideoFrameTimings(depthMs = depthMs),
-        )
+        return videoDepthResult(working, inference, depthMs)
     }
+
+    private fun resizeVideoSource(source: Bitmap, params: VrGenerationParams): Bitmap {
+        val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge,
+            if (params.matchV10Default) DepthEdgeMode.COMFY_LEGACY_V10 else params.edgeMode)
+        val longEdge = max(source.width, source.height)
+        if (longEdge <= safeMaxLongEdge) return source
+        val scale = safeMaxLongEdge.toFloat() / longEdge
+        return Bitmap.createScaledBitmap(source, max(1, (source.width * scale).roundToInt()),
+            max(1, (source.height * scale).roundToInt()), true)
+    }
+
+    fun prepareRotatedVideoInput(source: Bitmap, params: VrGenerationParams, geometry: QnnInputGeometry): Pair<Bitmap, Bitmap> {
+        val working = resizeVideoSource(source, params)
+        return try {
+            working to transformQnnInput(working, geometry)
+        } catch (error: Throwable) {
+            if (working !== source) working.recycle()
+            throw error
+        }
+    }
+
+    fun inferPreparedVideoDepth(
+        source: Bitmap,
+        tensor: Bitmap,
+        geometry: QnnInputGeometry,
+        session: DepthModelSession,
+        inputTransformNanos: Long,
+    ): VideoDepthResult {
+        val started = SystemClock.uptimeMillis()
+        val inference = session.inferPreparedVideo(tensor, geometry)
+        return videoDepthResult(source, inference, SystemClock.uptimeMillis() - started, inputTransformNanos)
+    }
+
+    private fun videoDepthResult(
+        source: Bitmap,
+        inference: DepthInferenceOutput,
+        depthMs: Long,
+        inputTransformNanos: Long = inference.rotationTiming?.inputTransformNanos ?: 0L,
+    ): VideoDepthResult = VideoDepthResult(
+            source = source,
+            rawDepth = inference.map.values,
+            timings = VideoFrameTimings(
+                depthMs = depthMs,
+                inputTransformNanos = inputTransformNanos,
+                depthRotationNanos = inference.rotationTiming?.outputRotationNanos ?: 0L,
+            ),
+            depthWidth = inference.map.width,
+            depthHeight = inference.map.height,
+            modelInputWidth = inference.inputWidth,
+            modelInputHeight = inference.inputHeight,
+            modelInputRotation = inference.geometry?.rotation ?: 0,
+        )
 
     fun finishVideoSbs(
         depth: VideoDepthResult,
         params: VrGenerationParams,
         temporalSmoother: DepthTemporalSmoother,
     ): VideoSbsResult {
+        val modelDepth = if (depth.depthWidth > 0 && depth.depthHeight > 0) {
+            DepthMap(depth.rawDepth, depth.depthWidth, depth.depthHeight)
+        } else DepthTensorShape.map(depth.rawDepth)
         val temporalStart = SystemClock.uptimeMillis()
-        val stableDepth = temporalSmoother.smooth(depth.rawDepth)
+        val stableDepth = temporalSmoother.smooth(modelDepth)
         val temporalMs = SystemClock.uptimeMillis() - temporalStart
         val depthPostStart = SystemClock.uptimeMillis()
         val depthMap = try {
@@ -4835,14 +5079,50 @@ private class VrGenerator @JvmOverloads constructor(
                 temporalMs = temporalMs,
                 depthPostMs = depthPostMs,
                 sbsMs = sbsMs,
-                depthWidth = depthMap.width,
-                depthHeight = depthMap.height,
+                    inputTransformNanos = depth.timings.inputTransformNanos,
+                    depthRotationNanos = depth.timings.depthRotationNanos,
+                depthGeometry = VideoDepthGeometry(
+                    depth.modelInputWidth.takeIf { it > 0 } ?: modelDepth.width,
+                    depth.modelInputHeight.takeIf { it > 0 } ?: modelDepth.height,
+                    depthMap.width, depthMap.height, modelDepth.width, modelDepth.height, depth.modelInputRotation,
+                ),
             ),
         )
     }
 
     fun prepareImageSession(params: VrGenerationParams, onRuntimeInfo: (String) -> Unit) {
+        val shapes = qnnModelConfig(params.depthModel)
+            ?.let { QnnInputGeometry.warmupGeometries(it.size, it.aspect) }.orEmpty()
+        prepareImageSession(params, shapes, {}, { _, _ -> }, onRuntimeInfo)
+    }
+
+    fun prepareImageSession(
+        params: VrGenerationParams,
+        qnnShapes: List<QnnInputGeometry>,
+        checkCurrent: () -> Unit,
+        onShapeReady: (Int, Int) -> Unit,
+        onRuntimeInfo: (String) -> Unit,
+    ) {
+        if (qnnShapes.size == 2) {
+            val key = params.depthSessionKey()
+            val lease = depthSessions.acquireIfPresent(key) ?: run {
+                // Release an idle old model before keeping two new GPU graphs resident.
+                depthSessions.trimIdle()
+                checkCurrent()
+                depthSessions.acquire(key) { openDepthSession(params, onRuntimeInfo = onRuntimeInfo, allowDownload = false) }
+            }
+            lease.use {
+                qnnShapes.forEachIndexed { index, geometry ->
+                    checkCurrent()
+                    lease.value.prepareQnnShape(geometry, checkCurrent)
+                    checkCurrent()
+                    onShapeReady(index + 1, qnnShapes.size)
+                }
+            }
+            return
+        }
         depthSessions.acquire(params.depthSessionKey()) {
+            checkCurrent()
             val session = openDepthSession(params, onRuntimeInfo = onRuntimeInfo, allowDownload = false)
             try {
                 session.prepare()
@@ -4872,17 +5152,42 @@ private class VrGenerator @JvmOverloads constructor(
         onRuntimeInfo: (String) -> Unit = {},
         allowDownload: Boolean = true,
     ): DepthModelSession {
+        val qnn = qnnModelConfig(params.depthModel)
+        if (qnn != null) {
+            check(QnnFp16DepthRuntime.hasGpuBackend(context)) { "QNN GPU 不可用 / QNN GPU unavailable" }
+            onModelProgress(1f)
+            return DepthModelSession.openQnn(context, qnn, onRuntimeInfo)
+        }
         val modelFile = modelManager.ensureModel(params.depthModel, onModelProgress, allowDownload)
         return DepthModelSession(modelFile, params.modelThreads, params.useGpu, params.gpuTestMode, params.forceGpuNoFallback, onRuntimeInfo)
     }
 
-    fun borrowVideoDepthSession(params:VrGenerationParams,onModelProgress:(Float)->Unit,onRuntimeInfo:(String)->Unit):IdleResourcePool.Borrowed<DepthModelSession> {
-        val key=params.depthSessionKey()
-        depthSessions.acquireIfPresent(key)?.let {onRuntimeInfo("depth session acquired reused=true key=$key");return it}
-        // A different video model must not evict the selected image model (notably the 770 model).
-        val owned=openDepthSession(params,onModelProgress,onRuntimeInfo)
-        onRuntimeInfo("depth session acquired reused=false ownedVideo=true key=$key")
-        return IdleResourcePool.Borrowed(owned){owned.close()}
+    fun borrowVideoDepthSession(
+        params: VrGenerationParams,
+        onModelProgress: (Float) -> Unit,
+        onRuntimeInfo: (String) -> Unit,
+        orientation: QnnVideoOrientation?,
+        checkActive: () -> Unit,
+    ): IdleResourcePool.Borrowed<DepthModelSession> {
+        val key = params.depthSessionKey()
+        if (orientation?.useNativeLandscape != true) {
+            depthSessions.acquireIfPresent(key)?.let {
+                onRuntimeInfo("depth session acquired reused=true key=$key")
+                return it
+            }
+        }
+        // A private video session cannot evict either of the prepared image shapes.
+        val owned = openDepthSession(params, onModelProgress, onRuntimeInfo)
+        try {
+            if (orientation?.useNativeLandscape == true) {
+                owned.prepareQnnShape(orientation.inferenceInput, checkActive, allowNativeLandscapeOverride = true)
+            }
+            onRuntimeInfo("depth session acquired reused=false ownedVideo=true key=$key")
+            return IdleResourcePool.Borrowed(owned) { owned.close() }
+        } catch (error: Throwable) {
+            runCatching { owned.close() }.exceptionOrNull()?.let(error::addSuppressed)
+            throw error
+        }
     }
 
     private fun memorySafeMaxLongEdge(width: Int, height: Int, requested: Int, mode: DepthEdgeMode): Int {
@@ -4934,11 +5239,11 @@ private class VrGenerator @JvmOverloads constructor(
         }
     }
 
-    private fun prepareDepth(depth: FloatArray, params: VrGenerationParams, width: Int, height: Int): DepthMap {
+    private fun prepareDepth(depth: DepthMap, params: VrGenerationParams, width: Int, height: Int): DepthMap {
         // Reserve space for resize/filter intermediates and the diagnostic bitmap per active job.
         val budget = (Runtime.getRuntime().maxMemory() / 8).coerceAtMost(96L * 1024 * 1024)
-        val canonical = DepthDirection.modelDepth(depth, params.invertModelDepth)
-        val modelDepth = DepthTensorShape.map(canonical)
+        val canonical = DepthDirection.modelDepth(depth.values, params.invertModelDepth)
+        val modelDepth = depth.copy(values = canonical)
         val prepared = DepthPostProcessing.process(modelDepth, width, height, params, max(1L, budget / 16))
         if (params.edgeMode.isComfyMain) {
             val restored = ComfyLegacyStereoRenderer.prepareDepth(prepared.values, prepared.width, prepared.height, width, height, params.blurRadius, true)
@@ -5030,20 +5335,25 @@ private enum class GpuMode {
     BEST_COMPAT,
 }
 
-class DepthModelSession(
-    modelFile: File,
-    modelThreads: Int,
+class DepthModelSession private constructor(
     useGpu: Boolean,
-    gpuTestMode: GpuTestMode,
-    forceGpuNoFallback: Boolean,
-    onRuntimeInfo: (String) -> Unit = {},
+    createRuntime: () -> DepthInferenceRuntime,
 ) : Closeable {
+    constructor(
+        modelFile: File,
+        modelThreads: Int,
+        useGpu: Boolean,
+        gpuTestMode: GpuTestMode,
+        forceGpuNoFallback: Boolean,
+        onRuntimeInfo: (String) -> Unit = {},
+    ) : this(useGpu, {
+        DepthModelRuntime(modelFile, modelThreads, useGpu, gpuTestMode, forceGpuNoFallback, onRuntimeInfo)
+    })
+
     private val ownsWorker = !useGpu
     private val worker = if (useGpu) gpuWorker else AffinityWorker("depth-cpu")
     private val resource = try {
-        ThreadBoundResource(worker) {
-            DepthModelRuntime(modelFile, modelThreads, useGpu, gpuTestMode, forceGpuNoFallback, onRuntimeInfo)
-        }
+        ThreadBoundResource(worker, createRuntime)
     } catch (error: Throwable) {
         if (ownsWorker) worker.close()
         throw error
@@ -5054,7 +5364,30 @@ class DepthModelSession(
         it.run(bitmap)
     }
 
+    internal fun infer(bitmap: Bitmap, priority: Int = 1, geometryOverride: QnnInputGeometry? = null,
+        onStarted: () -> Unit = {}): DepthInferenceOutput = resource.use(priority) {
+        onStarted()
+        it.infer(bitmap, geometryOverride)
+    }
+
     fun prepare() = resource.use(priority = 100) { it.prepare() }
+
+    internal fun prepareQnnShape(
+        geometry: QnnInputGeometry,
+        checkCurrent: () -> Unit,
+        allowNativeLandscapeOverride: Boolean = false,
+    ) = resource.use(priority = 100) {
+        checkCurrent()
+        it.prepareQnnShape(geometry, allowNativeLandscapeOverride)
+    }
+
+    internal fun inferVideo(bitmap: Bitmap, orientation: QnnVideoOrientation): DepthInferenceOutput = resource.use {
+        it.infer(bitmap, orientation.inferenceInput, orientation.useNativeLandscape)
+    }
+
+    internal fun inferPreparedVideo(bitmap: Bitmap, geometry: QnnInputGeometry): DepthInferenceOutput = resource.use {
+        it.inferPreparedVideo(bitmap, geometry)
+    }
 
     override fun close() {
         try { resource.close() } finally { if (ownsWorker) worker.close() }
@@ -5062,6 +5395,9 @@ class DepthModelSession(
 
     companion object {
         private val gpuWorker = AffinityWorker("depth-gpu-owner")
+
+        internal fun openQnn(context: Context, config: QnnModelConfig, onRuntimeInfo: (String) -> Unit = {}): DepthModelSession =
+            DepthModelSession(useGpu = true) { QnnFp16DepthRuntime.open(context, config, onRuntimeInfo) }
     }
 }
 
@@ -5072,7 +5408,7 @@ private class DepthModelRuntime(
     private val gpuTestMode: GpuTestMode,
     private val forceGpuNoFallback: Boolean,
     private val onRuntimeInfo: (String) -> Unit = {},
-) : Closeable {
+) : DepthInferenceRuntime {
     private val inputSize: Int
     private val model = loadModelFile(modelFile)
     private var gpuDelegate: GpuDelegate? = null
@@ -5123,10 +5459,10 @@ private class DepthModelRuntime(
     }
 
     @Synchronized
-    fun prepare() { interpreter.allocateTensors() }
+    override fun prepare() { interpreter.allocateTensors() }
 
     @Synchronized
-    fun run(bitmap: Bitmap): FloatArray {
+    override fun run(bitmap: Bitmap): FloatArray {
         val prepareStarted = System.nanoTime()
         val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         input.clear()
@@ -5368,11 +5704,27 @@ private data class VideoSbsResult(
     val timings: VideoFrameTimings,
 )
 
-data class VideoDepthResult(
+data class VideoDepthResult @JvmOverloads constructor(
     val source: Bitmap,
     val rawDepth: FloatArray,
     val timings: VideoFrameTimings,
+    val depthWidth: Int = 0,
+    val depthHeight: Int = 0,
+    val modelInputWidth: Int = 0,
+    val modelInputHeight: Int = 0,
+    val modelInputRotation: Int = 0,
 )
+
+private fun VideoDepthResult.restoreRotation(): VideoDepthResult {
+    val started = System.nanoTime()
+    val upright = rotateQnnDepthCounterClockwise(rawDepth, depthWidth, depthHeight)
+    return copy(
+        rawDepth = upright,
+        depthWidth = depthHeight,
+        depthHeight = depthWidth,
+        timings = timings.copy(depthRotationNanos = System.nanoTime() - started),
+    )
+}
 
 private data class VideoFramePlan(
     val timeline: VideoTimeline,
@@ -5391,6 +5743,27 @@ class DepthTemporalSmoother(
     private val localMotionThreshold: Float = 0.08f,
 ) {
     private var previous: FloatArray? = null
+    private var previousWidth = 0
+    private var previousHeight = 0
+
+    internal fun checkpoint(): VideoSegmentStore.Checkpoint? = previous?.let {
+        VideoSegmentStore.Checkpoint(previousWidth, previousHeight, it)
+    }
+
+    internal fun restore(checkpoint: VideoSegmentStore.Checkpoint) {
+        previousWidth = checkpoint.width
+        previousHeight = checkpoint.height
+        previous = checkpoint.values
+    }
+
+    internal fun smooth(current: DepthMap): DepthMap {
+        if (previousWidth != current.width || previousHeight != current.height) {
+            previous = null
+            previousWidth = current.width
+            previousHeight = current.height
+        }
+        return current.copy(values = smooth(current.values))
+    }
 
     fun smooth(current: FloatArray): FloatArray {
         val prev = previous
@@ -5440,6 +5813,14 @@ private class VideoVrGenerator(
         val version = params.cacheVersion()
         val dir = cache.entryDir(item, version)
         val framesDir = File(dir, "frames").also { it.mkdirs() }
+        val portraitPair = qnnModelConfig(vrParams.depthModel)?.takeIf { it.aspect == QnnDepthAspect.PORTRAIT_PAIR }
+        val orientationFile = portraitPair?.let { File(dir, "qnn_orientation.tsv") }
+        var orientation = orientationFile?.takeIf { it.isFile }?.let {
+            QnnVideoOrientation.restore(it.readText(Charsets.UTF_8), portraitPair.size)
+        }
+        check(orientationFile == null || orientation != null || framesDir.list().isNullOrEmpty()) {
+            "视频续跑缺少推理方向记录 / Missing QNN orientation for cached video frames"
+        }
         val previousFramesDirs = listOf("encoderV13", "encoderV12")
             .asSequence()
             .map { encoderVersion -> version.replace("_$VIDEO_ENCODER_VERSION", "_$encoderVersion") }
@@ -5452,11 +5833,10 @@ private class VideoVrGenerator(
         val logPath = File(dir, "job.log")
         val metaPath = File(dir, "video_params.txt")
         if (pendingOutput.exists()) pendingOutput.delete()
-        val log = StringBuilder()
+        logPath.writeText("", Charsets.UTF_8)
         val started = System.currentTimeMillis()
         fun mark(line: String) {
-            log.append(System.currentTimeMillis() - started).append("ms ").append(line).append('\n')
-            logPath.writeText(log.toString(), Charsets.UTF_8)
+            logPath.appendText("${System.currentTimeMillis() - started}ms $line\n", Charsets.UTF_8)
         }
 
         val retriever = MediaMetadataRetriever()
@@ -5475,70 +5855,138 @@ private class VideoVrGenerator(
                 mark("frame cache fallbacks=${previousFramesDirs.joinToString("|") { it.absolutePath }}")
             }
 
+            val segmentsDirectory = File(dir, "segments")
+            val store = if (segmentsDirectory.isDirectory ||
+                framesDir.list().isNullOrEmpty() && previousFramesDirs.isEmpty()
+            ) VideoSegmentStore(segmentsDirectory, framesDir, totalFrames, (fps * 3 / 2).coerceIn(6, 72)) else null
+            val completed = store?.recover()?.toMutableList() ?: mutableListOf()
             var width = 0
             var height = 0
             val temporalSmoother = DepthTemporalSmoother()
-            DeferredResource { frameGenerator.borrowVideoDepthSession(vrParams, onModelProgress, onRuntimeInfo) }.use { depthSession ->
-                val cachedFirst = readCachedStereoFrame(framesDir, 0, previousFramesDirs)?.also {
-                    onRuntimeInfo("frame cache hit frame=0 version=$version")
-                }
-                val firstEyes = cachedFirst ?: run {
-                    val first = reader.frameAt(0)
-                    var ownedEyes: StereoBitmapPair? = null
-                    var firstSource: Bitmap? = null
-                    try {
-                        val source = if (first.config == Bitmap.Config.ARGB_8888) {
-                            first
-                        } else {
-                            first.copy(Bitmap.Config.ARGB_8888, false)
-                        }.also { firstSource = it }
-                        val generated = frameGenerator.generateVideoSbsBitmap(source, vrParams, depthSession.get().value, temporalSmoother)
+            completed.lastOrNull()?.let { last ->
+                width = last.width
+                height = last.height
+                requireNotNull(store?.readCheckpoint(last)) { "Missing video segment depth checkpoint" }.let(temporalSmoother::restore)
+                mark("resume segments=${completed.size} nextFrame=${last.range.endFrameExclusive}")
+            }
+            val depthGeometry = DeferredResource {
+                frameGenerator.borrowVideoDepthSession(vrParams, onModelProgress, onRuntimeInfo, orientation, checkActive)
+            }.use { depthSession ->
+                fun encodeRange(target: File, segment: VideoSegmentStore.Range? = null): VideoDepthGeometry? {
+                    val firstIndex = segment?.startFrame ?: 0
+                    var firstTimings = VideoFrameTimings()
+                    val cachedFirst = if (segment != null) null else readCachedStereoFrame(framesDir, firstIndex, previousFramesDirs)?.also {
+                        onRuntimeInfo("frame cache hit frame=0 version=$version")
+                    }
+                    val firstEyes = cachedFirst ?: run {
+                        val first = reader.frameAt(firstIndex)
+                        var ownedEyes: StereoBitmapPair? = null
+                        var firstSource: Bitmap? = null
                         try {
-                            writeStereoFrameCache(framesDir, 0, generated.eyes)
-                        } catch (error: Throwable) {
-                            generated.eyes.recycle()
-                            throw error
-                        }
-                        generated.eyes.also { ownedEyes = it }
-                    } finally {
-                        listOfNotNull(first, firstSource).distinct().forEach {
-                            if (it !== ownedEyes?.left && it !== ownedEyes?.right && !it.isRecycled) it.recycle()
+                            val source = if (first.config == Bitmap.Config.ARGB_8888) {
+                                first
+                            } else {
+                                first.copy(Bitmap.Config.ARGB_8888, false)
+                            }.also { firstSource = it }
+                            if (portraitPair != null && orientationFile != null && orientation == null) {
+                                val input = QnnInputGeometry.forSource(portraitPair.size, source.width, source.height, portraitPair.aspect)
+                                checkActive()
+                                val planned = QnnVideoOrientation.forNewVideo(input)
+                                val temporary = File.createTempFile(".qnn_orientation-", ".tmp", dir)
+                                try {
+                                    temporary.writeText(planned.encode(), Charsets.UTF_8)
+                                    java.nio.file.Files.move(temporary.toPath(), orientationFile.toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+                                } finally {
+                                    temporary.delete()
+                                }
+                                orientation = planned
+                            }
+                            orientation?.let {
+                                mark("qnn video rotation=${it.inferenceInput.rotation} nativeLandscape=${it.useNativeLandscape} input=${it.inferenceInput.tensorWidth}x${it.inferenceInput.tensorHeight}")
+                            }
+                            val generated = frameGenerator.generateVideoSbsBitmap(source, vrParams, depthSession.get().value, temporalSmoother, orientation)
+                            firstTimings = generated.timings
+                            try {
+                                if (segment == null) writeStereoFrameCache(framesDir, firstIndex, generated.eyes)
+                            } catch (error: Throwable) {
+                                generated.eyes.recycle()
+                                throw error
+                            }
+                            generated.eyes.also { ownedEyes = it }
+                        } finally {
+                            listOfNotNull(first, firstSource).distinct().forEach {
+                                if (it !== ownedEyes?.left && it !== ownedEyes?.right && !it.isRecycled) it.recycle()
+                            }
                         }
                     }
-                }
-                width = even(firstEyes.sbsWidth)
-                height = even(firstEyes.height)
-                mark("first frame eyes=${firstEyes.left.width}x${firstEyes.left.height} encode=${width}x${height} cached=${cachedFirst != null}")
+                    if (width == 0) {
+                        width = even(firstEyes.sbsWidth)
+                        height = even(firstEyes.height)
+                    }
+                    try {
+                        mark("first frame index=$firstIndex eyes=${firstEyes.left.width}x${firstEyes.left.height} encode=${width}x${height} cached=${cachedFirst != null}")
+                    } catch (error: Throwable) {
+                        firstEyes.recycle()
+                        throw error
+                    }
 
-                encodeVideo(
-                    item = item,
-                    reader = reader,
-                    checkActive = checkActive,
-                    firstEyes = firstEyes,
-                    firstCacheHit = cachedFirst != null,
-                    framesDir = framesDir,
-                    fallbackFramesDirs = previousFramesDirs,
-                    output = pendingOutput,
-                    width = width,
-                    height = height,
-                    fps = fps,
-                    totalFrames = totalFrames,
-                    framePlan = framePlan,
-                    version = version,
-                    params = vrParams,
-                    videoParams = params,
-                    depthSession = depthSession,
-                    temporalSmoother = temporalSmoother,
-                    onModelProgress = onModelProgress,
-                    onRuntimeInfo = onRuntimeInfo,
-                    onProgress = onProgress,
-                    mark = ::mark,
-                )
+                    return encodeVideo(
+                        item = item,
+                        reader = reader,
+                        checkActive = checkActive,
+                        firstEyes = firstEyes,
+                        firstCacheHit = cachedFirst != null,
+                        firstTimings = firstTimings,
+                        framesDir = framesDir,
+                        fallbackFramesDirs = previousFramesDirs,
+                        output = target,
+                        width = width,
+                        height = height,
+                        fps = fps,
+                        totalFrames = totalFrames,
+                        framePlan = framePlan,
+                        version = version,
+                        params = vrParams,
+                        videoParams = params,
+                        depthSession = depthSession,
+                        orientation = orientation,
+                        temporalSmoother = temporalSmoother,
+                        onModelProgress = onModelProgress,
+                        onRuntimeInfo = onRuntimeInfo,
+                        onProgress = onProgress,
+                        mark = ::mark,
+                        segment = segment,
+                    )
+                }
+                if (store == null) {
+                    encodeRange(pendingOutput)
+                } else {
+                    var geometry = completed.lastOrNull()?.geometry
+                    for (range in store.ranges.drop(completed.size)) {
+                        checkActive()
+                        store.begin(range).use { stage ->
+                            geometry = encodeRange(stage.mediaFile, range)
+                            val checkpoint = requireNotNull(temporalSmoother.checkpoint())
+                            completed += store.publish(stage, width, height, checkpoint, geometry, checkActive)
+                            mark("segment committed index=${range.index} start=${range.startFrame} end=${range.endFrameExclusive}")
+                        }
+                    }
+                    geometry
+                }
             }
 
             checkActive()
+            if (store != null) {
+                reader.close()
+                VideoSegmentMuxer.mux(
+                    context, item.uri,
+                    completed.map { VideoSegment(it.mediaFile, it.range.startFrame, it.range.endFrameExclusive - it.range.startFrame) },
+                    framePlan.timeline, pendingOutput, checkActive,
+                )
+                mark("segments stitched count=${completed.size}")
+            }
             metaPath.writeText(
-                listOf(
+                (listOf(
                     "width=$width",
                     "height=$height",
                     "durationMs=$durationMs",
@@ -5551,7 +5999,8 @@ private class VideoVrGenerator(
                     "depthModel=${vrParams.depthModel}",
                     "cacheVersion=$version",
                     "encoderVersion=$VIDEO_ENCODER_VERSION",
-                    "frameCache=split_jpeg_q$VIDEO_FRAME_JPEG_QUALITY",
+                    if (store == null) "frameCache=split_jpeg_q$VIDEO_FRAME_JPEG_QUALITY" else "frameCache=segments",
+                    "segments=${completed.size}",
                     "frameCacheFallbacks=${previousFramesDirs.joinToString("|") { it.absolutePath }}",
                     "modelThreads=${vrParams.modelThreads}",
                     "depthWorkers=${params.depthWorkers.coerceIn(1, 2)}",
@@ -5563,12 +6012,20 @@ private class VideoVrGenerator(
                     "depthUpscaleMaxLongEdge=${vrParams.depthUpscale.boundedLongEdge}",
                     "depthInterpolation=${vrParams.depthUpscale.interpolation}",
                     "depthResizeOrder=${vrParams.depthUpscale.order}",
-                ).joinToString("\n"),
+                ) + depthGeometry?.metadataLines().orEmpty() + orientation?.let {
+                    listOf("qnnNativeLandscape=${it.useNativeLandscape}") +
+                        listOfNotNull(it.rotationNanos?.let { nanos -> "qnnRotationProbeNanos=$nanos" })
+                }.orEmpty()).joinToString("\n"),
                 Charsets.UTF_8,
             )
+            java.io.FileOutputStream(pendingOutput, true).use { it.fd.sync() }
+            checkActive()
             java.nio.file.Files.move(pendingOutput.toPath(), output.toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            val entry = cache.register(item, dir) ?: error("Video output cache missing")
+            if (store != null) segmentsDirectory.deleteRecursively()
+            framesDir.deleteRecursively()
             mark("done output=${output.absolutePath}")
-            return cache.register(item, dir) ?: error("Video output cache missing")
+            return entry
         } finally {
             frameReader?.close()
             retriever.release()
@@ -5631,6 +6088,7 @@ private class VideoVrGenerator(
         checkActive: () -> Unit,
         firstEyes: StereoBitmapPair,
         firstCacheHit: Boolean,
+        firstTimings: VideoFrameTimings,
         framesDir: File,
         fallbackFramesDirs: List<File>,
         output: File,
@@ -5643,12 +6101,14 @@ private class VideoVrGenerator(
         params: VrGenerationParams,
         videoParams: VideoGenerationParams,
         depthSession: DeferredResource<IdleResourcePool.Borrowed<DepthModelSession>>,
+        orientation: QnnVideoOrientation?,
         temporalSmoother: DepthTemporalSmoother,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit,
         onProgress: (Float, Int, Int, Int, VideoFrameMetrics, VideoFrameTimings, VideoPipelineStats) -> Unit,
         mark: (String) -> Unit,
-    ) {
+        segment: VideoSegmentStore.Range? = null,
+    ): VideoDepthGeometry? {
         var ownedCodec: MediaCodec? = null
         var ownedSurface: Surface? = null
         var ownedMuxer: MediaMuxer? = null
@@ -5667,6 +6127,7 @@ private class VideoVrGenerator(
             val targetBitrate = videoCapabilities.bitrateRange.clamp(max(pixelRateTarget, sourceRateTarget))
             val useVbr = encoderCapabilities.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                if (segment != null) setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
@@ -5693,7 +6154,7 @@ private class VideoVrGenerator(
             codec.start()
 
             val muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4).also { ownedMuxer = it }
-            val audio = prepareAudioExtractor(item).also { ownedAudio = it }
+            val audio = if (segment == null) prepareAudioExtractor(item).also { ownedAudio = it } else null
             val audioTrack = audio?.format?.let { muxer.addTrack(it) } ?: -1
             var videoTrack = -1
             var muxerStarted = false
@@ -5734,6 +6195,8 @@ private class VideoVrGenerator(
             data class PipelineFrame(
                 val index: Int,
                 var source: Bitmap? = null,
+                var tensor: Bitmap? = null,
+                var inputTransformNanos: Long = 0L,
                 var depth: VideoDepthResult? = null,
                 var eyes: StereoBitmapPair? = null,
                 var timings: VideoFrameTimings = VideoFrameTimings(),
@@ -5743,16 +6206,31 @@ private class VideoVrGenerator(
                 var generatedLatencyMs: Long = 0L,
             )
             val available = Runtime.getRuntime().let { it.maxMemory() - (it.totalMemory() - it.freeMemory()) }
+            val systemMemory = android.app.ActivityManager.MemoryInfo().also {
+                (context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager).getMemoryInfo(it)
+            }
+            val memoryBudget = minOf((available * 0.4).toLong(), (systemMemory.availMem - systemMemory.threshold).coerceAtLeast(0L) / 8)
             val pairBytes = firstEyes.left.allocationByteCount.toLong() + firstEyes.right.allocationByteCount
-            val inFlightLimit = ((available * 0.4) / (pairBytes * 2).coerceAtLeast(1)).toInt().coerceIn(2, 4)
+            val rotatedInput = orientation?.inferenceInput?.takeIf { it.rotation == 90 }
+            val modelBytes = rotatedInput?.let { 4L * it.tensorWidth * it.tensorHeight } ?: 0L
+            val inFlightLimit = (memoryBudget / (pairBytes * 2 + modelBytes * 2).coerceAtLeast(1))
+                .coerceIn(1L, if (rotatedInput == null) 4L else 12L).toInt()
             val cacheHits = AtomicInteger(if (firstCacheHit) 1 else 0)
             val depthWorkerCount = if (params.useGpu) 1 else videoParams.depthWorkers.coerceIn(1, 2)
             val extraSessions = mutableMapOf<Int, DepthModelSession>()
             var lastGeneratedEncodedAt = 0L
-            var lastDepthSize: Pair<Int, Int>? = null
-            mark("pipeline inFlightLimit=$inFlightLimit depthWorkers=$depthWorkerCount cacheWriter=independent")
+            var lastDepthGeometry: VideoDepthGeometry? = null
+            var rotationFrames = 0
+            var inputTransformNanos = 0L
+            var depthRotationNanos = 0L
+            var peakPrepared = 0
+            var peakUpright = 0
+            var throughputSamples = 0
+            var totalThroughputMs = 0L
+            mark("pipeline inFlightLimit=$inFlightLimit depthWorkers=$depthWorkerCount cacheWriter=${if (segment == null) "independent" else "off"} rotationQueues=${if (rotatedInput != null) "4/4" else "off"}")
 
             fun releaseFrame(data: PipelineFrame) {
+                data.tensor?.let { if (it !== data.source && !it.isRecycled) it.recycle() }
                 data.source?.let { if (!it.isRecycled) it.recycle() }
                 data.depth?.source?.let { if (!it.isRecycled) it.recycle() }
                 data.eyes?.recycle()
@@ -5761,13 +6239,33 @@ private class VideoVrGenerator(
                 checkActive()
                 val eyes = requireNotNull(data.eyes)
                 val encodeStart = SystemClock.uptimeMillis()
-                activeRenderer.drawStereo(eyes.left, eyes.right, framePlan.timeline[data.index])
+                val firstPts = segment?.let { framePlan.timeline[it.startFrame] } ?: 0L
+                activeRenderer.drawStereo(eyes.left, eyes.right, framePlan.timeline[data.index] - firstPts)
                 drain(end = false)
                 val timings = data.timings.copy(encodeMs = SystemClock.uptimeMillis() - encodeStart)
+                if (data.index > 0 && !data.cacheHit && rotatedInput != null) {
+                    rotationFrames++
+                    inputTransformNanos += timings.inputTransformNanos
+                    depthRotationNanos += timings.depthRotationNanos
+                    peakPrepared = max(peakPrepared, pipeline.inputPrepared.coerceAtMost(4))
+                    peakUpright = max(peakUpright, pipeline.depthRestored.coerceAtMost(4))
+                }
+                timings.depthGeometry?.let { geometry ->
+                    if (geometry != lastDepthGeometry) {
+                        mark("depth post output=${geometry.preparedWidth}x${geometry.preparedHeight} model=${geometry.modelWidth}x${geometry.modelHeight} upscale=${params.depthUpscale}; memory/output limits apply")
+                        lastDepthGeometry = geometry
+                    }
+                }
                 val now = SystemClock.uptimeMillis()
                 val throughput = if (!data.cacheHit && lastGeneratedEncodedAt > 0L) now - lastGeneratedEncodedAt else 0L
+                if (throughput > 0L) {
+                    throughputSamples++
+                    totalThroughputMs += throughput
+                }
                 if (!data.cacheHit) lastGeneratedEncodedAt = now
-                val activeMs = timings.depthMs + timings.temporalMs + timings.depthPostMs + timings.sbsMs
+                val rotationWorkMs = if (data.index > 0 && rotatedInput != null)
+                    (timings.inputTransformNanos + timings.depthRotationNanos) / 1_000_000L else 0L
+                val activeMs = timings.depthMs + timings.temporalMs + timings.depthPostMs + timings.sbsMs + rotationWorkMs
                 val latency = if (data.decodedAt > 0L) now - data.decodedAt else 0L
                 val metrics = VideoFrameMetrics(
                     throughputMs = throughput, latencyMs = latency,
@@ -5778,19 +6276,22 @@ private class VideoVrGenerator(
                     decodeQueue = pipeline.decoded, depthQueue = pipeline.depths, generatedQueue = pipeline.generated,
                     waitingFrames = pipeline.generated, cacheHits = cacheHits.get(),
                     cacheWriteQueue = pipeline.writes, lastCacheWriteMs = pipeline.lastWriteMs,
+                    preparedInputQueue = pipeline.inputPrepared.coerceAtMost(4),
+                    uprightDepthQueue = pipeline.depthRestored.coerceAtMost(4),
                 )
                 onProgress((data.index + 1).toFloat() / totalFrames, data.index + 1, totalFrames, fps, metrics, timings, stats)
             }
             try {
                 val pipelineResult = OrderedFramePipeline<PipelineFrame>(inFlightLimit, depthWorkerCount).run(
-                    first = 1, endExclusive = totalFrames,
+                    first = (segment?.startFrame ?: 0) + 1,
+                    endExclusive = segment?.endFrameExclusive ?: totalFrames,
                     checkActive = checkActive,
                     load = { index ->
                         val data = PipelineFrame(index)
                         try {
                             val started = SystemClock.uptimeMillis()
                             data.decodedAt = started
-                            data.eyes = readCachedStereoFrame(framesDir, index, fallbackFramesDirs)
+                            if (segment == null) data.eyes = readCachedStereoFrame(framesDir, index, fallbackFramesDirs)
                             data.cacheHit = data.eyes != null
                             if (!data.cacheHit) data.source = reader.frameAt(index) else cacheHits.incrementAndGet()
                             data.timings = VideoFrameTimings(decodeMs = SystemClock.uptimeMillis() - started)
@@ -5799,11 +6300,22 @@ private class VideoVrGenerator(
                     },
                     depth = { data, worker ->
                         if (!data.cacheHit) {
-                            val session = if (worker == 0) depthSession.get().value else synchronized(extraSessions) {
+                            val session = if (worker == 0 || orientation != null) depthSession.get().value else synchronized(extraSessions) {
                                 extraSessions.getOrPut(worker) { frameGenerator.openDepthSession(params, onModelProgress, onRuntimeInfo) }
                             }
-                            data.startedAt = SystemClock.uptimeMillis()
-                            data.depth = frameGenerator.generateVideoDepth(requireNotNull(data.source), params, session)
+                            if (data.startedAt == 0L) data.startedAt = SystemClock.uptimeMillis()
+                            val source = requireNotNull(data.source)
+                            if (rotatedInput == null) {
+                                data.depth = frameGenerator.generateVideoDepth(source, params, session, orientation)
+                            } else {
+                                val tensor = requireNotNull(data.tensor)
+                                try {
+                                    data.depth = frameGenerator.inferPreparedVideoDepth(source, tensor, rotatedInput, session, data.inputTransformNanos)
+                                } finally {
+                                    if (tensor !== source) tensor.recycle()
+                                    data.tensor = null
+                                }
+                            }
                         }
                     },
                     generate = { data ->
@@ -5814,23 +6326,41 @@ private class VideoVrGenerator(
                             data.source = null
                             data.depth = null
                             data.timings = result.timings.copy(decodeMs = data.timings.decodeMs)
-                            val depthSize = result.timings.depthWidth to result.timings.depthHeight
-                            if (depthSize != lastDepthSize) {
-                                mark("depth post output=${depthSize.first}x${depthSize.second} upscale=${params.depthUpscale}; memory/output limits apply")
-                                lastDepthSize = depthSize
-                            }
                             data.generatedLatencyMs = SystemClock.uptimeMillis() - data.startedAt
                         }
-                        !data.cacheHit
+                        !data.cacheHit && segment == null
                     },
                     persist = { data -> writeStereoFrameCache(framesDir, data.index, requireNotNull(data.eyes)) },
                     encode = ::encodeFrame,
                     dispose = ::releaseFrame,
                     beforeConsume = {
-                        encodeFrame(PipelineFrame(0, eyes = firstEyes, cacheHit = firstCacheHit), FramePipelineStats(0, 0, 0, 0, 0))
+                        encodeFrame(PipelineFrame(segment?.startFrame ?: 0, eyes = firstEyes, cacheHit = firstCacheHit, timings = firstTimings), FramePipelineStats(0, 0, 0, 0, 0))
+                    },
+                    prepareInput = rotatedInput?.let { geometry ->
+                        { data ->
+                            if (!data.cacheHit) {
+                                val source = requireNotNull(data.source)
+                                data.startedAt = SystemClock.uptimeMillis()
+                                val started = System.nanoTime()
+                                val (working, tensor) = frameGenerator.prepareRotatedVideoInput(source, params, geometry)
+                                data.inputTransformNanos = System.nanoTime() - started
+                                data.source = working
+                                data.tensor = tensor
+                                if (working !== source) source.recycle()
+                            }
+                        }
+                    },
+                    restoreDepth = rotatedInput?.let {
+                        { data -> if (!data.cacheHit) data.depth = requireNotNull(data.depth).restoreRotation() }
                     },
                 )
                 mark("cache writer completed=" + pipelineResult.writes + " averageMs=" + pipelineResult.writeTimeMs / pipelineResult.writes.coerceAtLeast(1))
+                if (rotationFrames > 0) {
+                    mark("rotation frames=$rotationFrames meanInputNs=${inputTransformNanos / rotationFrames} meanRestoreNs=${depthRotationNanos / rotationFrames} sampledQueuePeaks=$peakPrepared/$peakUpright")
+                }
+                if (throughputSamples > 0) {
+                    mark("new frame throughput samples=$throughputSamples meanMs=${totalThroughputMs.toDouble() / throughputSamples}")
+                }
             } finally {
                 extraSessions.values.forEach { it.close() }
             }
@@ -5842,6 +6372,7 @@ private class VideoVrGenerator(
             }
             muxer.stop()
             muxerStopped = true
+            return lastDepthGeometry
         } finally {
             firstEyes.recycle()
             runCatching { renderer?.release() }
@@ -6136,6 +6667,7 @@ private sealed class AppScreen {
 fun GalleryApp(viewModel: GalleryViewModel) {
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
+    val viewports = rememberSaveable(saver = GalleryViewports.Saver) { GalleryViewports() }
     var pendingReplaceIndexes by remember { mutableStateOf<List<Int>>(emptyList()) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
         viewModel.onPermissionChanged(
@@ -6208,6 +6740,14 @@ fun GalleryApp(viewModel: GalleryViewModel) {
     }
 
     val pageState = rememberSaveableStateHolder()
+    if (state.additionalImageSources.isNotEmpty() && !state.settingsOpen) {
+        AdditionalImagesDialog(
+            state,
+            onEdit = viewModel::openSettings,
+            onConfirm = viewModel::confirmAdditionalImages,
+            onCancel = viewModel::cancelAdditionalImages,
+        )
+    }
     Box(Modifier.fillMaxSize()) {
         when (screen) {
             AppScreen.Comparison -> state.comparison?.let { comparison ->
@@ -6215,6 +6755,7 @@ fun GalleryApp(viewModel: GalleryViewModel) {
             }
             AppScreen.Manage -> ManageScreen(
                 state = state,
+                viewports = viewports,
                 onBack = viewModel::closeManage,
                 selectedTab = state.generatedTab,
                 onTabChange = viewModel::setGeneratedTab,
@@ -6222,9 +6763,7 @@ fun GalleryApp(viewModel: GalleryViewModel) {
                 onOpenVersion = viewModel::openGeneratedVersion,
                 onCloseVersion = viewModel::closeGeneratedVersion,
                 onSetGeneratedColumns = { viewModel.setPageColumns("generated", it) },
-                onGeneratedScroll = viewModel::setGeneratedScroll,
-                onGeneratedVersionScroll = viewModel::setGeneratedVersionScroll,
-                onDeleteVersion = viewModel::deleteCacheVersions,
+                onDeleteVersion = viewModel::deleteGeneratedAlbums,
                 onOpenGenerated = viewModel::openGeneratedPhoto,
                 onOpenGeneratedVideo = viewModel::openGeneratedVideo,
                 onSaveVideo = { viewModel.saveGeneratedVideo(context, it) },
@@ -6237,10 +6776,16 @@ fun GalleryApp(viewModel: GalleryViewModel) {
                 onSaveImages = { viewModel.saveManagedGeneratedCopies(context, it) },
                 onDeleteImages = viewModel::deleteGeneratedImageEntries,
                 onRegenerateImages = viewModel::regenerateImages,
-                onGenerateImages = viewModel::generateAdditionalImages,
+                onGenerateImages = viewModel::requestAdditionalImages,
             )
             AppScreen.Settings -> SettingsScreen(
                 fromDebug = state.debugIndex != null,
+                initialSection = when {
+                    state.additionalImageSources.isNotEmpty() -> "depth"
+                    state.debugIndex?.let(state.photos::getOrNull)?.kind == MediaKind.VIDEO -> "video"
+                    state.debugIndex != null -> "depth"
+                    else -> "general"
+                },
                 settings = state.settings,
                 modelWarmupStatus = state.modelWarmupStatus,
                 updateStatus = state.updateStatus,
@@ -6260,17 +6805,17 @@ fun GalleryApp(viewModel: GalleryViewModel) {
             )
             AppScreen.Debug -> pageState.SaveableStateProvider("debug-${state.debugIndex}") { DebugScreen(
                 state = state,
-                index = state.debugIndex ?: state.galleryAnchorIndex,
+                index = state.debugIndex ?: state.allGalleryAnchorIndex(),
                 onBack = viewModel::closeDebug,
                 onSettings = viewModel::openSettings,
-                onCompare = { viewModel.startComparison(state.debugIndex ?: state.galleryAnchorIndex) },
-                onGenerate = { viewModel.generateAdditionalImages(listOf(state.debugIndex ?: state.galleryAnchorIndex)) },
-                onRegenerate = { viewModel.regenerateViewedImage(state.debugIndex ?: state.galleryAnchorIndex) },
-                onShare = { viewModel.exportDebug(context, state.debugIndex ?: state.galleryAnchorIndex) },
+                onCompare = { viewModel.startComparison(state.debugIndex ?: state.allGalleryAnchorIndex()) },
+                onGenerate = { viewModel.requestAdditionalImages(listOf(state.debugIndex ?: state.allGalleryAnchorIndex())) },
+                onRegenerate = { viewModel.regenerateViewedImage(state.debugIndex ?: state.allGalleryAnchorIndex()) },
+                onShare = { viewModel.exportDebug(context, state.debugIndex ?: state.allGalleryAnchorIndex()) },
             ) }
             AppScreen.Viewer -> StudioTheme(dark = true) { ViewerScreen(
                 state = state,
-                startIndex = state.selectedIndex ?: state.galleryAnchorIndex,
+                startIndex = state.selectedIndex ?: state.allGalleryAnchorIndex(),
                 onClose = viewModel::closeViewer,
                 onIndexChanged = viewModel::onPagerIndexChanged,
                 onVr = viewModel::requestVr,
@@ -6280,15 +6825,13 @@ fun GalleryApp(viewModel: GalleryViewModel) {
             }
             AppScreen.Gallery -> GalleryScreen(
                 state = state,
+                viewports = viewports,
                 onRefresh = viewModel::loadPhotos,
-                onOpen = viewModel::openPhoto,
                 onOpenScoped = viewModel::openScopedPhoto,
                 onSettings = viewModel::openSettings,
                 onSetTab = viewModel::setHomeTab,
                 onSetGeneratedTab = viewModel::setGeneratedTab,
                 onSetPageColumns = viewModel::setPageColumns,
-                onGeneratedScroll = viewModel::setGeneratedScroll,
-                onGeneratedVersionScroll = viewModel::setGeneratedVersionScroll,
                 onToggleGeneratedVersion = viewModel::toggleGeneratedVersion,
                 onOpenGeneratedVersion = viewModel::openGeneratedVersion,
                 onCloseGeneratedVersion = viewModel::closeGeneratedVersion,
@@ -6309,7 +6852,7 @@ fun GalleryApp(viewModel: GalleryViewModel) {
                         viewModel.replaceOriginalsWithGenerated(context, indexes)
                     }
                 },
-                onDeleteVersion = viewModel::deleteCacheVersions,
+                onDeleteVersion = viewModel::deleteGeneratedAlbums,
                 onOpenGenerated = viewModel::openGeneratedPhoto,
                 onOpenGeneratedVideo = viewModel::openGeneratedVideo,
                 onSaveVideo = { viewModel.saveGeneratedVideo(context, it) },
@@ -6322,7 +6865,7 @@ fun GalleryApp(viewModel: GalleryViewModel) {
                 onSaveImages = { viewModel.saveManagedGeneratedCopies(context, it) },
                 onDeleteImages = viewModel::deleteGeneratedImageEntries,
                 onRegenerateImages = viewModel::regenerateImages,
-                onGenerateImages = viewModel::generateAdditionalImages,
+                onGenerateImages = viewModel::requestAdditionalImages,
             )
         }
     }
@@ -6356,15 +6899,13 @@ private data class GeneratedSelectionActionsState(
 @Composable
 private fun GalleryScreen(
     state: UiState,
+    viewports: GalleryViewports,
     onRefresh: () -> Unit,
-    onOpen: (Int, Int, Int) -> Unit,
-    onOpenScoped: (Int, List<String>, Int, Int) -> Unit,
+    onOpenScoped: (Int, List<String>) -> Unit,
     onSettings: () -> Unit,
     onSetTab: (String) -> Unit,
     onSetGeneratedTab: (String) -> Unit,
     onSetPageColumns: (String, Int) -> Unit,
-    onGeneratedScroll: (String, Int, Int) -> Unit,
-    onGeneratedVersionScroll: (String, Int, Int) -> Unit,
     onToggleGeneratedVersion: (String) -> Unit,
     onOpenGeneratedVersion: (String) -> Unit,
     onCloseGeneratedVersion: () -> Unit,
@@ -6416,18 +6957,13 @@ private fun GalleryScreen(
     val selectedIndexes = remember(selectedKeys, photoIndexByKey) {
         if (selectedKeys.isEmpty()) emptyList() else selectedKeys.mapNotNull { photoIndexByKey[it] }
     }
-    val allGridState = rememberLazyGridState(
-        initialFirstVisibleItemIndex = state.galleryScrollIndex.coerceAtLeast(0),
-        initialFirstVisibleItemScrollOffset = state.galleryScrollOffset.coerceAtLeast(0),
-    )
-    val albumListGridState = rememberLazyGridState()
-    val albumDetailGridState = rememberLazyGridState(
-        initialFirstVisibleItemIndex = state.galleryScrollIndex.coerceAtLeast(0),
-        initialFirstVisibleItemScrollOffset = state.galleryScrollOffset.coerceAtLeast(0),
-    )
-    val gridState = if (state.homeTab == "albums" && state.selectedAlbumId != null) albumDetailGridState else allGridState
+    val timelineScope = if (state.homeTab == "albums") {
+        state.selectedAlbumId?.let(GalleryGridScope::album) ?: GalleryGridScope.ALL
+    } else GalleryGridScope.ALL
     val timelineColumns = StudioLayout.columns(if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumDetailColumns else state.allColumns, configuration.screenWidthDp, configuration.fontScale)
     var topBarHeightPx by remember { mutableStateOf(0) }
+    var generatedTabsBounds by remember { mutableStateOf<Rect?>(null) }
+    var generatedTabsOverlap by remember(state.homeTab, state.generatedTab, state.selectedGeneratedVersion) { mutableStateOf(false) }
     val topContentPadding = with(density) { topBarHeightPx.toDp() }
     val topBarStatusText = if (state.homeTab == "generated" && state.selectedGeneratedVersion != null) {
         cacheVersionTitle(state.selectedGeneratedVersion, lang)
@@ -6455,6 +6991,7 @@ private fun GalleryScreen(
                 ) {
                     ManageScreen(
                         state = state,
+                        viewports = viewports,
                         embedded = true,
                         onBack = {},
                         selectedTab = state.generatedTab,
@@ -6465,8 +7002,6 @@ private fun GalleryScreen(
                         contentTopPadding = topListPadding + 8.dp,
                         contentBottomPadding = bottomPadding,
                         onSetGeneratedColumns = { onSetPageColumns("generated", it) },
-                        onGeneratedScroll = onGeneratedScroll,
-                        onGeneratedVersionScroll = onGeneratedVersionScroll,
                         onDeleteVersion = onDeleteVersion,
                         onOpenGenerated = onOpenGenerated,
                         onOpenGeneratedVideo = onOpenGeneratedVideo,
@@ -6482,11 +7017,15 @@ private fun GalleryScreen(
                         onRegenerateImages = onRegenerateImages,
                         onGenerateImages = onGenerateImages,
                         onGeneratedSelectionChange = { generatedSelectionActions = it },
+                        tabsBounds = generatedTabsBounds,
+                        onTabsOverlapChanged = { generatedTabsOverlap = it },
                     )
                 }
             } else if (state.homeTab != "generated" && (if (state.homeTab == "albums" && state.selectedAlbumId == null) state.albums.isEmpty() else visibleItems.isEmpty())) {
                 StudioEmptyState(lang.t("还没有可浏览的媒体", "No media to browse"), lang.t("授予媒体访问权限，或在系统图库添加图片与视频后刷新。", "Allow media access, or add photos and videos to your system gallery, then refresh.")) { OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) } }
             } else if (state.homeTab == "albums" && state.selectedAlbumId == null) {
+                val albumKeys = remember(state.albums) { state.albums.map { it.bucketId } }
+                val albumListGridState = rememberGalleryGridState(viewports, GalleryGridScope.ALBUMS, albumKeys)
                 Box(
                     Modifier
                         .fillMaxSize()
@@ -6518,7 +7057,8 @@ private fun GalleryScreen(
                     items = visibleItems,
                     state = state,
                     lang = lang,
-                    gridState = gridState,
+                    viewports = viewports,
+                    viewportScope = timelineScope,
                     columns = timelineColumns,
                     selectedKeys = selectedKeys,
                     onColumns = { nextColumns ->
@@ -6530,13 +7070,7 @@ private fun GalleryScreen(
                             selectedKeys = if (photo.cacheKey in selectedKeys) selectedKeys - photo.cacheKey else selectedKeys + photo.cacheKey
                         } else {
                             val index = state.photos.indexOfFirst { it.cacheKey == photo.cacheKey }
-                            if (index >= 0) {
-                                if (state.homeTab == "albums" || state.homeTab == "all") {
-                                    onOpenScoped(index, visibleScopeKeys, gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset)
-                                } else {
-                                    onOpen(index, gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset)
-                                }
-                            }
+                            if (index >= 0) onOpenScoped(index, visibleScopeKeys)
                         }
                     },
                     onItemLongClick = { photo ->
@@ -6577,6 +7111,8 @@ private fun GalleryScreen(
                 .onSizeChanged { topBarHeightPx = it.height }
                 .padding(horizontal = 12.dp, vertical = 6.dp),
         ) {
+            val titleColor = MaterialTheme.colorScheme.onSurface
+            val detailColor = MaterialTheme.colorScheme.onSurfaceVariant
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if ((state.homeTab == "albums" && state.selectedAlbumId != null) || (state.homeTab == "generated" && state.selectedGeneratedVersion != null)) {
                     IconButton(onClick = { if (state.homeTab == "albums") onCloseAlbum() else onCloseGeneratedVersion() }) { Icon(Icons.Default.ArrowBack, lang.t("返回", "Back")) }
@@ -6586,8 +7122,10 @@ private fun GalleryScreen(
                         "generated" -> lang.t("生成", "Generated")
                         "albums" -> state.selectedAlbumId?.let { id -> state.albums.firstOrNull { it.bucketId == id }?.name } ?: lang.t("相册", "Albums")
                         else -> lang.t("全部", "All")
-                    }, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(if (state.homeTab == "generated") lang.t("结果与任务 · 按参数版本保留", "Results & jobs · kept by parameter version") else lang.t("选择素材，开始创作", "Choose media and create"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }, style = studioFloatingTextStyle(MaterialTheme.typography.titleLarge, titleColor), color = titleColor,
+                        fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(if (state.homeTab == "generated") lang.t("结果与任务 · 按参数版本保留", "Results & jobs · kept by parameter version") else lang.t("选择素材，开始创作", "Choose media and create"),
+                        style = studioFloatingTextStyle(MaterialTheme.typography.labelSmall, detailColor), color = detailColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 SelectionActionIcon(Icons.Default.HelpOutline, lang.t("使用指南", "Guide")) { showGuide = true }
                 SelectionActionIcon(Icons.Default.ListAlt, lang.t("任务", "Tasks")) { showTasks = true }
@@ -6595,11 +7133,17 @@ private fun GalleryScreen(
                 SelectionActionIcon(Icons.Default.Refresh, lang.t("刷新", "Refresh"), onRefresh)
             }
             if (state.homeTab == "generated") {
-                RoundedPillTabs(listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")), state.generatedTab, onSetGeneratedTab)
+                RoundedPillTabs(
+                    listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")),
+                    state.generatedTab, onSetGeneratedTab,
+                    modifier = Modifier.onGloballyPositioned { generatedTabsBounds = it.boundsInRoot() },
+                    translucent = generatedTabsOverlap,
+                )
             }
             topBarStatusText?.takeIf { it != dismissedMessage }?.let { message ->
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(lang.pickMixed(message), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Text(lang.pickMixed(message), Modifier.weight(1f), style = studioFloatingTextStyle(MaterialTheme.typography.bodySmall, detailColor),
+                        color = detailColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     IconButton(onClick = { dismissedMessage = message }, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Close, lang.t("收起提示", "Dismiss message"), Modifier.size(16.dp)) }
                 }
             }
@@ -6643,7 +7187,8 @@ private fun TimelineGrid(
     items: List<PhotoItem>,
     state: UiState,
     lang: AppLanguage,
-    gridState: androidx.compose.foundation.lazy.grid.LazyGridState,
+    viewports: GalleryViewports,
+    viewportScope: String,
     columns: Int,
     selectedKeys: Set<String>,
     onColumns: (Int) -> Unit,
@@ -6655,21 +7200,17 @@ private fun TimelineGrid(
     contentBottomPadding: androidx.compose.ui.unit.Dp = 96.dp,
     modifier: Modifier = Modifier,
 ) {
-    val restoreRenderLimit = min(items.size, max(1200, gridState.firstVisibleItemIndex + 400))
-    var renderLimit by remember(items.firstOrNull()?.cacheKey) { mutableStateOf(restoreRenderLimit) }
-    LaunchedEffect(items.size) {
-        renderLimit = renderLimit.coerceAtLeast(restoreRenderLimit).coerceAtMost(items.size)
+    val saved = remember(viewports, viewportScope) { viewports[viewportScope] }
+    val anchorMediaIndex = remember(saved, items) {
+        if (saved == null) 0 else {
+            val day = saved.key.removePrefix("header_").toLongOrNull()
+            items.indexOfFirst { it.cacheKey == saved.key || (day != null && localEpochDay(it.modifiedTime) == day) }
+        }
     }
-    LaunchedEffect(items.size, gridState) {
-        snapshotFlow { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0 }
-            .collect { lastVisible ->
-                if (lastVisible > renderLimit - 80 && renderLimit < items.size) {
-                    renderLimit = min(items.size, renderLimit + 1200)
-                }
-                if (lastVisible > renderLimit - 80) {
-                    onNearEnd()
-                }
-            }
+    val restoreRenderLimit = min(items.size, max(1200, max(saved?.index ?: 0, anchorMediaIndex) + 400))
+    var renderLimit by remember(viewports, viewportScope) { mutableStateOf(restoreRenderLimit) }
+    LaunchedEffect(items.size, restoreRenderLimit) {
+        renderLimit = renderLimit.coerceAtLeast(restoreRenderLimit).coerceAtMost(items.size)
     }
     val renderedItems = remember(items, renderLimit) { items.take(renderLimit) }
     val cells = remember(renderedItems, lang, renderLimit, items.size) {
@@ -6689,6 +7230,17 @@ private fun TimelineGrid(
         }
         result
     }
+    val keys = remember(cells) { cells.map { it.gridKey } }
+    val gridState = rememberGalleryGridState(viewports, viewportScope, keys)
+    LaunchedEffect(items.size, gridState) {
+        snapshotFlow { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0 }
+            .collect { lastVisible ->
+                if (lastVisible > renderLimit - 80 && renderLimit < items.size) {
+                    renderLimit = min(items.size, renderLimit + 1200)
+                }
+                if (lastVisible > renderLimit - 80) onNearEnd()
+            }
+    }
     Box(modifier) {
         LazyVerticalGrid(
             columns = GridCells.Fixed(columns),
@@ -6702,13 +7254,7 @@ private fun TimelineGrid(
         ) {
             items(
                 items = cells,
-                key = { cell ->
-                    when (cell) {
-                        is TimelineCell.Header -> "header_${cell.day}"
-                        is TimelineCell.Media -> cell.item.cacheKey
-                        is TimelineCell.Footer -> "footer_${cell.loaded}_${cell.total}_${cell.text.orEmpty()}"
-                    }
-                },
+                key = { it.gridKey },
                 span = { cell -> if (cell is TimelineCell.Media) GridItemSpan(1) else GridItemSpan(maxLineSpan) },
             ) { cell ->
                 when (cell) {
@@ -6888,10 +7434,12 @@ private fun RoundedPillTabs(
     selected: String,
     onSelect: (String) -> Unit,
     modifier: Modifier = Modifier,
+    translucent: Boolean = false,
 ) {
+    val colors = MaterialTheme.colorScheme
     Row(
         modifier = modifier
-            .background(MaterialTheme.colorScheme.surfaceContainerHigh, RoundedCornerShape(28.dp))
+            .background(colors.surfaceContainerHigh.copy(alpha = if (translucent) 0.25f else 1f), RoundedCornerShape(28.dp))
             .padding(3.dp),
         horizontalArrangement = Arrangement.spacedBy(3.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -6899,16 +7447,19 @@ private fun RoundedPillTabs(
         options.forEach { (key, label) ->
             val active = key == selected
             Surface(
-                color = if (active) MaterialTheme.colorScheme.primaryContainer else androidx.compose.ui.graphics.Color.Transparent,
+                color = if (active) colors.primaryContainer.copy(alpha = if (translucent) 0.5f else 1f) else androidx.compose.ui.graphics.Color.Transparent,
                 shape = RoundedCornerShape(24.dp),
                 modifier = Modifier.weight(1f)
                     .clip(RoundedCornerShape(24.dp))
                     .clickable { onSelect(key) }
                     .semantics { this[androidx.compose.ui.semantics.SemanticsProperties.Selected] = active },
             ) {
+                val labelColor = if (active) colors.onPrimaryContainer else colors.onSurface
+                val labelStyle = LocalTextStyle.current
                 Text(
                     text = label,
-                    color = if (active) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+                    color = labelColor,
+                    style = if (translucent) studioFloatingTextStyle(labelStyle, labelColor) else labelStyle,
                     fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
                     maxLines = 2, overflow = TextOverflow.Ellipsis, textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).wrapContentHeight(Alignment.CenterVertically).padding(horizontal = 8.dp, vertical = 9.dp),
@@ -7115,10 +7666,40 @@ private fun StatusBadge(
     )
 }
 
+private const val VideoQueueActionsGridKey = "video-queue-actions"
+private val ManagedCacheItem.gridKey: String get() = "${entry.photoKey}_${entry.version}"
+
+@Composable
+private fun Modifier.reportContentBehindTabs(
+    grid: LazyGridState,
+    tabsBounds: Rect?,
+    onOverlapChanged: ((Boolean) -> Unit)?,
+): Modifier {
+    if (onOverlapChanged == null) return this
+    var gridTop by remember(grid) { mutableStateOf<Float?>(null) }
+    val reportOverlap by rememberUpdatedState(onOverlapChanged)
+    LaunchedEffect(grid, tabsBounds) {
+        snapshotFlow {
+            val top = gridTop
+            if (top == null || tabsBounds == null) return@snapshotFlow false
+            val layout = grid.layoutInfo
+            // Lazy grid offsets are measured from the start of content, excluding top padding.
+            val contentTop = top - layout.viewportStartOffset
+            layout.visibleItemsInfo.any { item ->
+                val itemTop = contentTop + item.offset.y
+                itemTop < tabsBounds.bottom && itemTop + item.size.height > tabsBounds.top
+            }
+        }.collect { reportOverlap(it) }
+    }
+    DisposableEffect(grid) { onDispose { onOverlapChanged(false) } }
+    return onGloballyPositioned { gridTop = it.positionInRoot().y }
+}
+
 @OptIn(ExperimentalFoundationApi::class, ExperimentalLayoutApi::class)
 @Composable
 private fun ManageScreen(
     state: UiState,
+    viewports: GalleryViewports,
     embedded: Boolean = false,
     onBack: () -> Unit,
     selectedTab: String,
@@ -7129,8 +7710,6 @@ private fun ManageScreen(
     contentTopPadding: androidx.compose.ui.unit.Dp = 0.dp,
     contentBottomPadding: androidx.compose.ui.unit.Dp = 100.dp,
     onSetGeneratedColumns: (Int) -> Unit,
-    onGeneratedScroll: (String, Int, Int) -> Unit,
-    onGeneratedVersionScroll: (String, Int, Int) -> Unit,
     onDeleteVersion: (List<String>) -> Unit,
     onOpenGenerated: (Int, VrCacheEntry) -> Unit,
     onOpenGeneratedVideo: (Int) -> Unit,
@@ -7146,6 +7725,8 @@ private fun ManageScreen(
     onRegenerateImages: (List<ManagedCacheItem>) -> Unit,
     onGenerateImages: (List<Int>) -> Unit,
     onGeneratedSelectionChange: (GeneratedSelectionActionsState?) -> Unit = {},
+    tabsBounds: Rect? = null,
+    onTabsOverlapChanged: ((Boolean) -> Unit)? = null,
 ) {
     val lang = state.settings.language
     val config = LocalConfiguration.current
@@ -7160,6 +7741,9 @@ private fun ManageScreen(
         selectedVideoKeys = emptySet()
     }
     val availablePhotoKeys = remember(state.photos) { state.photos.mapTo(hashSetOf()) { it.cacheKey } }
+    val imagesByAlbum = remember(state.managedCacheItems) {
+        state.managedCacheItems.groupBy { generatedAlbumKey(it.entry.version) }
+    }
     LaunchedEffect(selectedTab, state.selectedGeneratedVersion) {
         selectedImageKeys = emptySet()
         selectedVideoKeys = emptySet()
@@ -7168,8 +7752,12 @@ private fun ManageScreen(
     LaunchedEffect(state.cacheVersions) {
         selectedVersions = selectedVersions.intersect(state.cacheVersions.map { it.version }.toSet())
     }
+    LaunchedEffect(state.loading, state.selectedGeneratedVersion, imagesByAlbum) {
+        val selected = state.selectedGeneratedVersion
+        if (!state.loading && selected != null && selected !in imagesByAlbum) onCloseVersion()
+    }
     versionsToDelete?.let { versions ->
-        val count = state.managedCacheItems.count { it.entry.version in versions }
+        val count = versions.sumOf { imagesByAlbum[it].orEmpty().size }
         AlertDialog(
             onDismissRequest = { versionsToDelete = null },
             title = { Text(lang.t("删除 ${versions.size} 个生成相册？", "Delete ${versions.size} generated albums?")) },
@@ -7196,7 +7784,7 @@ private fun ManageScreen(
             title = { Text(lang.t("重新生成 ${indexes.size} 张图片？", "Regenerate ${indexes.size} images?")) },
             text = { Text(lang.t("使用当前设置；同一原图只入队一次。完整成功后仅替换选中的旧结果，失败保留。其他历史版本和原图保留，不开启邻图预加载。", "Use current settings once per source. Replace only selected old results after success; keep them on failure. Other versions and originals stay. No neighbor prefetch.")) },
             confirmButton = { Button(enabled = indexes.isNotEmpty(), onClick = {
-                onRegenerateImages(state.managedCacheItems.filter { it.entry.version in versions })
+                onRegenerateImages(versions.flatMap { imagesByAlbum[it].orEmpty() })
                 selectedVersions = emptySet()
                 versionsToRegenerate = null
             }) { Text(lang.t("重新生成", "Regenerate")) } },
@@ -7235,22 +7823,16 @@ private fun ManageScreen(
         LinkedPager(selectedTab, listOf("images", "videos"), onTabChange,
             Modifier.weight(1f).fillMaxWidth(),
             swipeEnabled = selectedImageKeys.isEmpty() && selectedVideoKeys.isEmpty() && selectedVersions.isEmpty()) {     tab ->
+            val reportTabsOverlap = onTabsOverlapChanged.takeIf { embedded && tab == selectedTab }
                 val gridColumns = StudioLayout.columns(state.generatedColumns, config.screenWidthDp, config.fontScale, tab == "videos" || state.selectedGeneratedVersion == null)
             if (tab == "videos") {
-                val videoGridState = rememberLazyGridState(
-                    initialFirstVisibleItemIndex = state.generatedVideoScrollIndex.coerceAtLeast(0),
-                    initialFirstVisibleItemScrollOffset = state.generatedVideoScrollOffset.coerceAtLeast(0),
-                )
-                LaunchedEffect(videoGridState) {
-                    snapshotFlow { videoGridState.firstVisibleItemIndex to videoGridState.firstVisibleItemScrollOffset }
-                        .collect { (index, offset) -> onGeneratedScroll("videos", index, offset) }
-                }
                 val videos = state.photos.filter { item ->
                     item.kind == MediaKind.VIDEO &&
                         ((state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL) != VideoVrState.NORMAL ||
                             state.videoEntries.containsKey(item.cacheKey) ||
                             state.videoJobs.any { it.item.cacheKey == item.cacheKey })
                 }
+                val videoKeys = remember(videos) { listOf(VideoQueueActionsGridKey) + videos.map { it.cacheKey } }
                 LaunchedEffect(videos) { selectedVideoKeys = selectedVideoKeys.intersect(videos.mapTo(hashSetOf()) { it.cacheKey }) }
                 val selectedIndexes = videos.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.cacheKey }.takeIf { it >= 0 && item.cacheKey in selectedVideoKeys } }
                 val startCount = selectedIndexes.count { VideoCommandPolicy.canStart(state.videoStates[state.photos[it].cacheKey] ?: VideoVrState.NORMAL) }
@@ -7291,12 +7873,14 @@ private fun ManageScreen(
                 if (videos.isEmpty()) {
                     StudioEmptyState(lang.t("还没有视频任务", "No video jobs yet"), lang.t("从全部或相册打开视频，手动加入 VR 队列。视频不会自动加入图片预加载。", "Open a video from All or Albums and add it to the VR queue. Videos are never added by image prefetch."), Modifier.padding(top = contentTopPadding, bottom = contentBottomPadding))
                 } else {
+                    val videoGridState = rememberGalleryGridState(viewports, GalleryGridScope.GENERATED_VIDEOS, videoKeys)
                     Box(Modifier.fillMaxSize()) {
                         LazyVerticalGrid(
                             columns = GridCells.Fixed(gridColumns),
                             state = videoGridState,
                             modifier = Modifier
                                 .fillMaxSize()
+                                .reportContentBehindTabs(videoGridState, tabsBounds, reportTabsOverlap)
                                 .background(MaterialTheme.colorScheme.background)
                                 .discreteColumnPinch(columns = gridColumns, onColumns = onSetGeneratedColumns)
                                 .generatedGridDragSelection(
@@ -7319,7 +7903,7 @@ private fun ManageScreen(
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            item(key = "video-queue-actions", span = { GridItemSpan(maxLineSpan) }) {
+                            item(key = VideoQueueActionsGridKey, span = { GridItemSpan(maxLineSpan) }) {
                                 val indexes = videos.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.cacheKey }.takeIf { it >= 0 } }
                                 val starts = indexes.count { VideoCommandPolicy.canStart(state.videoStates[state.photos[it].cacheKey] ?: VideoVrState.NORMAL) }
                                 val pauses = indexes.count { VideoCommandPolicy.canPause(state.videoStates[state.photos[it].cacheKey] ?: VideoVrState.NORMAL) }
@@ -7375,7 +7959,7 @@ private fun ManageScreen(
                     }
                     StudioEmptyState(lang.t("创作结果会出现在这里", "Your creations will appear here"), lang.t("从全部或相册打开图片会自动开启 VR。结果按参数版本保存，长按可多选；不会改写系统原图。", "Opening a photo from All or Albums enables VR; use its Viewer switch to turn it off. Results are kept by parameter version; long press to select. Originals are unchanged."), Modifier.padding(top = contentTopPadding, bottom = contentBottomPadding))
                 } else {
-                    val selectedVersion = state.selectedGeneratedVersion
+                    val selectedVersion = state.selectedGeneratedVersion?.takeIf { it in imagesByAlbum }
                     if (selectedVersion == null) {
                         LaunchedEffect(embedded, selectedTab, selectedVersions, state.cacheVersions) {
                             if (embedded && tab == selectedTab) onGeneratedSelectionChange(
@@ -7401,20 +7985,15 @@ private fun ManageScreen(
                                 onDelete = { versionsToDelete = selectedVersions }, confirmChanges = false,
                                 onGenerate = { onGenerateImages(GeneratedSelectionScope.regenerationIndexes(state.photos.map { it.cacheKey }, state.managedCacheItems.map { it.entry.photoKey to it.entry.version }, selectedVersions)); selectedVersions = emptySet() })
                         }
-                        val versionGridState = rememberLazyGridState(
-                            initialFirstVisibleItemIndex = state.generatedImageScrollIndex.coerceAtLeast(0),
-                            initialFirstVisibleItemScrollOffset = state.generatedImageScrollOffset.coerceAtLeast(0),
-                        )
-                        LaunchedEffect(versionGridState) {
-                            snapshotFlow { versionGridState.firstVisibleItemIndex to versionGridState.firstVisibleItemScrollOffset }
-                                .collect { (index, offset) -> onGeneratedScroll("images", index, offset) }
-                        }
+                        val versionKeys = remember(state.cacheVersions) { state.cacheVersions.map { it.version } }
+                        val versionGridState = rememberGalleryGridState(viewports, GalleryGridScope.GENERATED_VERSIONS, versionKeys)
                         Box(Modifier.fillMaxSize()) {
                             LazyVerticalGrid(
                                 columns = GridCells.Fixed(gridColumns),
                                 state = versionGridState,
                                 modifier = Modifier
                                     .fillMaxSize()
+                                    .reportContentBehindTabs(versionGridState, tabsBounds, reportTabsOverlap)
                                     .background(MaterialTheme.colorScheme.background)
                                     .discreteColumnPinch(columns = gridColumns, onColumns = onSetGeneratedColumns)
                                     .generatedGridDragSelection(
@@ -7434,8 +8013,7 @@ private fun ManageScreen(
                                 horizontalArrangement = Arrangement.spacedBy(14.dp),
                             ) {
                                 items(state.cacheVersions, key = { it.version }) { summary ->
-                                    val items = state.managedCacheItems.filter { it.entry.version == summary.version }
-                                    val cover = items.maxByOrNull { it.entry.createdAt }
+                                    val cover = imagesByAlbum[summary.version]?.maxByOrNull { it.entry.createdAt }
                                     GeneratedVersionTile(
                                         summary = summary,
                                         cover = cover,
@@ -7452,18 +8030,12 @@ private fun ManageScreen(
                             GridToTopButton(versionGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
                         }
                     } else {
-                        val itemsInVersion = state.managedCacheItems.filter { it.entry.version == selectedVersion }
+                        val itemsInVersion = imagesByAlbum[selectedVersion].orEmpty()
                         LaunchedEffect(itemsInVersion) {
                             selectedImageKeys = selectedImageKeys.intersect(itemsInVersion.mapTo(hashSetOf()) { "${it.entry.photoKey}|${it.entry.version}" })
                         }
-                        val imageGridState = rememberLazyGridState(
-                            initialFirstVisibleItemIndex = (state.generatedVersionScrollIndexes[selectedVersion] ?: 0).coerceAtLeast(0),
-                            initialFirstVisibleItemScrollOffset = (state.generatedVersionScrollOffsets[selectedVersion] ?: 0).coerceAtLeast(0),
-                        )
-                        LaunchedEffect(selectedVersion, imageGridState) {
-                            snapshotFlow { imageGridState.firstVisibleItemIndex to imageGridState.firstVisibleItemScrollOffset }
-                                .collect { (index, offset) -> onGeneratedVersionScroll(selectedVersion, index, offset) }
-                        }
+                        val imageKeys = remember(itemsInVersion) { itemsInVersion.map { it.gridKey } }
+                        val imageGridState = rememberGalleryGridState(viewports, GalleryGridScope.generatedVersion(selectedVersion), imageKeys)
                         Column(Modifier.fillMaxSize()) {
                             if (!embedded) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -7522,6 +8094,7 @@ private fun ManageScreen(
                                     state = imageGridState,
                                     modifier = Modifier
                                         .fillMaxSize()
+                                        .reportContentBehindTabs(imageGridState, tabsBounds, reportTabsOverlap)
                                         .background(MaterialTheme.colorScheme.background)
                                         .discreteColumnPinch(columns = gridColumns, onColumns = onSetGeneratedColumns)
                                         .generatedGridDragSelection(
@@ -7544,7 +8117,7 @@ private fun ManageScreen(
                                     verticalArrangement = Arrangement.spacedBy(8.dp),
                                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 ) {
-                                    items(itemsInVersion, key = { "${it.entry.photoKey}_${it.entry.version}" }) { item ->
+                                    items(itemsInVersion, key = { it.gridKey }) { item ->
                                         val index = state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }
                                         val selectionKey = "${item.entry.photoKey}|${item.entry.version}"
                                         Box(
@@ -7643,11 +8216,12 @@ private fun GeneratedVersionTile(
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
+        val details = remember(summary.version, lang) { generatedAlbumParameterDetails(summary.version, lang) }
         Text(
-            text = "${(summary.bytes / 1024f / 1024f).roundToInt()} MB",
+            text = details.ifEmpty { "${(summary.bytes / 1024f / 1024f).roundToInt()} MB" },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
+            maxLines = 3,
             overflow = TextOverflow.Ellipsis,
         )
     }
@@ -7674,6 +8248,43 @@ private fun GeneratedSbsThumbnail(entry: VrCacheEntry, maxSide: Int, contentScal
             CircularProgressIndicator(Modifier.size(22.dp))
         }
     }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun AdditionalImagesDialog(
+    state: UiState,
+    onEdit: () -> Unit,
+    onConfirm: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    val lang = state.settings.language
+    val version = state.settings.toParams().cacheVersion()
+    val ready = remember(state.additionalImageSources, state.managedCacheItems, version) {
+        additionalImageSourceKeys(state.additionalImageSources, version, state.managedCacheItems.map { it.resultKey })
+    }
+    val alreadyHave = state.additionalImageSources.size - ready.size
+    val targetExists = state.cacheVersions.any { it.version == version }
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text(lang.t("使用新参数生成", "Generate with new parameters")) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(cacheVersionTitle(version, lang), style = MaterialTheme.typography.titleSmall)
+                val details = remember(version, lang) { generatedAlbumParameterDetails(version, lang) }
+                if (details.isNotEmpty()) Text(details, style = MaterialTheme.typography.bodySmall)
+                Text(when {
+                    ready.isEmpty() -> lang.t("所选原图已有这套参数的结果。调整参数后可生成到另一个相册。", "The selected originals already have results with these parameters. Adjust them to generate into a different album.")
+                    targetExists -> lang.t("生成 ${ready.size} 张，归入已有的同参数相册。", "Generate ${ready.size} images into the existing album for these parameters.")
+                    else -> lang.t("生成 ${ready.size} 张，首张完成后会显示新相册。", "Generate ${ready.size} images. The new album appears when the first result is ready.")
+                })
+                if (ready.isNotEmpty() && alreadyHave > 0) Text(lang.t("已有结果 $alreadyHave 张，直接跳过。", "Skipping $alreadyHave images with existing results."))
+                TextButton(onClick = onEdit) { Text(lang.t("调整参数", "Adjust parameters")) }
+            }
+        },
+        confirmButton = { Button(onClick = onConfirm, enabled = ready.isNotEmpty()) { Text(lang.t("开始生成", "Start generation")) } },
+        dismissButton = { TextButton(onClick = onCancel) { Text(lang.t("取消", "Cancel")) } },
+    )
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -7705,18 +8316,17 @@ private fun ManageSelectionActions(
             onStart?.let { action -> TextButton(onClick = action, enabled = startCount > 0) { Text(lang.t("开始所选 $startCount 项", "Start $startCount selected")) } }
             onPause?.let { action -> TextButton(onClick = action, enabled = pauseCount > 0) { Text(lang.t("暂停所选 $pauseCount 项", "Pause $pauseCount selected")) } }
             onSave?.let { TextButton(onClick = it) { Text(if (imageReplacement) lang.t("保存无损 PNG", "Save lossless PNG") else lang.t("保存副本", "Save copies")) } }
-            onGenerate?.let { action -> TextButton(onClick = { pending = "additional" }) { Text(lang.t("使用新参数生成", "Generate with new parameters")) } }
+            onGenerate?.let { action -> TextButton(onClick = action) { Text(lang.t("使用新参数生成", "Generate with new parameters")) } }
             onRegenerate?.let { action -> TextButton(onClick = { if (confirmChanges) pending = "regenerate" else action() }) { Text(lang.t("重新生成", "Regenerate")) } }
             TextButton(onClick = { if (confirmChanges) pending = "delete" else onDelete() }) { Text(lang.t("删除结果", "Delete results"), color = MaterialTheme.colorScheme.error) }
         }
     }
     pending?.let { action ->
         val deleting = action == "delete"
-        val additional = action == "additional"
         AlertDialog(onDismissRequest = { pending = null },
-            title = { Text(if (deleting) lang.t("删除所选 $count 项结果？", "Delete $count selected results?") else if (additional) lang.t("使用新参数生成所选 $count 项？", "Generate $count selected items with new parameters?") else lang.t("重新生成所选 $count 项？", "Regenerate $count selected items?")) },
-            text = { Text(if (deleting) lang.t("仅删除所选生成结果并取消相关任务，不删除系统原图。", "Only selected generated results and related jobs are removed. Original media is kept.") else if (additional) lang.t("按当前设置另存新结果，全部旧结果和原图保留。同一原图只入队一次，不开启邻图预加载。", "Create separate results with current settings. Keep all old results and originals; once per source, without neighbor prefetch.") else if (!imageReplacement) lang.t("按当前设置清理并重新生成所选视频缓存；失败需重试。系统原视频不修改。", "Clear and regenerate selected video cache with current settings; retry on failure. Original videos are unchanged.") else lang.t("使用当前设置生成成功后，仅替换选中的旧结果；失败保留。其他历史版本和原图保留，不启动邻图预加载。", "Replace only the selected old results after success. Keep them on failure. Other historical versions and originals stay; no neighbor prefetch.")) },
-            confirmButton = { Button(onClick = { pending = null; if (deleting) onDelete() else if (additional) onGenerate?.invoke() else onRegenerate?.invoke() }) { Text(lang.t("确认", "Confirm")) } },
+            title = { Text(if (deleting) lang.t("删除所选 $count 项结果？", "Delete $count selected results?") else lang.t("重新生成所选 $count 项？", "Regenerate $count selected items?")) },
+            text = { Text(if (deleting) lang.t("仅删除所选生成结果并取消相关任务，不删除系统原图。", "Only selected generated results and related jobs are removed. Original media is kept.") else if (!imageReplacement) lang.t("按当前设置清理并重新生成所选视频缓存；失败需重试。系统原视频不修改。", "Clear and regenerate selected video cache with current settings; retry on failure. Original videos are unchanged.") else lang.t("使用当前设置生成成功后，仅替换选中的旧结果；失败保留。其他历史版本和原图保留，不启动邻图预加载。", "Replace only the selected old results after success. Keep them on failure. Other historical versions and originals stay; no neighbor prefetch.")) },
+            confirmButton = { Button(onClick = { pending = null; if (deleting) onDelete() else onRegenerate?.invoke() }) { Text(lang.t("确认", "Confirm")) } },
             dismissButton = { TextButton(onClick = { pending = null }) { Text(lang.t("取消", "Cancel")) } },
         )
     }
@@ -7765,6 +8375,7 @@ private fun StudioSettingsPager(
 @Composable
 private fun SettingsScreen(
     fromDebug: Boolean = false,
+    initialSection: String = "general",
     settings: AppSettings,
     modelWarmupStatus: String?,
     updateStatus: String?,
@@ -7784,7 +8395,8 @@ private fun SettingsScreen(
 ) {
     val lang = settings.language
     val context = LocalContext.current
-    var section by rememberSaveable(fromDebug) { mutableStateOf(if (fromDebug) "depth" else "general") }
+    val qnnBackendAvailable = remember(context) { QnnFp16DepthRuntime.hasGpuBackend(context) }
+    var section by rememberSaveable(initialSection) { mutableStateOf(initialSection) }
     var defaultSaved by remember(settings.edgeMode) { mutableStateOf(false) }
     var defaultSaveFailed by remember(settings.edgeMode) { mutableStateOf(false) }
     LaunchedEffect(settings) { defaultSaved = false; defaultSaveFailed = false }
@@ -7881,15 +8493,12 @@ private fun SettingsScreen(
                     }
                 }
                 item {
-                    StudioCard(lang.t("模型推理与深度放大", "Model inference and depth upsampling")) {
-                        val depthModel = modelSpec(settings.imageModelId)
-                        SettingChoice(lang.t("图片模型推理分辨率", "Image model inference resolution"), settings.imageModelId, ImageModels.map { it.id }, { modelSpec(it).displayName }) { onChange(settings.copy(imageModelId = it, depthResolution = modelSpec(it).inputSize)) }
-                        SettingHelp(lang.t("实际输入与深度输出：${depthModel.inputSize}×${depthModel.inputSize}。770 对齐模型的 14 像素分块，需要首次下载约 101 MB；平板实测推理约慢 4 倍，首次 GPU 准备约 21 秒。细节不保证处处更好。下面的放大只是插值，不改变模型分辨率。", "Actual input/depth output: ${depthModel.inputSize}×${depthModel.inputSize}. 770 aligns to 14-pixel model patches and downloads about 101 MB. Tested tablet inference is about 4× slower, with about 21 seconds initial GPU setup. Detail is not universally better. Upsampling below only interpolates the output."))
+                    StudioCard(lang.t("深度后处理", "Depth post-processing")) {
                         DepthUpscaleControls(settings.depthUpscale, lang, settings.edgeMode.isComfyMain) { onChange(settings.copy(depthUpscale = it)) }
                     }
                 }
                 item {
-                    StudioCard(lang.t("输出尺寸", "Output size")) {
+                    StudioCard(lang.t("SBS 成品尺寸", "SBS output size")) {
                         SettingInt(lang.t("单眼最大长边", "Maximum eye long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) { onChange(settings.copy(maxLongEdge = it)) }
                         SettingHelp(lang.t("不是 SBS 总宽。小图不强制放大；内存不足仍可能降采样。日常 JPEG 100 缓存有损。", "Not total SBS width. Small images are not enlarged; memory pressure may downsample. Daily JPEG 100 cache is lossy."))
                         Text(lang.t("保存到图库：原图重新生成 · 无损 PNG", "Gallery save: re-render original · lossless PNG"), style = MaterialTheme.typography.bodyMedium)
@@ -7900,7 +8509,7 @@ private fun SettingsScreen(
             "images" -> {
                 item {
                     StudioCard(lang.t("图片模型", "Image model"), modelWarmupStatus?.let(lang::pickMixed)) {
-                        ModelPicker(lang.t("模型", "Model"), settings.imageModelId, lang, ImageModels) { onChange(settings.copy(imageModelId = it.id, depthResolution = it.inputSize)) }
+                        ModelPicker(lang.t("模型", "Model"), settings.imageModelId, lang, ImageModels, qnnBackendAvailable) { onChange(settings.copy(imageModelId = it.id, depthResolution = it.inputSize)) }
                     }
                 }
                 item {
@@ -7915,27 +8524,34 @@ private fun SettingsScreen(
                 }
                 item {
                     StudioCard(lang.t("图片推理", "Image inference")) {
-                        SettingInt(lang.t("每会话 CPU 线程", "CPU threads per session"), settings.modelThreads, listOf(1, 2, 4, 8)) { onChange(settings.copy(modelThreads = it)) }
-                        StudioSwitch(lang.t("强制 GPU", "Force GPU"), lang.t("失败会报错，不自动回退 CPU", "Failures are reported; no silent CPU fallback"), settings.useGpu) { onChange(settings.copy(useGpu = it)) }
-                        GpuModePicker(settings.gpuTestMode, lang) { onChange(settings.copy(gpuTestMode = it)) }
-                        SettingHelp(lang.t("GPU 模式供图片和视频共用，不是占用率限制。解释器与 delegate 的创建、推理、释放都在同一拥有者线程。关闭 GPU 才使用 CPU。", "GPU mode is shared by images and video; it is not a utilization cap. Interpreter/delegate creation, inference and release share one owner thread. Disable GPU to use CPU."))
+                        if (qnnModelConfig(settings.imageModelId) != null) {
+                            SettingHelp(lang.t("QNN 固定使用 GPU。推理失败会显示错误。", "QNN uses GPU only. Inference failures are reported."))
+                        } else {
+                            SettingInt(lang.t("每会话 CPU 线程", "CPU threads per session"), settings.modelThreads, listOf(1, 2, 4, 8)) { onChange(settings.copy(modelThreads = it)) }
+                            StudioSwitch(lang.t("强制 GPU", "Force GPU"), lang.t("失败会报错，不自动回退 CPU", "Failures are reported; no silent CPU fallback"), settings.useGpu) { onChange(settings.copy(useGpu = it)) }
+                            GpuModePicker(settings.gpuTestMode, lang) { onChange(settings.copy(gpuTestMode = it)) }
+                            SettingHelp(lang.t("GPU 模式供图片和视频共用，不是占用率限制。解释器与 delegate 的创建、推理、释放都在同一拥有者线程。关闭 GPU 才使用 CPU。", "GPU mode is shared by images and video; it is not a utilization cap. Interpreter/delegate creation, inference and release share one owner thread. Disable GPU to use CPU."))
+                        }
                     }
                 }
             }
             "video" -> {
                 item {
                     StudioCard(lang.t("视频模型", "Video model")) {
-                        ModelPicker(lang.t("模型", "Model"), settings.videoModelId, lang, VideoModels) { onChange(settings.copy(videoModelId = it.id)) }
-                        val spec = modelSpec(settings.videoModelId)
-                        SettingHelp(lang.t("模型固定输入 ${spec.inputSize}×${spec.inputSize}，不会因深度放大提高推理分辨率。", "Fixed ${spec.inputSize}×${spec.inputSize} model input; upsampling does not increase inference resolution."))
+                        ModelPicker(lang.t("模型", "Model"), settings.videoModelId, lang, VideoModels, qnnBackendAvailable) { onChange(settings.copy(videoModelId = it.id)) }
+                        SettingHelp(lang.t("继续已有任务沿用原型号、尺寸和比例模式。新任务和重新生成使用这里的选择。", "Resuming keeps the job's original model, size and aspect mode. New jobs and regeneration use this selection."))
                     }
                 }
                 item {
                     StudioCard(lang.t("视频流水线", "Video pipeline"), lang.t("视频独立排队，不参与图片预加载", "Videos are queued separately from image prefetch")) {
-                        SettingInt(lang.t("每会话 CPU 线程", "CPU threads per session"), settings.videoModelThreads, listOf(1, 2, 4, 8)) { onChange(settings.copy(videoModelThreads = it)) }
-                        SettingInt(lang.t("深度 worker 数", "Depth workers"), settings.videoDepthWorkers, listOf(1, 2)) { onChange(settings.copy(videoDepthWorkers = it)) }
-                        StudioSwitch(lang.t("视频强制 GPU", "Force GPU for video"), lang.t("GPU 使用单会话；失败不回退 CPU", "One GPU session; no silent CPU fallback"), settings.videoUseGpu) { onChange(settings.copy(videoUseGpu = it)) }
-                        GpuModePicker(settings.gpuTestMode, lang) { onChange(settings.copy(gpuTestMode = it)) }
+                        if (qnnModelConfig(settings.videoModelId) != null) {
+                            SettingHelp(lang.t("QNN 固定在一个 GPU 工作线程上推理。失败会显示错误。", "QNN inference runs on one GPU worker thread. Failures are reported."))
+                        } else {
+                            SettingInt(lang.t("每会话 CPU 线程", "CPU threads per session"), settings.videoModelThreads, listOf(1, 2, 4, 8)) { onChange(settings.copy(videoModelThreads = it)) }
+                            SettingInt(lang.t("深度 worker 数", "Depth workers"), settings.videoDepthWorkers, listOf(1, 2)) { onChange(settings.copy(videoDepthWorkers = it)) }
+                            StudioSwitch(lang.t("视频强制 GPU", "Force GPU for video"), lang.t("GPU 使用单会话；失败不回退 CPU", "One GPU session; no silent CPU fallback"), settings.videoUseGpu) { onChange(settings.copy(videoUseGpu = it)) }
+                            GpuModePicker(settings.gpuTestMode, lang) { onChange(settings.copy(gpuTestMode = it)) }
+                        }
                         SettingHelp(lang.t("CPU 可使用 1–2 个独立深度会话；GPU 固定一个。解码、推理、写入、编码为有界流水线。保留原始时间线与音频，播放使用单个 SBS 源。这里不控制播放速度。", "CPU supports 1–2 depth sessions; GPU uses one. Decode, inference, writes and encoding form a bounded pipeline. Original timestamps and audio are retained, with one SBS playback source. These settings do not change playback speed."))
                     }
                 }
@@ -7988,43 +8604,175 @@ private fun ModelPicker(
     selectedModelId: String,
     lang: AppLanguage,
     models: List<ModelSpec>,
+    qnnBackendAvailable: Boolean,
     onSelect: (ModelSpec) -> Unit,
 ) {
+    val families = remember(models) { models.groupBy(ModelSpec::selectionFamily) }
+    val activeModelId = activeDepthModelId(selectedModelId)
+    val selected = models.firstOrNull { it.id == activeModelId }
+    val selectedFamily = selected?.selectionFamily()
+    val selectedQnn = qnnModelConfig(activeModelId)
     Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
     Spacer(Modifier.height(6.dp))
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        models.forEach { spec ->
-            val selected = selectedModelId == spec.id
+        families.forEach { (family, variants) ->
+            val spec = variants.first()
+            val variant = qnnModelConfig(spec.id)?.variant
+            val label = when {
+                variant == QnnDepthVariant.FP16 -> "Depth Anything V2 · QNN GPU FP16"
+                variant == QnnDepthVariant.FP32_HEAD -> lang.t("Depth Anything V2 · QNN GPU 末端 FP32", "Depth Anything V2 · QNN GPU FP32 head")
+                family == DEFAULT_TFLITE_MODEL_ID -> "Depth Anything V2 · TFLite"
+                else -> spec.displayName
+            }
             val buttonModifier = Modifier.fillMaxWidth()
-            if (!spec.downloadable) {
+            val qnnUnavailable = variant != null && !qnnBackendAvailable
+            if (!spec.downloadable || qnnUnavailable) {
                 OutlinedButton(onClick = {}, enabled = false, modifier = buttonModifier) {
                     Column(Modifier.fillMaxWidth()) {
-                        Text(spec.displayName, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                        Text(lang.t(spec.noteZh, spec.noteEn), style = MaterialTheme.typography.labelSmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                        Text(label)
+                        val reason = if (qnnUnavailable) lang.t("当前 Android 进程无法加载 QNN GPU", "QNN GPU is unavailable in this Android process") else lang.t(spec.noteZh, spec.noteEn)
+                        Text(reason, style = MaterialTheme.typography.labelSmall)
                     }
                 }
-            } else if (selected) {
-                Button(onClick = { onSelect(spec) }, modifier = buttonModifier) {
-                    Text(spec.displayName, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            } else if (family == selectedFamily) {
+                Button(onClick = {}, modifier = buttonModifier) {
+                    Text(label)
                 }
             } else {
-                OutlinedButton(onClick = { onSelect(spec) }, modifier = buttonModifier) {
-                    Text(spec.displayName, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                OutlinedButton(onClick = {
+                    val aspect = selectedQnn?.aspect ?: QnnDepthAspect.SQUARE
+                    onSelect(variants.firstOrNull {
+                        it.inputSize == selected?.inputSize && (variant == null || qnnModelConfig(it.id)?.aspect == aspect)
+                    } ?: spec)
+                }, modifier = buttonModifier) {
+                    Text(label)
                 }
             }
         }
     }
+    if (selected != null && selectedFamily != null && selected.downloadable) {
+        Spacer(Modifier.height(12.dp))
+        val variants = families.getValue(selectedFamily)
+        val size = selected.inputSize
+        when {
+            selectedQnn != null && qnnBackendAvailable -> {
+                fun select(config: QnnModelConfig) = onSelect(variants.first { it.id == qnnModelId(config) })
+                SettingChoice(lang.t("输入比例", "Input aspect ratio"), selectedQnn.aspect,
+                    listOf(QnnDepthAspect.SQUARE, QnnDepthAspect.ALIGNED, QnnDepthAspect.PORTRAIT_PAIR), {
+                        when (it) {
+                            QnnDepthAspect.SQUARE -> lang.t("固定方形", "Fixed square")
+                            QnnDepthAspect.FIT -> lang.t("等比例补齐", "Aspect padding")
+                            QnnDepthAspect.ALIGNED -> lang.t("14 像素分块", "14-pixel patches")
+                            QnnDepthAspect.WIDE_TALL -> lang.t("固定横竖屏（16:9 / 9:16）", "Fixed landscape / portrait (16:9 / 9:16)")
+                            QnnDepthAspect.PORTRAIT_PAIR -> lang.t("双竖版（9:16 / 3:4）", "Two portrait shapes (9:16 / 3:4)")
+                        }
+                    }) {
+                    select(selectedQnn.copy(aspect = it))
+                }
+                when (selectedQnn.aspect) {
+                    QnnDepthAspect.SQUARE -> SettingHelp(lang.t("固定按方形尺寸推理。", "Always uses a square input."))
+                    QnnDepthAspect.WIDE_TALL -> SettingHelp(lang.t(
+                        "横图和方图直接缩放到 16:9，竖图直接缩放到 9:16。每档仅使用这两套 GPU 计算图。",
+                        "Landscape and square media resize directly to 16:9, portrait media to 9:16. Each budget uses only these two GPU graphs.",
+                    ))
+                    QnnDepthAspect.PORTRAIT_PAIR -> SettingHelp(lang.t(
+                        "横向素材旋转 90° 后推理，深度图再转回原方向。素材按接近的比例使用 9:16 或 3:4 GPU 图，方形使用 3:4。",
+                        "Landscape media rotates 90° for inference and depth rotates back. Media uses the closer 9:16 or 3:4 GPU graph. Square media uses 3:4.",
+                    ))
+                    QnnDepthAspect.ALIGNED, QnnDepthAspect.FIT -> SettingHelp(lang.t("素材比例决定推理宽高，每边为整数格 × 14 像素。", "The source aspect ratio guides the inference width and height. Each side is an integer number of 14-pixel patches."))
+                }
+                QnnResolutionEditor(size, selectedQnn.aspect, lang) { select(selectedQnn.copy(size = it)) }
+                if (selectedQnn.aspect == QnnDepthAspect.ALIGNED || selectedQnn.aspect == QnnDepthAspect.FIT) {
+                    SettingHelp(lang.t("像素预算是推理输入的像素上限。切换到新的尺寸时可能需要初始化 GPU 会话。", "The pixel budget caps the inference input area. A new shape may require GPU session initialization."))
+                }
+                if (selectedQnn.variant == QnnDepthVariant.FP32_HEAD) {
+                    SettingHelp(lang.t("最后三层深度卷积使用 FP32，其余主体使用 FP16。", "The last three depth convolutions use FP32. The rest of the model uses FP16."))
+                }
+            }
+            variants.size > 1 && selectedQnn == null -> SettingChoice(
+                lang.t("推理分辨率", "Inference resolution"), size, variants.map { it.inputSize }, { "${it}×$it" },
+            ) { newSize -> onSelect(variants.first { it.inputSize == newSize }) }
+            selectedQnn?.aspect == QnnDepthAspect.PORTRAIT_PAIR -> {
+                val sizes = qnnFixedPairSizes(size, selectedQnn.aspect)
+                Text(lang.t("推理分辨率 $sizes", "Inference resolution $sizes"), style = MaterialTheme.typography.bodyMedium)
+            }
+            else -> Text(lang.t("推理分辨率 ${size}×$size", "Inference resolution ${size}×$size"), style = MaterialTheme.typography.bodyMedium)
+        }
+        if (selected.id == HIGH_TFLITE_MODEL_ID) SettingHelp(lang.t(selected.noteZh, selected.noteEn))
+    }
     Text(
-        lang.t("可用模型会在首次生成前自动下载；待导入模型需要先提供移动端资产和 SHA-256。", "Available models download automatically before first generation. Pending models need a mobile asset and SHA-256 first."),
+        lang.t("QNN 模型随应用提供。其他可用模型在首次生成时下载。", "QNN models are bundled. Other available models download on first generation."),
         style = MaterialTheme.typography.bodySmall,
     )
     Spacer(Modifier.height(10.dp))
 }
 
+private fun ModelSpec.selectionFamily(): String {
+    val variant = qnnModelConfig(id)?.variant
+    if (variant != null) return qnnModelId(QnnModelConfig(variant, QNN_FP16_MODEL_SIZE, QnnDepthAspect.SQUARE))
+    return if (id == HIGH_TFLITE_MODEL_ID) DEFAULT_TFLITE_MODEL_ID else id
+}
+
+private fun qnnFixedPairSizes(size: Int, aspect: QnnDepthAspect): String =
+    QnnInputGeometry.warmupGeometries(size, aspect).joinToString(" / ") { "${it.tensorWidth}×${it.tensorHeight}" }
+
+@Composable
+private fun QnnResolutionEditor(size: Int, aspect: QnnDepthAspect, lang: AppLanguage, onSelect: (Int) -> Unit) {
+    var input by rememberSaveable(size) { mutableStateOf((size / QNN_FP16_PATCH_SIZE).toString()) }
+    val focus = LocalFocusManager.current
+    val tiles = input.toIntOrNull()?.takeIf { it in QNN_FP16_MIN_TOKENS..QNN_FP16_MAX_TOKENS }
+    val pendingSize = tiles?.times(QNN_FP16_PATCH_SIZE)
+    val range = "$QNN_FP16_MIN_TOKENS–$QNN_FP16_MAX_TOKENS"
+    val applySize: () -> Unit = {
+        if (pendingSize != null) {
+            focus.clearFocus()
+            if (pendingSize != size) onSelect(pendingSize)
+        }
+    }
+    val adaptive = aspect != QnnDepthAspect.SQUARE
+    val current = if (adaptive) lang.t("推理像素预算 ${size}×$size", "Inference pixel budget ${size}×$size")
+        else lang.t("推理分辨率 ${size}×$size", "Inference resolution ${size}×$size")
+    Text(current, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+    val portraitPair = aspect == QnnDepthAspect.PORTRAIT_PAIR
+    if (portraitPair) {
+        val sizes = qnnFixedPairSizes(size, aspect)
+        Text(lang.t("实际推理尺寸（9:16 / 3:4）$sizes", "Actual input sizes (9:16 / 3:4) $sizes"), style = MaterialTheme.typography.bodySmall)
+    }
+    OutlinedTextField(
+        value = input,
+        onValueChange = { if (it.length <= 6 && it.all(Char::isDigit)) input = it },
+        modifier = Modifier.fillMaxWidth(),
+        label = { Text(if (adaptive) lang.t("预算方形每边分块数（$range）", "Square budget patches per side ($range)")
+            else lang.t("每边分块数（$range）", "Patches per side ($range)")) },
+        singleLine = true,
+        isError = input.isNotEmpty() && pendingSize == null,
+        supportingText = {
+            Text(if (pendingSize == null) {
+                lang.t("输入 $range 的整数。每块宽 $QNN_FP16_PATCH_SIZE 像素。", "Enter an integer from $range. Each patch is $QNN_FP16_PATCH_SIZE pixels wide.")
+            } else if (portraitPair) {
+                val sizes = qnnFixedPairSizes(pendingSize, aspect)
+                lang.t("9:16 / 3:4 尺寸 $sizes", "9:16 / 3:4 sizes $sizes")
+            } else if (adaptive) {
+                val pixels = String.format(Locale.US, "%,d", pendingSize * pendingSize)
+                lang.t("$tiles × $QNN_FP16_PATCH_SIZE = $pendingSize，像素上限 $pixels。",
+                    "$tiles × $QNN_FP16_PATCH_SIZE = $pendingSize, up to $pixels pixels.")
+            } else {
+                lang.t("$tiles × $QNN_FP16_PATCH_SIZE = $pendingSize 像素，实际推理 ${pendingSize}×$pendingSize。",
+                    "$tiles × $QNN_FP16_PATCH_SIZE = $pendingSize pixels, actual inference ${pendingSize}×$pendingSize.")
+            })
+        },
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+        keyboardActions = KeyboardActions(onDone = { applySize() }),
+    )
+    OutlinedButton(onClick = applySize, enabled = pendingSize != null && pendingSize != size) {
+        Text(if (adaptive) lang.t("应用像素预算", "Apply pixel budget") else lang.t("应用分辨率", "Apply resolution"))
+    }
+}
+
 @Composable
 private fun DepthUpscaleControls(settings: DepthUpscaleSettings, lang: AppLanguage, fixedFinalGaussian: Boolean = false, onChange: (DepthUpscaleSettings) -> Unit) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Text(lang.t("深度图放大", "Depth upsampling"), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+        Text(lang.t("插值放大深度图", "Upsample depth map"), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
         Switch(checked = settings.enabled, onCheckedChange = { onChange(settings.copy(enabled = it)) })
     }
     if (!settings.enabled) {
@@ -8043,7 +8791,7 @@ private fun DepthUpscaleControls(settings: DepthUpscaleSettings, lang: AppLangua
         OutlinedTextField(value = value, onValueChange = { next ->
             value = next.filter(Char::isDigit).take(5)
             value.toIntOrNull()?.takeIf { it in 256..8192 }?.let { onChange(settings.copy(maxLongEdge = it)) }
-        }, label = { Text(lang.t("深度图最大长边（像素）", "Maximum depth edge (px)")) },
+        }, label = { Text(lang.t("后处理深度图长边上限（像素）", "Post-processed depth map long-edge limit (px)")) },
             supportingText = { Text("256 - 8192") }, isError = (value.toIntOrNull() ?: 0) !in 256..8192,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true,
             modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
@@ -8101,16 +8849,22 @@ private fun SettingFloat(title: String, value: Float, maximum: Float, onChange: 
     }
 }
 
+private data class ViewerPage(
+    val sourceIndex: Int,
+    val photo: PhotoItem,
+    val result: VrCacheEntry? = null,
+)
+
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 private fun ViewerScreen(
     state: UiState,
     startIndex: Int,
     onClose: () -> Unit,
-    onIndexChanged: (Int) -> Unit,
+    onIndexChanged: (Int, String?) -> Unit,
     onVr: (Int) -> Unit,
     onRetry: (Int) -> Unit,
-    onOpenDebug: (Int) -> Unit,
+    onOpenDebug: (Int, String?) -> Unit,
 ) {
     val lang = state.settings.language
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -8136,31 +8890,36 @@ private fun ViewerScreen(
         }
     }
 
-    val generatedEntryByKey = remember(state.managedCacheItems, state.viewerOrigin, state.selectedGeneratedVersion) {
-        if (state.viewerOrigin != ViewerOrigin.NORMAL && state.selectedGeneratedVersion != null) {
-            state.managedCacheItems
-                .filter { it.entry.version == state.selectedGeneratedVersion }
-                .associate { it.photoItem.cacheKey to it.entry }
-        } else {
-            emptyMap()
+    val generatedResults = state.viewerGeneratedResults
+    val viewerItems = if (generatedResults != null) {
+        remember(state.photos, generatedResults, state.managedCacheItems) {
+            val photoIndexes = state.photos.withIndex().associate { it.value.cacheKey to it.index }
+            val results = state.managedCacheItems.associateBy { it.resultKey }
+            generatedResults.mapNotNull { key ->
+                val index = photoIndexes[key.first] ?: return@mapNotNull null
+                val result = results[key] ?: return@mapNotNull null
+                ViewerPage(index, state.photos[index], result.entry)
+            }
         }
-    }
-    val viewerItems = remember(state.photos, state.viewerScopeKeys, state.viewerScopeOrderedKeys) {
-        viewerScopeIndices(state).map { it to state.photos[it] }
+    } else {
+        remember(state.photos, state.viewerScopeKeys, state.viewerScopeOrderedKeys) {
+            viewerScopeIndices(state).map { ViewerPage(it, state.photos[it]) }
+        }
     }
     if (viewerItems.isEmpty()) {
         StudioEmptyState(lang.t("此浏览范围已没有结果", "No results in this viewer scope"), lang.t("结果可能已被删除。返回列表重新选择，浏览范围不会回落到全部媒体。", "Results may have been deleted. Return to the list; this scope never falls back to all media.")) { Button(onClick = onClose) { Text(lang.t("返回", "Back")) } }
         return
     }
-    val initialPage = viewerItems.indexOfFirst { it.first == startIndex }.takeIf { it >= 0 } ?: 0
+    val initialPage = viewerItems.indexOfFirst { it.sourceIndex == startIndex && it.result?.version == state.viewerResultVersion }
+        .coerceAtLeast(0)
     val pagerState = rememberPagerState(initialPage = initialPage) { viewerItems.size }
     val viewerFlingBehavior = PagerDefaults.flingBehavior(state = pagerState)
-    val viewerCacheSignature = remember(viewerItems) { viewerItems.joinToString("|") { it.second.cacheKey } }
+    val viewerCacheSignature = remember(viewerItems) { viewerItems.map { it.photo.cacheKey to it.result?.version } }
     val metrics = context.resources.displayMetrics
     val previewSide = (max(metrics.widthPixels, metrics.heightPixels) / 2).coerceIn(960, 1600)
     val viewerBitmapCache = remember(viewerCacheSignature, previewSide) { ViewerImageLoader(context, previewSide) }
     DisposableEffect(viewerBitmapCache) { onDispose { viewerBitmapCache.close() } }
-    LaunchedEffect(viewerCacheSignature, pagerState.settledPage, state.vrMode, generatedViewer, state.entries, generatedEntryByKey) {
+    LaunchedEffect(viewerItems, pagerState.settledPage, state.vrMode, generatedViewer, state.entries) {
         val preloadPages = listOf(
             pagerState.settledPage,
             pagerState.settledPage + 1,
@@ -8169,10 +8928,10 @@ private fun ViewerScreen(
             pagerState.settledPage - 2,
         )
         val nearbyTargets = preloadPages
-            .mapNotNull { page -> viewerItems.getOrNull(page)?.second }
-            .filter { item -> item.kind == MediaKind.IMAGE }
+            .mapNotNull(viewerItems::getOrNull)
+            .filter { it.photo.kind == MediaKind.IMAGE }
             .flatMap { item ->
-                val entry = generatedEntryByKey[item.cacheKey] ?: state.entries[item.cacheKey]
+                val entry = item.result ?: state.entries[item.photo.cacheKey]
                 if ((state.vrMode || generatedViewer) && entry != null) {
                     if (entry.hasSplitEyes) {
                         listOf(
@@ -8183,7 +8942,7 @@ private fun ViewerScreen(
                         listOf(Uri.fromFile(File(entry.outputPath)) to previewSide)
                     }
                 } else {
-                    listOf(item.uri to previewSide)
+                    listOf(item.photo.uri to previewSide)
                 }
             }
             .distinct()
@@ -8191,8 +8950,9 @@ private fun ViewerScreen(
             viewerBitmapCache.load(uri, maxSide)
         }
     }
-    LaunchedEffect(pagerState.settledPage) {
-        viewerItems.getOrNull(pagerState.settledPage)?.first?.let(onIndexChanged)
+    val settledItem = viewerItems.getOrNull(pagerState.settledPage)
+    LaunchedEffect(settledItem?.sourceIndex, settledItem?.result?.version) {
+        settledItem?.let { onIndexChanged(it.sourceIndex, it.result?.version) }
     }
     var controlsVisible by remember { mutableStateOf(true) }
     var controlsHeld by remember { mutableStateOf(false) }
@@ -8213,8 +8973,9 @@ private fun ViewerScreen(
             modifier = Modifier.fillMaxSize(),
             beyondViewportPageCount = 1,
             flingBehavior = viewerFlingBehavior,
+            key = { viewerCacheSignature[it] },
         ) { page ->
-            val (sourceIndex, photo) = viewerItems.getOrNull(page) ?: return@HorizontalPager
+            val (sourceIndex, photo, result) = viewerItems.getOrNull(page) ?: return@HorizontalPager
             if (photo.kind == MediaKind.VIDEO) {
                 val generated = state.videoEntries[photo.cacheKey]
                 val job = state.videoJobs.firstOrNull { it.item.cacheKey == photo.cacheKey }
@@ -8238,7 +8999,7 @@ private fun ViewerScreen(
                     playerContent()
                 }
             } else {
-                val entry = generatedEntryByKey[photo.cacheKey] ?: state.entries[photo.cacheKey]
+                val entry = result ?: state.entries[photo.cacheKey]
                 val vrState = state.states[photo.cacheKey] ?: VrState.NORMAL
                 if ((state.vrMode || generatedViewer) && entry != null) {
                     SyncStereoEntryImage(entry, viewerBitmapCache, Modifier.fillMaxSize()) {
@@ -8275,15 +9036,16 @@ private fun ViewerScreen(
             ) {
                 IconButton(onClick = onClose) { Icon(Icons.Default.Close, lang.t("返回", "Back"), tint = MaterialTheme.colorScheme.onSurface) }
                 Spacer(Modifier.width(8.dp))
-                val currentPair = viewerItems.getOrNull(pagerState.currentPage)
-                val currentIndex = currentPair?.first ?: startIndex
-                val currentItem = currentPair?.second
+                val currentPage = viewerItems.getOrNull(pagerState.currentPage)
+                val currentIndex = currentPage?.sourceIndex ?: startIndex
+                val currentItem = currentPage?.photo
+                val currentVersion = currentPage?.result?.version
                 Text(
                     text = currentItem?.displayName.orEmpty(),
                     color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f).combinedClickable(onClick = {}, onLongClick = { onOpenDebug(currentIndex) }),
+                    modifier = Modifier.weight(1f).combinedClickable(onClick = {}, onLongClick = { onOpenDebug(currentIndex, currentVersion) }),
                 )
                 val currentVideoState = currentItem?.takeIf { it.kind == MediaKind.VIDEO }?.let { state.videoStates[it.cacheKey] ?: VideoVrState.NORMAL }
                 val vrButtonEnabled = if (currentVideoState != null) {
@@ -8312,22 +9074,23 @@ private fun ViewerScreen(
                     )
                 }
                 Spacer(Modifier.width(8.dp))
-                OutlinedButton(onClick = { onOpenDebug(currentIndex) }, contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp)) {
+                OutlinedButton(onClick = { onOpenDebug(currentIndex, currentVersion) }, contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp)) {
                     Text(lang.t("调试", "Debug"), maxLines = 1)
                 }
             }
-            val current = viewerItems.getOrNull(pagerState.currentPage)?.second
+            val currentPage = viewerItems.getOrNull(pagerState.currentPage)
+            val current = currentPage?.photo
             if (!generatedViewer && state.vrMode && current?.kind != MediaKind.VIDEO) Column(
                 modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
             ) {
-                if (current != null) {
+                if (currentPage != null) {
                     Text(
-                        text = imageLoadedLine(state, viewerItems.getOrNull(pagerState.currentPage)?.first ?: startIndex, lang),
+                        text = imageLoadedLine(state, currentPage.sourceIndex, lang),
                         color = androidx.compose.ui.graphics.Color.White,
                         style = MaterialTheme.typography.bodySmall,
                     )
                     Text(
-                        text = imageQueueLine(state, viewerItems.getOrNull(pagerState.currentPage)?.first ?: startIndex, lang),
+                        text = imageQueueLine(state, currentPage.sourceIndex, lang),
                         color = androidx.compose.ui.graphics.Color.White,
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -8378,7 +9141,7 @@ private fun DebugScreen(
 ) {
     val lang = state.settings.language
     val photo = state.photos.getOrNull(index)
-    val entry = photo?.let { p -> state.managedCacheItems.firstOrNull { it.entry.photoKey == p.cacheKey && it.entry.version == state.selectedGeneratedVersion }?.entry ?: state.entries[p.cacheKey] }
+    val entry = photo?.let(state::viewerEntry)
     val vrState = photo?.let { state.states[it.cacheKey] } ?: VrState.NORMAL
     val job = photo?.let { p -> state.jobs.firstOrNull { it.photoItem.cacheKey == p.cacheKey } }
     val isVideo = photo?.kind == MediaKind.VIDEO
@@ -8451,25 +9214,39 @@ private fun DebugScreen(
                     DebugLine(lang.t("队列等待", "Queue wait"), "${videoJob?.queueWaitMs ?: 0}ms")
                     DebugLine(lang.t("缓存命中读取", "Cache-hit read"), "${videoJob?.cacheHitReadMs ?: 0}ms")
                     val pipeline = videoJob?.pipelineStats ?: VideoPipelineStats()
+                    val timings = videoJob?.frameTimings ?: VideoFrameTimings()
                     DebugLine(lang.t("解码队列", "Decode queue"), "${pipeline.decodeQueue}")
+                    if (timings.inputTransformNanos > 0L) {
+                        DebugLine(lang.t("输入旋转缩放", "Input rotation and resize"), "${timings.inputTransformNanos / 1000} µs · ${pipeline.preparedInputQueue}/4")
+                        DebugLine(lang.t("深度转回", "Depth rotation back"), "${timings.depthRotationNanos / 1000} µs · ${pipeline.uprightDepthQueue}/4")
+                    }
                     DebugLine(lang.t("深度结果队列", "Depth queue"), "${pipeline.depthQueue}")
                     DebugLine(lang.t("生成队列", "Generated queue"), "${pipeline.generatedQueue}")
                     DebugLine(lang.t("等待编码", "Encode waiting"), "${pipeline.waitingFrames}")
                     DebugLine(lang.t("缓存命中", "Cache hits"), "${pipeline.cacheHits}")
                     DebugLine(lang.t("后台写入队列", "Cache write queue"), "${pipeline.cacheWriteQueue}")
-                    val timings = videoJob?.frameTimings ?: VideoFrameTimings()
                     DebugLine(lang.t("取帧", "Decode"), "${timings.decodeMs}ms")
                     DebugLine(lang.t("深度推理", "Depth"), "${timings.depthMs}ms")
                     DebugLine(lang.t("时序平滑", "Temporal"), "${timings.temporalMs}ms")
                     DebugLine(lang.t("深度后处理", "Depth post"), "${timings.depthPostMs}ms")
-                    DebugLine(lang.t("深度图尺寸", "Depth size"), if (timings.depthWidth > 0) "${timings.depthWidth}x${timings.depthHeight}" else "-")
+                    val recordedEntry = videoEntry?.takeIf { videoJob?.cacheVersion.isNullOrBlank() || it.cacheVersion == videoJob?.cacheVersion }
+                    val geometry = timings.depthGeometry ?: recordedEntry?.depthGeometry
+                    DebugLine(lang.t("模型原生深度", "Native model depth"), geometry?.let { "${it.modelWidth}×${it.modelHeight}" } ?: "-")
+                    if (geometry != null && (geometry.inputRotation != 0 || geometry.contentWidth != geometry.modelWidth || geometry.contentHeight != geometry.modelHeight)) {
+                        val label = if (geometry.inputRotation == 90) lang.t("转回后深度", "Upright depth") else lang.t("裁回后深度", "Cropped depth")
+                        DebugLine(label, "${geometry.contentWidth}×${geometry.contentHeight}")
+                    }
+                    DebugLine(lang.t("后处理深度", "Prepared depth"), geometry?.let { "${it.preparedWidth}×${it.preparedHeight}" } ?: "-")
+                    DebugLine(lang.t("SBS 成品尺寸", "SBS output size"), recordedEntry?.let { "${it.width}×${it.height}" } ?: "-")
                     DebugLine("SBS", "${timings.sbsMs}ms")
                     DebugLine(lang.t("最近后台写入", "Last async cache write"), "${pipeline.lastCacheWriteMs}ms")
                     DebugLine(lang.t("编码提交", "Encode submit"), "${timings.encodeMs}ms")
-                    DebugLine("Model", videoJob?.modelId?.ifBlank { state.settings.videoModelId } ?: state.settings.videoModelId)
-                    DebugLine("Cache", videoJob?.cacheVersion?.ifBlank { "-" } ?: "-")
+                    val jobModelId = videoJob?.modelId?.takeIf { it.isNotBlank() } ?: recordedEntry?.modelId?.takeIf { it.isNotBlank() }
+                    DebugLine(lang.t("该任务模型", "Job model"), AvailableModels.firstOrNull { it.id == jobModelId }?.displayName ?: jobModelId ?: "-")
+                    DebugLine(lang.t("新任务模型", "New-job model"), modelSpec(state.settings.videoModelId).displayName)
+                    DebugLine("Cache", videoJob?.cacheVersion?.takeIf { it.isNotBlank() } ?: recordedEntry?.cacheVersion?.takeIf { it.isNotBlank() } ?: "-")
                     DebugLine("Threads", "${videoJob?.modelThreads ?: state.settings.videoModelThreads}")
-                    DebugLine("GPU requested", "${videoJob?.useGpu ?: state.settings.videoUseGpu}")
+                    DebugLine("GPU requested", "${videoJob?.useGpu ?: state.settings.toVideoParams().useGpu}")
                     DebugLine("GPU mode", state.settings.gpuTestMode.name)
                     DebugLine("Force GPU", "${state.settings.toVideoParams().toVrParams().forceGpuNoFallback}")
                     DebugLine("Runtime", videoJob?.runtimeInfo?.ifBlank { "-" } ?: "-")
@@ -9787,7 +10564,7 @@ private fun decodeSbsLeftPreview(file: File, maxLongEdge: Int): Bitmap {
         val decoder = BitmapRegionDecoder.newInstance(input, false)
             ?: error("Unable to open generated preview decoder: ${file.absolutePath}")
         return try {
-            decoder.decodeRegion(Rect(0, 0, leftWidth, height), options)
+            decoder.decodeRegion(BitmapRect(0, 0, leftWidth, height), options)
                 ?: error("Unable to decode generated preview: ${file.absolutePath}")
         } finally {
             decoder.recycle()
@@ -10057,7 +10834,8 @@ private fun loadModelFile(file: File): ByteBuffer {
     }
 }
 
-private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, outputWidth: Int, outputHeight: Int, timings: GenerationTimings, depth: DepthMap): String {
+private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, outputWidth: Int, outputHeight: Int,
+    timings: GenerationTimings, depth: DepthMap, inference: DepthInferenceOutput): String {
     val existing = org.json.JSONObject()
         .put("photoKey", photo.cacheKey).put("cacheVersion", cacheVersion()).put("displayName", photo.displayName)
         .put("projection", when { edgeMode == DepthEdgeMode.COMFY_SUBPIXEL_V11 -> "SSS_MAIN_SUBPIXEL_COVERAGE_V11"; edgeMode.isComfyMain -> "SSS_MAIN_LEGACY_30372fec"; edgeMode.isReference -> "SSS_EXTERNAL_V2_2_30372fec"; else -> "LEGACY_PHONE" })
@@ -10079,12 +10857,22 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, outputWi
             .put("writeParamsMs", timings.writeParamsMs).put("writeLogMs", timings.writeLogMs)
             .put("writeMs", timings.writeMs).put("totalMs", timings.totalMs))
         .put("modelSha256", modelSpec(depthModel).sha256).put("modelSource", modelSpec(depthModel).url)
-    existing.put("depthWidth", depth.width).put("depthHeight", depth.height)
+    existing.put("modelInputWidth", inference.inputWidth).put("modelInputHeight", inference.inputHeight)
+        .put("modelDepthContentWidth", inference.geometry?.contentWidth ?: inference.map.width)
+        .put("modelDepthContentHeight", inference.geometry?.contentHeight ?: inference.map.height)
+        .put("modelDepthPadLeft", inference.geometry?.left ?: 0).put("modelDepthPadTop", inference.geometry?.top ?: 0)
+        .put("modelInputRotation", inference.geometry?.rotation ?: 0)
+        .put("modelDepthUprightWidth", inference.map.width).put("modelDepthUprightHeight", inference.map.height)
+        .put("depthWidth", depth.width).put("depthHeight", depth.height)
         .put("depthUpscale", org.json.JSONObject()
             .put("enabled", depthUpscale.enabled)
             .put("maxLongEdge", depthUpscale.boundedLongEdge)
             .put("interpolation", depthUpscale.interpolation.name)
             .put("order", depthUpscale.order.name))
+    inference.rotationTiming?.let {
+        existing.put("modelInputTransformNanos", it.inputTransformNanos)
+            .put("modelOutputRotationNanos", it.outputRotationNanos)
+    }
     return existing.toString(2)
 }
 

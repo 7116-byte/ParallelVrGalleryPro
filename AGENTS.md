@@ -2,9 +2,16 @@
 
 正式开发根目录为本文件所在目录。先读 README.md、docs/development.md、docs/recovery-acceptance-2026-10-31.md、docs/studio-v1.3.00.md 和原四份版本技术文档，再检查实际 Git 状态。历史恢复基线为 1.2.00 / 10200，HEAD `389798ab66f4dcef735dc2e22ce424cf9f18e59a`；当前版本与 HEAD 以源码及实际 Git 为准。恢复阶段的“不改功能、不升版本、不发布”限制只记录历史恢复范围。本次正式迭代已获用户授权实现、验证、提交、推送、打标签和发布，无需临发布重复确认。设备覆盖安装不卸载、不清空数据；媒体测试仍需明确范围授权。始终不删除旧备份。
 
+## 当前版本
+
+开发和发布先读 [开发文档](docs/development.md)、[版本索引](CHANGELOG.md) 与 [v1.15.00 记录](docs/releases/v1.15.00.md)。正式 GitHub Release 使用 `Build.ps1 -Variant Release` 的原证书签名产物，公开资产名为 `app-debug.apk` 与 `app-debug.apk.sha256`。GitHub Actions 独立验证公开源码的 JVM、Lint 和调试构建。
+
+当前图片和视频分别保存模型及推理尺寸。QNN 图片和视频都支持固定方形、动态 14 像素分块及双竖版。保护 GPU 拥有者线程、活跃会话和任务快照。视频新任务以完整分段提交，合并保持源时间轴和音频，成品登记后再清理工作缓存。已存在的逐帧缓存与暂停任务沿兼容路径处理。
+
 ## 开发入口与私密资产
 
 - 源码及 `.git` 直接位于根目录；`.local/` 必须一直被 Git 忽略。原签名、稳定模型、便携工具、离线缓存、完整恢复材料和历史验收资料都在 `.local/`，禁止提交或上传。不要读取、打印、复制 GitHub Token；优先复用本机已有登录。
+- `app/src/main/assets/models/` 的两份内置 QNN ONNX 是独立公开的 Small 衍生模型。随源码与 APK 保留模型、ONNX Runtime 和 QNN 许可，来源见 [NOTICE](NOTICE.md)。个人媒体、测试取证、实验权重及设备配置放在忽略目录。
 - 双击 `Verify-Restoration.cmd`：本地资产核验、离线 clean / JVM / Lint / APK 构建与包名、版本、证书核验。日常构建使用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Build.ps1`，默认离线。
 - 显式使用 `.local/toolchain/android-user-home/debug.keystore`；历史发布使用这份 debug 签名。证书 SHA-256 必须是 `c51c08290903e65d2e99fe35ceffd44b637f04cc5bbdd5ea9ecb8847d4ea7359`。不得替换为新系统的密钥，不改用户全局密钥。
 - applicationId / namespace / Kotlin package 均为 `com.local.parallelvrgallerypro`。源码目录仍是 `app/src/main/java/com/local/parallelvrgallery`，不得按目录名误改 package。
