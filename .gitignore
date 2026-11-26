@@ -18,3 +18,4 @@ _workspace_artifacts/
 .codex-attachments/
 *.keystore
 *.jks
+rust/target/

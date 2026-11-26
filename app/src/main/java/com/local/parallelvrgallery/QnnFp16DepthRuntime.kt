@@ -77,9 +77,11 @@ internal class QnnFp16DepthRuntime private constructor(
         requireTensor(session.outputInfo[OUTPUT]?.info as? TensorInfo, outputShape, OUTPUT)
     }
 
-    private val pixels = IntArray(count)
-    private val rgb = floatBuffer(3 * count)
-    private val depth = floatBuffer(count)
+    private var pixelsScratch: IntArray? = null
+    private val rgbBytes = directBytes(3 * count)
+    private val rgb = rgbBytes.asFloatBuffer()
+    private val depthBytes = directBytes(count)
+    private val depth = depthBytes.asFloatBuffer()
     private val input = OnnxTensor.createTensor(environment, rgb, inputShape)
     private val output = try {
         OnnxTensor.createTensor(environment, depth, outputShape)
@@ -89,7 +91,6 @@ internal class QnnFp16DepthRuntime private constructor(
     }
     private val inputs = mapOf(INPUT to input)
     private val outputs = mapOf(OUTPUT to output)
-    private var rotatedDepthScratch: FloatArray? = null
 
     // ORT has already prepared its graph when the session was created.
     override fun prepare() = Unit
@@ -117,44 +118,44 @@ internal class QnnFp16DepthRuntime private constructor(
         val prepareStarted = System.nanoTime()
         val scaled = if (preparedVideo) bitmap else transformQnnInput(bitmap, geometry)
         val transformFinished = if (rotated) System.nanoTime() else prepareStarted
-        try {
-            scaled.getPixels(pixels, 0, geometry.contentWidth, 0, 0, geometry.contentWidth, geometry.contentHeight)
-        } finally {
-            if (scaled !== bitmap) scaled.recycle()
-        }
         val packStarted = System.nanoTime()
-        if (geometry.coversTensor()) {
-            for (index in pixels.indices) packPixel(index, pixels[index])
-        } else {
-            // Bilinear scaling preserves the content aspect ratio. Repeating the nearest
-            // content pixel at its borders avoids inventing black edges before inference.
-            for (y in 0 until height) {
-                val contentRow = (y - geometry.top).coerceIn(0, geometry.contentHeight - 1) * geometry.contentWidth
-                val tensorRow = y * width
-                for (x in 0 until width) {
-                    val contentColumn = (x - geometry.left).coerceIn(0, geometry.contentWidth - 1)
-                    packPixel(tensorRow + x, pixels[contentRow + contentColumn])
+        try {
+            val packedZeroCopy = scaled.config == Bitmap.Config.ARGB_8888 &&
+                RustCore.packQnnRgbBitmap(scaled, rgbBytes, width, height, geometry.left, geometry.top)
+            if (!packedZeroCopy) {
+                val pixels = pixelsScratch ?: IntArray(count).also { pixelsScratch = it }
+                scaled.getPixels(pixels, 0, geometry.contentWidth, 0, 0, geometry.contentWidth, geometry.contentHeight)
+                if (geometry.coversTensor()) {
+                    for (index in pixels.indices) packPixel(index, pixels[index])
+                } else {
+                    for (y in 0 until height) {
+                        val contentRow = (y - geometry.top).coerceIn(0, geometry.contentHeight - 1) * geometry.contentWidth
+                        val tensorRow = y * width
+                        for (x in 0 until width) {
+                            val contentColumn = (x - geometry.left).coerceIn(0, geometry.contentWidth - 1)
+                            packPixel(tensorRow + x, pixels[contentRow + contentColumn])
+                        }
+                    }
                 }
             }
+        } finally {
+            if (scaled !== bitmap) scaled.recycle()
         }
         val invokeStarted = System.nanoTime()
         session.run(inputs, outputs).use { }
         val readStarted = System.nanoTime()
-        val values: FloatArray
+        val values = RustCore.extractQnnDepthDirect(
+            depthBytes, width, height, geometry.contentWidth, geometry.contentHeight, geometry.left, geometry.top, rotated,
+        )
+        val readFinished = System.nanoTime()
         val rotationTiming = if (rotated) {
-            val scratch = rotatedDepthScratch ?: FloatArray(count).also { rotatedDepthScratch = it }
-            depth.duplicate().get(scratch)
-            val turnStarted = System.nanoTime()
-            values = rotateQnnDepthCounterClockwise(scratch, width, height)
-            QnnDepthRotationTiming(transformFinished - prepareStarted, invokeStarted - transformFinished, System.nanoTime() - turnStarted)
+            QnnDepthRotationTiming(transformFinished - prepareStarted, invokeStarted - transformFinished, readFinished - readStarted)
         } else {
-            values = readQnnDepthContent(depth, geometry)
             null
         }
-        normalizeQnnDepth(values)
         InferenceProfiling.listener?.invoke(
             budgetSize, packStarted - prepareStarted, invokeStarted - packStarted,
-            readStarted - invokeStarted, System.nanoTime() - readStarted,
+            readStarted - invokeStarted, readFinished - readStarted,
         )
         val map = if (rotated) DepthMap(values, geometry.contentHeight, geometry.contentWidth)
         else DepthMap(values, geometry.contentWidth, geometry.contentHeight)
@@ -386,8 +387,8 @@ internal class QnnFp16DepthRuntime private constructor(
             }
         }
 
-        private fun floatBuffer(size: Int): FloatBuffer =
-            ByteBuffer.allocateDirect(size * Float.SIZE_BYTES).order(ByteOrder.nativeOrder()).asFloatBuffer()
+        private fun directBytes(size: Int): ByteBuffer =
+            ByteBuffer.allocateDirect(size * Float.SIZE_BYTES).order(ByteOrder.nativeOrder())
 
         private fun rgbNorm(mean: Float, std: Float) = FloatArray(256) { (it / 255f - mean) / std }
     }
@@ -413,27 +414,9 @@ internal fun transformQnnInput(bitmap: Bitmap, geometry: QnnInputGeometry): Bitm
     return transformed
 }
 
-/** Matrix input is clockwise. Restore a row-major float map to the source orientation. */
-internal fun rotateQnnDepthCounterClockwise(values: FloatArray, width: Int, height: Int): FloatArray {
-    require(width > 0 && height > 0 && width.toLong() * height == values.size.toLong())
-    val turned = FloatArray(values.size)
-    // A tile keeps the strided source lines hot while writing contiguous output rows.
-    val tile = 32
-    for (top in 0 until width step tile) {
-        for (left in 0 until height step tile) {
-            for (y in top until minOf(top + tile, width)) {
-                var from = left * width + width - 1 - y
-                var to = y * height + left
-                val length = minOf(tile, height - left)
-                repeat(length) {
-                    turned[to++] = values[from]
-                    from += width
-                }
-            }
-        }
-    }
-    return turned
-}
+/** Matrix input is clockwise. Restore a row-major float map to the source orientation in Rust. */
+internal fun rotateQnnDepthCounterClockwise(values: FloatArray, width: Int, height: Int): FloatArray =
+    RustCore.rotateDepthCcw90(values, width, height)
 
 /** Extract the visible content before min/max normalization so padding cannot affect its depth range. */
 internal fun readQnnDepthContent(depth: FloatBuffer, geometry: QnnInputGeometry): FloatArray {
@@ -451,14 +434,5 @@ internal fun readQnnDepthContent(depth: FloatBuffer, geometry: QnnInputGeometry)
 }
 
 internal fun normalizeQnnDepth(values: FloatArray) {
-    var minimum = Float.POSITIVE_INFINITY
-    var maximum = Float.NEGATIVE_INFINITY
-    for (value in values) {
-        check(value.isFinite()) { "QNN GPU 深度含无效数值 / Non-finite QNN GPU depth" }
-        minimum = minOf(minimum, value)
-        maximum = maxOf(maximum, value)
-    }
-    val range = maximum - minimum
-    check(range.isFinite() && range > 0.0001f) { "QNN GPU 深度变化不足 / Flat QNN GPU depth" }
-    for (index in values.indices) values[index] = (values[index] - minimum) / range
+    RustCore.normalizeModelDepth(values, strict = true)
 }

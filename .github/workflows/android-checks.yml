@@ -29,8 +29,14 @@ jobs:
           packages: platform-tools
           log-accepted-android-sdk-licenses: false
       - uses: gradle/actions/setup-gradle@v4
-      - name: Install compile SDK
-        run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0'
+      - name: Install compile SDK and NDK
+        run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0' 'ndk;27.2.12479018'
+      - name: Build and verify Rust core (Host + 4 Android ABIs)
+        shell: pwsh
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/Build-RustCore.ps1 -Online
       - name: Unit tests, lint and build
         run: bash ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
       - name: Upload verification reports

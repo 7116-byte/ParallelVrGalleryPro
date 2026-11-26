@@ -45,6 +45,29 @@ val collectQnnNotices by tasks.registering(CollectQnnNotices::class) {
     outputDirectory.set(layout.buildDirectory.dir("generated/qnn-notices"))
 }
 
+val rustAndroidJniDir = providers.gradleProperty("pvgRustAndroidDir").orNull?.let(rootProject::file)
+    ?: rootProject.file(".local/rust-core/android")
+val rustHostJniDir = providers.gradleProperty("pvgRustHostDir").orNull?.let(rootProject::file)
+    ?: rootProject.file(".local/rust-core/host")
+
+val verifyRustAndroidLibs by tasks.registering {
+    doLast {
+        val supportedAbis = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+        check(supportedAbis.any { rustAndroidJniDir.resolve("$it/libpvg_core.so").isFile }) {
+            "Missing Android Rust JNI library in $rustAndroidJniDir. Run scripts/Build-RustCore.ps1 first."
+        }
+    }
+}
+
+val verifyRustHostLib by tasks.registering {
+    doLast {
+        val candidates = listOf("pvg_core.dll", "libpvg_core.so", "libpvg_core.dylib")
+        check(candidates.any { rustHostJniDir.resolve(it).isFile }) {
+            "Missing Host Rust JNI library in $rustHostJniDir. Run scripts/Build-RustCore.ps1 first."
+        }
+    }
+}
+
 android {
     namespace = "com.local.parallelvrgallerypro"
     compileSdk = 36
@@ -53,13 +76,20 @@ android {
         applicationId = "com.local.parallelvrgallerypro"
         minSdk = 30
         targetSdk = 35
-        versionCode = 11502
-        versionName = "1.15.02"
+        versionCode = 11600
+        versionName = "1.16.00"
     }
 
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+
+    testOptions {
+        unitTests.all { test ->
+            test.systemProperty("java.library.path", rustHostJniDir.absolutePath)
+            test.systemProperty("pvg.rust.host.dir", rustHostJniDir.absolutePath)
+        }
     }
 
     packaging {
@@ -87,11 +117,19 @@ android {
             matchingFallbacks += listOf("release")
         }
     }
+    sourceSets.getByName("main") {
+        jniLibs.srcDir(rustAndroidJniDir)
+    }
     sourceSets.getByName("benchmark") {
         java.srcDir("src/debug/java")
         manifest.srcFile("src/debug/AndroidManifest.xml")
     }
 }
+
+tasks.matching { it.name in setOf("mergeDebugJniLibFolders", "mergeReleaseJniLibFolders", "mergeBenchmarkJniLibFolders") }
+    .configureEach { dependsOn(verifyRustAndroidLibs) }
+tasks.matching { it.name == "testDebugUnitTest" }
+    .configureEach { dependsOn(verifyRustHostLib) }
 
 androidComponents {
     onVariants { variant ->

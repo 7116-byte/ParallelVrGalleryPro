@@ -68,53 +68,8 @@ internal data class QnnInputGeometry(
         fun forSource(size: Int, sourceWidth: Int, sourceHeight: Int, aspect: QnnDepthAspect): QnnInputGeometry {
             require(isQnnFp16Size(size)) { "Unsupported QNN pixel budget edge: $size" }
             require(sourceWidth > 0 && sourceHeight > 0) { "Invalid source dimensions: ${sourceWidth}x$sourceHeight" }
-            val landscape = sourceWidth >= sourceHeight
-            if (aspect == QnnDepthAspect.SQUARE) return fullTensor(size, size)
-            if (aspect == QnnDepthAspect.WIDE_TALL) return wideTall(size, landscape)
-            if (aspect == QnnDepthAspect.PORTRAIT_PAIR) {
-                val ratio = minOf(sourceWidth, sourceHeight).toDouble() / maxOf(sourceWidth, sourceHeight)
-                val (slim, standard) = portraitPair(size)
-                // The geometric mean is the midpoint in log aspect ratio.
-                val layout = if (ratio <= sqrt(27.0 / 64.0)) slim else standard
-                return if (sourceWidth > sourceHeight) layout.copy(rotation = 90) else layout
-            }
-
-            // Plan the long and short axes once so that rotating the source swaps them exactly.
-            val ratio = maxOf(sourceWidth, sourceHeight).toDouble() / minOf(sourceWidth, sourceHeight)
-            val budgetEdge = size / QNN_FP16_PATCH_SIZE
-            val budget = budgetEdge * budgetEdge
-            // Beyond 4:1, trade unused area for a bounded long axis. A one-patch short axis
-            // still allows exceptionally narrow media without allocating enormous tensors.
-            val desiredLong = (budgetEdge * sqrt(ratio)).coerceAtMost(2.0 * budgetEdge)
-            val desiredShort = (desiredLong / ratio).coerceAtLeast(1.0)
-            val longCandidates = floor(desiredLong).toInt()..ceil(desiredLong).toInt()
-            val shortCandidates = floor(desiredShort).toInt()..ceil(desiredShort).toInt()
-            var longPatches = longCandidates.first
-            var shortPatches = shortCandidates.first
-            var smallestError = Double.POSITIVE_INFINITY
-            for (long in longCandidates) {
-                for (short in shortCandidates) {
-                    val area = long * short
-                    if (area > budget) continue
-                    val longError = (long - desiredLong) / desiredLong
-                    val shortError = (short - desiredShort) / desiredShort
-                    val error = longError * longError + shortError * shortError
-                    if (error < smallestError || (error == smallestError && area > longPatches * shortPatches)) {
-                        longPatches = long
-                        shortPatches = short
-                        smallestError = error
-                    }
-                }
-            }
-
-            val width = QNN_FP16_PATCH_SIZE * if (landscape) longPatches else shortPatches
-            val height = QNN_FP16_PATCH_SIZE * if (landscape) shortPatches else longPatches
-            if (aspect == QnnDepthAspect.ALIGNED) return fullTensor(width, height)
-
-            val scale = minOf(width.toDouble() / sourceWidth, height.toDouble() / sourceHeight)
-            val contentWidth = (sourceWidth * scale).roundToInt().coerceIn(1, width)
-            val contentHeight = (sourceHeight * scale).roundToInt().coerceIn(1, height)
-            return QnnInputGeometry(width, height, contentWidth, contentHeight, (width - contentWidth) / 2, (height - contentHeight) / 2)
+            val g = RustCore.qnnInputGeometry(size, sourceWidth, sourceHeight, aspect.ordinal)
+            return QnnInputGeometry(g[0], g[1], g[2], g[3], g[4], g[5], g[6])
         }
 
         private fun fullTensor(width: Int, height: Int) = QnnInputGeometry(width, height, width, height, 0, 0)

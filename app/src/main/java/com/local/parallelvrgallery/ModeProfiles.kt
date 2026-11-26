@@ -68,15 +68,7 @@ internal fun VrGenerationParams.effectiveScale(eyeWidth: Int, depth: DepthMap? =
  * This is a scalar calibration of disparity amplitude, not a perceptual equivalence claim.
  */
 internal object DefaultDisparityCalibration {
-    fun span(values: FloatArray): Float {
-        if (values.isEmpty()) return 0f
-        val count = minOf(32768, values.size)
-        val sample = FloatArray(count) { i ->
-            values[(i.toLong() * values.size / count).toInt()].takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
-        }
-        sample.sort()
-        return sample[((count - 1) * 0.9).toInt()] - sample[((count - 1) * 0.1).toInt()]
-    }
+    fun span(values: FloatArray): Float = RustCore.disparitySpan(values)
 
     fun scale(params: VrGenerationParams, width: Int, prepared: FloatArray, v10Default: FloatArray): Float {
         if (!params.matchV10Default) return params.depthScale

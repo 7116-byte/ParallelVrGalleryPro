@@ -8,7 +8,7 @@ import org.opencv.core.Mat
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 
-/** Isolated SSS main-node path; original phone and external-node renderers stay intact. */
+/** Isolated SSS main-node path; projection executes zero-copy in Rust when Bitmap is RGBA_8888. */
 internal object ComfyLegacyStereoRenderer {
     private val initialized by lazy { check(OpenCVLoader.initLocal()); true }
 
@@ -25,10 +25,9 @@ internal object ComfyLegacyStereoRenderer {
             // Desktop estimator inverts once; the node's invert checkbox inverts again.
             val kernel = blur.coerceIn(1, 51).let { if (it % 2 == 0) it + 1 else it }
             Imgproc.GaussianBlur(normalized, smoothed, Size(kernel.toDouble(), kernel.toDouble()), 0.0)
-            return FloatArray(width * height).also { values ->
-                smoothed.get(0, 0, values)
-                for (i in values.indices) values[i] = (if (invert) values[i] else 1f - values[i]).coerceIn(0f, 1f)
-            }
+            val values = FloatArray(width * height)
+            smoothed.get(0, 0, values)
+            return RustCore.mapDepthDirection(values, invert = !invert, clamp = true)
         } finally { smoothed.release(); normalized.release(); resized.release(); input.release() }
     }
 
@@ -36,10 +35,21 @@ internal object ComfyLegacyStereoRenderer {
     @JvmOverloads
     fun renderPrepared(source: Bitmap, depth: FloatArray, scale: Float, subpixel: Boolean = false, shareOriginalEye: Boolean = false): Pair<Bitmap, Bitmap> {
         val w = source.width; val h = source.height
-        val pixels = IntArray(w * h); source.getPixels(pixels, 0, w, 0, 0, w, h)
-        val projected = if (subpixel) ComfySubpixelProjection.project(pixels, w, h, depth, scale) else ComfyLegacyProjection.project(pixels, w, h, depth, scale)
-        val left = Bitmap.createBitmap(projected, w, h, Bitmap.Config.ARGB_8888)
-        try { return left to if (shareOriginalEye) source else Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888) }
-        catch (error: Throwable) { left.recycle(); throw error }
+        val left = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        try {
+            val zeroCopyEligible = source.config == Bitmap.Config.ARGB_8888 && (!subpixel || !source.hasAlpha())
+            val projectedZeroCopy = zeroCopyEligible && RustCore.projectComfyBitmap(source, left, depth, scale, subpixel)
+            if (!projectedZeroCopy) {
+                val pixels = IntArray(w * h)
+                source.getPixels(pixels, 0, w, 0, 0, w, h)
+                val projected = RustCore.projectComfy(pixels, depth, w, h, scale, subpixel)
+                left.setPixels(projected, 0, w, 0, 0, w, h)
+            }
+            val right = if (shareOriginalEye) source else source.copy(Bitmap.Config.ARGB_8888, false)
+            return left to right
+        } catch (error: Throwable) {
+            left.recycle()
+            throw error
+        }
     }
 }

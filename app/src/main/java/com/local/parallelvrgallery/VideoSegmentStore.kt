@@ -51,9 +51,9 @@ internal class VideoSegmentStore(
 
         override fun get(index: Int): Range {
             if (index !in indices) throw IndexOutOfBoundsException("Video segment $index of $size")
-            val start = index * framesPerSegment
-            val end = minOf(totalFrames.toLong(), start.toLong() + framesPerSegment).toInt()
-            return Range(index, start, end)
+            val packed = RustCore.segmentRange(totalFrames, framesPerSegment, index)
+            check(packed >= 0L) { "Video segment $index out of range" }
+            return Range(index, (packed ushr 32).toInt(), packed.toInt())
         }
     }
 
@@ -151,14 +151,9 @@ internal class VideoSegmentStore(
             "Only the latest video checkpoint can restore temporal history"
         }
         val file = validateCheckpoint(completed) ?: return null
-        return DataInputStream(file.inputStream().buffered()).use { input ->
-            check(input.readInt() == DEPTH_MAGIC) { "Invalid video depth checkpoint" }
-            val width = input.readInt()
-            val height = input.readInt()
-            val count = checkedDepthCount(width, height)
-            check(file.length() == DEPTH_HEADER_BYTES + count.toLong() * Float.SIZE_BYTES) { "Invalid video depth checkpoint size" }
-            Checkpoint(width, height, FloatArray(count) { input.readFloat() })
-        }
+        val shape = IntArray(2)
+        val values = RustCore.readDepthCheckpoint(file.absolutePath, shape)
+        return Checkpoint(shape[0], shape[1], values)
     }
 
     private fun readCompleted(range: Range, dir: File): Completed {
@@ -197,25 +192,12 @@ internal class VideoSegmentStore(
     }
 
     private fun writeCheckpoint(file: File, checkpoint: Checkpoint) {
-        FileOutputStream(file).use { stream ->
-            DataOutputStream(stream.buffered()).use { output ->
-                output.writeInt(DEPTH_MAGIC)
-                output.writeInt(checkpoint.width)
-                output.writeInt(checkpoint.height)
-                checkpoint.values.forEach(output::writeFloat)
-                output.flush()
-                stream.fd.sync()
-            }
-        }
+        RustCore.writeDepthCheckpoint(file.absolutePath, checkpoint.width, checkpoint.height, checkpoint.values)
     }
 
     private fun reclaimJpegs(range: Range) {
         if (framesDir.list()?.isEmpty() != false) return
-        for (index in range.startFrame until range.endFrameExclusive) {
-            val number = String.format(Locale.US, "%06d", index)
-            File(framesDir, "left_$number.jpg").delete()
-            File(framesDir, "right_$number.jpg").delete()
-        }
+        RustCore.reclaimFrameJpegs(framesDir.absolutePath, range.startFrame, range.endFrameExclusive)
     }
 
     private fun segmentDirectory(index: Int) = File(directory, String.format(Locale.US, "segment_%06d", index))

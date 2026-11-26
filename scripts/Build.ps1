@@ -10,6 +10,13 @@ foreach ($name in $variables) { $saved[$name] = [Environment]::GetEnvironmentVar
 $result = [ordered]@{ startedAt=$started.ToString('o'); projectRoot=$projectRoot; variant=$Variant; offline=(-not $Online); passed=$false; deviceAcceptance='NOT RUN'; error=$null }
 try {
     . (Join-Path $PSScriptRoot 'Use-Environment.ps1') -ProjectRoot $projectRoot
+    $rustCoreOutput = Join-Path $projectRoot '.local\rust-core'
+    & (Join-Path $PSScriptRoot 'Build-RustCore.ps1') -Online:$Online -OutputDirectory $rustCoreOutput | Out-Host
+    $rustCore = Get-Content -LiteralPath (Join-Path $rustCoreOutput 'result.json') -Raw | ConvertFrom-Json
+    if (!$rustCore.passed -or $rustCore.verifiedLibraries.Count -ne 4) {
+        throw 'Build requires verified Rust core JNI libraries for all four Android ABIs and host JVM'
+    }
+    $result.rustCore = $rustCore
     $result.environment = [ordered]@{javaHome=$env:JAVA_HOME;androidSdk=$env:ANDROID_SDK_ROOT;gradleUserHome=$env:GRADLE_USER_HOME;androidUserHome=$env:ANDROID_USER_HOME;signingKey=$env:PVG_SIGNING_KEYSTORE}
     $expectedSigner = 'c51c08290903e65d2e99fe35ceffd44b637f04cc5bbdd5ea9ecb8847d4ea7359'
     $archivedKey = Join-Path $projectRoot '.local\recovery\toolchain\android-user-home\debug.keystore'
@@ -62,6 +69,17 @@ try {
     $result.lint = [ordered]@{errors=$lintErrors;warnings=@($issues | Where-Object severity -eq 'Warning').Count;information=@($issues | Where-Object severity -eq 'Information').Count}
     if ($lintErrors) { throw 'Lint contains errors' }
     $apk = Join-Path $projectRoot ('app\build\outputs\apk\' + $Variant.ToLowerInvariant() + '\app-' + $Variant.ToLowerInvariant() + '.apk')
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($apk)
+    try {
+        foreach ($library in $rustCore.verifiedLibraries) {
+            if (!$archive.GetEntry("lib/$($library.abi)/libpvg_core.so")) {
+                throw "APK missing Rust core library for $($library.abi)"
+            }
+        }
+    } finally {
+        $archive.Dispose()
+    }
     $badging = & "$env:ANDROID_SDK_ROOT\build-tools\35.0.0\aapt.exe" dump badging $apk
     if ($LASTEXITCODE -ne 0) { throw 'APK metadata extraction failed' }
     $packageLine = ($badging | Select-String '^package:').Line

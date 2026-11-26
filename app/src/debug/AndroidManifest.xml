@@ -5,4 +5,6 @@
     <!-- Debug-only, explicitly invoked from adb. No instrumentation is shipped in Release. -->
     <instrumentation android:name="com.local.parallelvrgallerypro.StudioGestureInstrumentation"
         android:targetPackage="${applicationId}" android:label="Studio gesture regression" />
+    <instrumentation android:name="com.local.parallelvrgallerypro.RustCoreDeviceProbe"
+        android:targetPackage="${applicationId}" android:label="RustCore zero-copy device probe" />
 </manifest>

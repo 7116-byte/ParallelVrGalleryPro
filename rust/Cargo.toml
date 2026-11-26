@@ -1,0 +1,13 @@
+[workspace]
+members = ["crates/pvg-core", "crates/pvg-jni"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+publish = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

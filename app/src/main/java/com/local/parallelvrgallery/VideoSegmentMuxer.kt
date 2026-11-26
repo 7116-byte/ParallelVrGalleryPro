@@ -53,7 +53,8 @@ internal object VideoSegmentMuxer {
                     if (audioTrack != null) {
                         while (audio.sampleTrackIndex >= 0) {
                             checkActive()
-                            writer.write(audio, audioTrack, audio.sampleTime)
+                            // AAC preroll packets legitimately carry negative source PTS.
+                            writer.write(audio, audioTrack, audio.sampleTime, allowNegativePts = true)
                             audio.advance()
                         }
                     }
@@ -138,8 +139,8 @@ internal object VideoSegmentMuxer {
         private var buffer = ByteBuffer.allocateDirect(512 * 1024)
         private val info = MediaCodec.BufferInfo()
 
-        fun write(reader: MediaExtractor, track: Int, pts: Long) {
-            require(pts >= 0L) { "Invalid sample timestamp" }
+        fun write(reader: MediaExtractor, track: Int, pts: Long, allowNegativePts: Boolean = false) {
+            require(allowNegativePts || pts >= 0L) { "Invalid sample timestamp" }
             val flags = reader.sampleFlags
             check(flags and MediaExtractor.SAMPLE_FLAG_ENCRYPTED == 0) { "Encrypted media cannot be remuxed" }
             val size = reader.sampleSize
@@ -167,14 +168,12 @@ internal object VideoSegmentMuxer {
 }
 
 internal fun checkVideoSegmentCoverage(segments: List<VideoSegment>, frameCount: Int) {
-    var nextFrame = 0
-    for (segment in segments) {
-        require(segment.firstFrame == nextFrame && segment.frameCount in 1..(frameCount - nextFrame)) {
-            "Invalid video segment range at frame $nextFrame"
-        }
-        nextFrame += segment.frameCount
+    val packed = IntArray(segments.size * 2)
+    segments.forEachIndexed { index, segment ->
+        packed[index * 2] = segment.firstFrame
+        packed[index * 2 + 1] = segment.frameCount
     }
-    require(frameCount > 0 && nextFrame == frameCount) { "Video segments cover $nextFrame of $frameCount frames" }
+    RustCore.checkSegmentCoverage(packed, frameCount)
 }
 
 internal class VideoSegmentTimestamps(private val segment: VideoSegment, private val timeline: VideoTimeline) {
@@ -184,17 +183,16 @@ internal class VideoSegmentTimestamps(private val segment: VideoSegment, private
 
     fun next(localPts: Long, sync: Boolean): Long {
         check(count < segment.frameCount) { "Too many frames in ${segment.file.name}" }
-        check(localPts > lastLocalPts) { "Nonmonotonic AVC timestamps in ${segment.file.name}" }
-        if (count == 0) {
-            check(sync) { "Video segment ${segment.file.name} does not start with a sync sample" }
-            firstLocalPts = localPts
-        }
         val globalPts = timeline[segment.firstFrame + count]
         val originalOffset = globalPts - timeline[segment.firstFrame]
-        // Android MP4 commonly uses a 90 kHz video clock. Two tick conversions may round.
-        check(abs((localPts - firstLocalPts) - originalOffset) <= 23L) {
-            "Unexpected AVC sample timestamp in ${segment.file.name} at frame ${segment.firstFrame + count}"
+        val first = if (count == 0) localPts else firstLocalPts
+        when (RustCore.validateSegmentTimestamp(localPts, lastLocalPts, first, originalOffset, count == 0, sync)) {
+            0 -> Unit
+            1 -> error("Nonmonotonic AVC timestamps in ${segment.file.name}")
+            2 -> error("Video segment ${segment.file.name} does not start with a sync sample")
+            else -> error("Unexpected AVC sample timestamp in ${segment.file.name} at frame ${segment.firstFrame + count}")
         }
+        firstLocalPts = first
         lastLocalPts = localPts
         count++
         return globalPts

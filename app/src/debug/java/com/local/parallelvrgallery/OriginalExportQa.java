@@ -51,7 +51,7 @@ final class OriginalExportQa {
                 generator.exportOriginalPng(photo,spec,output,()->true,(p,s)->kotlin.Unit.INSTANCE);
                 double ms=(System.nanoTime()-start)/1e6;
                 Bitmap actual=BitmapFactory.decodeFile(output.getPath());
-                Bitmap source=MainActivityKt.decodeScaledBitmap(scoped,photo.getUri(),Math.max(spec.getEyeWidth(),spec.getEyeHeight()));
+                Bitmap source=MediaIoUtilsKt.decodeScaledBitmap(scoped,photo.getUri(),Math.max(spec.getEyeWidth(),spec.getEyeHeight()));
                 Bitmap expected=null;
                 try(IdleResourcePool.Borrowed<DepthModelSession> lease=generator.borrowDepthSession(spec.getParams(),p->kotlin.Unit.INSTANCE,s->kotlin.Unit.INSTANCE)) {
                     expected=generator.generateSbsBitmap(source,spec.getParams(),p->kotlin.Unit.INSTANCE,s->kotlin.Unit.INSTANCE,lease.getValue());
@@ -75,7 +75,7 @@ final class OriginalExportQa {
             }
             // Exercise the real publication helper, only under a unique QA name; remove exactly that new URI.
             String name="PVG_QA_original1900_"+System.currentTimeMillis()+".png";
-            File saved=galleryPng;Uri uri=MainActivityKt.saveImageToGallery(context,saved,name,"image/png",action->{action.invoke();return kotlin.Unit.INSTANCE;});
+            File saved=galleryPng;Uri uri=MediaIoUtilsKt.saveImageToGallery(context,saved,name,"image/png",action->{action.invoke();return kotlin.Unit.INSTANCE;});
             try(InputStream in=context.getContentResolver().openInputStream(uri)) {
                 ByteArrayOutputStream copy=new ByteArrayOutputStream();byte[] buffer=new byte[32768];int read;
                 while((read=in.read(buffer))!=-1)copy.write(buffer,0,read);
@@ -83,7 +83,7 @@ final class OriginalExportQa {
                 if(!Arrays.equals(expected,actual))throw new AssertionError("Gallery copy differs");
             }finally{if(context.getContentResolver().delete(uri,null,null)!=1)throw new AssertionError("Own QA gallery cleanup failed");}
             boolean rejected=false;
-            try{MainActivityKt.saveImageToGallery(context,saved,name+"-cancelled","image/png",action->{throw new IllegalStateException("QA deletion invalidated token before publish");});}
+            try{MediaIoUtilsKt.saveImageToGallery(context,saved,name+"-cancelled","image/png",action->{throw new IllegalStateException("QA deletion invalidated token before publish");});}
             catch(IllegalStateException expected){rejected=true;}
             if(!rejected)throw new AssertionError("Invalidated gallery publication was allowed");
             JSONObject report=new JSONObject().put("modes",rows).put("galleryPngBytesExact",true).put("ownGalleryUriRemoved",true).put("invalidatedGalleryPublishRejected",true);
@@ -105,7 +105,7 @@ final class OriginalExportQa {
                 VrCacheEntry entry=generator.generate(photo,params,v->kotlin.Unit.INSTANCE,0,()->true,e->cache.publish(photo,e,Collections.emptyList()),v->kotlin.Unit.INSTANCE);
                 OriginalImageExportSpec spec=OriginalImageExportKt.readOriginalExportSpec(entry);File png=new File(run,"sample-"+i+".png");
                 generator.exportOriginalPng(photo,spec,png,()->true,(v,s)->kotlin.Unit.INSTANCE);
-                Bitmap actual=BitmapFactory.decodeFile(png.getPath()),source=MainActivityKt.decodeScaledBitmap(scoped,photo.getUri(),Math.max(spec.getEyeWidth(),spec.getEyeHeight()));
+                Bitmap actual=BitmapFactory.decodeFile(png.getPath()),source=MediaIoUtilsKt.decodeScaledBitmap(scoped,photo.getUri(),Math.max(spec.getEyeWidth(),spec.getEyeHeight()));
                 try {
                     int[] a=new int[source.getWidth()],b=new int[a.length];int offset=modes[i].isReference()?0:a.length;
                     for(int y=0;y<source.getHeight();y++){source.getPixels(a,0,a.length,0,y,a.length,1);actual.getPixels(b,0,b.length,offset,y,b.length,1);if(!Arrays.equals(a,b))throw new AssertionError("Original eye differs: "+names[i]);}

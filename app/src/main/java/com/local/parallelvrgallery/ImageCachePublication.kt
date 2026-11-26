@@ -34,10 +34,20 @@ internal object ImageCachePublication {
         return Prepared(id, work, target, moves, journal)
     }
 
+    private fun Prepared.toNativeFields(): Array<String> = buildList(5 + oldToBackup.size * 2) {
+        add(id); add(work.absolutePath); add(target.absolutePath); add(journal.absolutePath); add(done.absolutePath)
+        oldToBackup.forEach { (old, backup) -> add(old.absolutePath); add(backup.absolutePath) }
+    }.toTypedArray()
+
     @Synchronized
     fun commit(work: File, target: File, retire: List<File> = emptyList(),
-        move: (File, File) -> Boolean = { from, to -> from.renameTo(to) }) {
+        move: ((File, File) -> Boolean)? = null) {
         val transaction = prepare(work, target, retire)
+        if (move == null) {
+            val error = RustCore.publishImage(transaction.toNativeFields(), recover = false)
+            check(error == null) { error!! }
+            return
+        }
         val preserved = mutableListOf<Pair<File, File>>()
         try {
             transaction.oldToBackup.forEach { (old, backup) ->
@@ -56,7 +66,6 @@ internal object ImageCachePublication {
             if (restored) transaction.journal.delete()
             throw error
         }
-        // The marker in the new directory covers a kill before this completion sidecar.
         runCatching { FileOutputStream(transaction.done).use { it.write(transaction.id.toByteArray(Charsets.UTF_8)); it.fd.sync() } }
         cleanCommitted(transaction)
     }
@@ -86,19 +95,8 @@ internal object ImageCachePublication {
                     old to backup
                 }
                 val transaction = Prepared(id, work, target, moves, journal)
-                val published = File(target, MARKER).takeIf { it.isFile }?.readText(Charsets.UTF_8) == id
-                if (transaction.done.isFile || published) {
-                    cleanCommitted(transaction)
-                } else {
-                    moves.asReversed().forEach { (old, backup) ->
-                        if (backup.exists()) {
-                            check(!old.exists()) { "Recovery conflict; both copies retained" }
-                            check(old.parentFile!!.isDirectory || old.parentFile!!.mkdirs())
-                            check(backup.renameTo(old)) { "Cannot restore old result; backup retained" }
-                        }
-                    }
-                    journal.delete()
-                }
+                val error = RustCore.publishImage(transaction.toNativeFields(), recover = true)
+                check(error == null) { error!! }
             }.onFailure { warnings += "Image cache recovery pending (${journal.name}): ${it.message}" }
         }
         return warnings
